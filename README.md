@@ -114,3 +114,4 @@ Your VM has about 8 GB of RAM. That is enough for many local Ollama models, but 
 - Support multiple log formats
 - Add structured JSON output for automation
 - Extend the prompt with remediation templates
+
