@@ -1,0 +1,19 @@
+# Example CI/CD failure log
+
+Run tests
+  python -m pytest
+
+ERROR: test_api_connection.py - ModuleNotFoundError: No module named 'requests'
+=========================================== short test summary ===========================================
+FAILED test_api_connection.py::test_connection - ModuleNotFoundError: No module named 'requests'
+============================================ warnings summary ============================================
+FAILED: Package installation step failed
+Command: pip install -r requirements.txt
+Output:
+  ERROR: Could not find a version that satisfies the requirement requests==999.0.0 (from versions: 2.25.1, 2.26.0, ...)
+  ERROR: No matching distribution found for requests==999.0.0
+
+Build step: docker build --target test .
+Step 10/12 : RUN pip install -r requirements.txt
+ ---> Running in 8a7c9e5c4b12
+ERROR: Service 'app' failed to build: The command '/bin/sh -c pip install -r requirements.txt' returned a non-zero code: 1
