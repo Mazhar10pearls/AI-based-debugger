@@ -8,7 +8,7 @@ on:
 jobs:
   build-and-deploy:
     name: Build, Test, and Deploy Local App
-    runs-on: [self-hosted, linux, vm-runner]
+    runs-on: [self-hosted, linux, docker, ci]
 
     steps:
       - name: Checkout repository
@@ -28,19 +28,27 @@ jobs:
         run: |
           python -m pytest sample_app/test_app.py
 
-      - name: Build Docker image
+      - name: Build & Run Local Docker App
         run: |
           chmod +x sample_app/deploy_local.sh
           sample_app/deploy_local.sh
 
+      - name: Wait for app startup
+        run: sleep 5
+
       - name: Verify deployment
         run: |
-          sleep 5
           python - <<'PY'
 import urllib.request
-res = urllib.request.urlopen('http://127.0.0.1:5000', timeout=10)
-body = res.read().decode('utf-8')
-if 'Hello from local AI DevOps app!' not in body:
-    raise SystemExit('Deployment verification failed')
-print('Deployment verified')
+
+try:
+    res = urllib.request.urlopen('http://127.0.0.1:5000', timeout=10)
+    body = res.read().decode('utf-8')
+
+    if 'Hello from local AI DevOps app!' not in body:
+        raise SystemExit('Deployment verification failed')
+
+    print('Deployment verified successfully')
+except Exception as e:
+    raise SystemExit(f'App check failed: {e}')
 PY
