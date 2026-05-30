@@ -34,10 +34,41 @@ System Logs ─────┘
 | Tool | Purpose |
 |------|---------|
 | **ci-platform-poller.py** | **[MAIN]** Polls all CI/CD platforms continuously, auto-fixes failures |
+| **ci-local-deploy.yml** | GitHub Actions workflow to build and deploy a local app on a self-hosted runner |
 | **auto-fixer.py** | Core: detects failure type, generates fix, commits |
 | **analyzer.py** | Manual analysis mode (for testing) |
 | **workflow-watcher.py** | Alternative: watches directory for manual log drops |
 | **github-monitor.py** | Alternative: GitHub-only monitoring |
+
+---
+
+## 🏠 Local GitHub Actions Deployment Pipeline
+
+A sample mini application is included in `sample_app/`. The GitHub Actions workflow `./github/workflows/ci-local-deploy.yml`:
+
+- runs on a self-hosted Linux runner located on your VM
+- installs Python dependencies
+- runs unit tests
+- builds a Docker image
+- deploys the container locally
+- verifies the app is reachable on `http://localhost:5000`
+
+### When to use this
+
+Use this pipeline when you want a **real GitHub Actions job** to deploy to your own VM, not just simulate log analysis.
+
+### Requirements for local deployment
+
+- A VM with a self-hosted GitHub Actions runner installed
+- Docker installed on that VM
+- The runner tagged for `self-hosted` and `linux`
+- `sample_app/` code present in repository
+
+### How it works
+
+```text
+GitHub Actions push → self-hosted runner on VM → build/test → docker deploy → local app available
+```
 
 ---
 
@@ -98,6 +129,28 @@ python ci-platform-poller.py `
     --github-repo YOUR_REPO `
     --once
 ```
+
+---
+
+## 🧩 Self-Hosted Runner Setup for Local Deployment
+
+To run `ci-local-deploy.yml` on your VM, install a GitHub Actions self-hosted runner there.
+
+1. Go to your repository on GitHub.
+2. Settings → Actions → Runners → Add runner.
+3. Choose Linux, then copy the registration commands.
+4. Run the commands on your VM.
+5. Add the `self-hosted` label to the runner.
+
+Make sure Docker is installed on the VM:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y docker.io
+sudo usermod -aG docker $USER
+```
+
+Then push to `main` and the workflow will execute on your local VM.
 
 ---
 
