@@ -1,117 +1,239 @@
-# AI Workflow Analyzer
+# AI-Powered Workflow Auto-Fixer
 
-A beginner-friendly local AI project that analyzes CI/CD workflow logs using Ollama + Llama3.
+🤖 **Zero manual intervention DevOps automation** — Automatically detects CI/CD failures, analyzes them with local AI, and fixes them with auto-commit.
 
 ## What it does
 
-- Reads CI/CD workflow or failure logs
-- Sends logs to a local Ollama LLM
-- Detects probable root causes
-- Identifies failed components
-- Suggests remediation steps
-- Summarizes the failure
+| Tool | Purpose |
+|------|---------|
+| **analyzer.py** | Analyzes logs and generates insights (manual mode) |
+| **auto-fixer.py** | **[NEW]** Auto-detects failures, generates fixes, and auto-commits |
+| **workflow-watcher.py** | **[NEW]** Continuously monitors a directory for new failures and triggers auto-fixer |
+| **github-monitor.py** | **[NEW]** Monitors GitHub Actions workflow failures |
 
-## Prerequisites
+### Supported Failure Types
 
-- Python 3.10+
-- Ollama installed on your VM
-- A local Ollama model such as `llama3` pulled and available
+- ✅ GitHub Actions workflow failures
+- ✅ Docker build errors
+- ✅ Python dependency conflicts (requirements.txt)
+- ✅ Node.js dependency issues (package.json)
+- ✅ CI/CD build log failures
+- ✅ Generic error logs
 
-## Setup
+---
 
-1. Install Ollama:
+## Quick Start
 
-   - Follow the instructions at https://ollama.com/download
-
-2. Pull the Llama3 model:
-
-```powershell
-ollama pull llama3
-```
-
-3. Create a Python virtual environment and install dependencies:
+### 1. Install & Setup
 
 ```powershell
+# Clone or enter the project
+cd AI-BASED-debugger
+
+# Create virtual environment
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+
+# Install dependencies
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-> If you are using a Linux VM, replace the activation command with:
-> `source .venv/bin/activate`
-
-## Run Ollama locally
-
-Start the Ollama HTTP service before running the analyzer:
+### 2. Start Ollama (Terminal 1)
 
 ```powershell
+ollama pull llama3
 ollama run llama3
 ```
 
-This exposes the local API at `http://127.0.0.1:11434`.
+### 3. Run Auto-Fixer (Terminal 2)
 
-## Run the analyzer
-
-```powershell
-python analyzer.py --input sample-log.txt
-```
-
-Or automatically analyze the newest log file in a directory:
+#### Option A: Single failure analysis + auto-commit
 
 ```powershell
-python analyzer.py --log-dir .\logs
+# Detect failure, generate fix, and commit
+python auto-fixer.py --input sample-log.txt
 ```
 
-To save the analysis to a file:
+#### Option B: Continuous monitoring (watch a directory)
 
 ```powershell
-python analyzer.py --input sample-log.txt --output analysis.txt
+# Create logs directory
+mkdir logs
+
+# Start watcher (checks every 5 minutes)
+python workflow-watcher.py --watch-dir ./logs --interval 300
+
+# In another terminal, drop new failure logs into ./logs/
+# The watcher will automatically fix them and commit
 ```
 
-## GitHub issue update
-
-You can post the AI analysis directly to a GitHub issue comment.
+#### Option C: GitHub Actions monitoring
 
 ```powershell
-$env:GITHUB_TOKEN = "<your-token>"
-python analyzer.py --input sample-log.txt --github-repo owner/repo --github-issue 123
+# Set your GitHub token
+$env:GITHUB_TOKEN="ghp_xxxxxxxxxxxx"
+
+# Fetch failed workflows and trigger auto-fixer
+python github-monitor.py --owner YOUR_NAME --repo YOUR_REPO --auto-fix
 ```
 
-If you do not want to use the environment variable, pass the token explicitly:
+---
+
+## Usage Examples
+
+### Single-Shot Fix (Manual Trigger)
 
 ```powershell
-python analyzer.py --input sample-log.txt --github-repo owner/repo --github-issue 123 --github-token <your-token>
+# Fix a failure log once
+python auto-fixer.py --input build-error.log
+
+# Fix without committing (dry run)
+python auto-fixer.py --input build-error.log --no-commit
 ```
 
-## Custom API settings
-
-If Ollama is listening on a different address, use:
+### Continuous Auto-Fix Mode
 
 ```powershell
-python analyzer.py --input sample-log.txt --api-url http://127.0.0.1:11434/v1/completions
+# Start watcher in background
+Start-Job -ScriptBlock { python workflow-watcher.py --watch-dir ./logs --interval 60 }
+
+# Drop new logs, they're automatically fixed
+Copy-Item build-error.log ./logs/
+# → Watcher detects it, analyzes, fixes, commits
 ```
 
-If you want to use a different model name:
+### Analyze Only (No Fix)
 
 ```powershell
-python analyzer.py --input sample-log.txt --model llama3
+# Just analyze, don't fix
+python analyzer.py --input sample-log.txt --output report.txt
 ```
 
-## Example log file
+---
 
-A sample log file is included in `sample-log.txt`. Replace it with your own GitHub Actions, Docker build, Kubernetes, or CI/CD error logs.
+## How It Works
 
-To automatically analyze logs, save workflow output to a directory and use `--log-dir`.
+```
+┌─────────────────────────────────────────────────────────┐
+│ New Failure Detected (log file)                         │
+└────────────┬────────────────────────────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────────────────────────────┐
+│ FailureDetector                                         │
+│ • GitHub Actions workflow?                              │
+│ • Docker build error?                                   │
+│ • Dependency conflict?                                  │
+│ • CI/CD build failure?                                  │
+└────────────┬────────────────────────────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────────────────────────────┐
+│ WorkflowAnalyzer (Ollama + Llama3)                      │
+│ • Sends failure to local LLM                            │
+│ • Receives: root cause, fix, commit message             │
+└────────────┬────────────────────────────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────────────────────────────┐
+│ AutoFixer                                               │
+│ • Writes fixed file to disk                             │
+│ • Runs: git add, git commit, git push                   │
+└────────────┬────────────────────────────────────────────┘
+             │
+             ▼
+        ✅ Fixed & Committed
+```
 
-## Notes for your VM
+---
 
-Your VM has about 8 GB of RAM. That is enough for many local Ollama models, but if `llama3` does not fit, you can switch to a smaller locally-supported model via Ollama.
+## Configuration
 
-## Next steps
+### Environment Variables
 
-- Add GitHub Actions integration
-- Support multiple log formats
-- Add structured JSON output for automation
-- Extend the prompt with remediation templates
+```powershell
+$env:OLLAMA_API_URL = "http://127.0.0.1:11434/v1/completions"
+$env:OLLAMA_MODEL = "llama3"
+$env:GITHUB_TOKEN = "ghp_xxxxxxxxxxxx"
+```
 
+### Auto-Fixer Options
+
+```powershell
+python auto-fixer.py --help
+
+# Key options:
+#   --input FILE              : Failure log to analyze
+#   --no-commit              : Apply fix but don't git push
+#   --model MODEL            : Use different Ollama model
+#   --api-url URL            : Custom Ollama endpoint
+#   --repo PATH              : Path to git repository
+```
+
+### Watcher Options
+
+```powershell
+python workflow-watcher.py --help
+
+# Key options:
+#   --watch-dir DIR          : Directory to monitor for logs
+#   --interval SECONDS       : Check frequency (default: 300)
+#   --auto-fixer SCRIPT      : Path to auto-fixer.py
+#   --once                   : Run once and exit
+```
+
+---
+
+## Example: GitHub Actions Auto-Fix Workflow
+
+1. GitHub Actions job fails
+2. Logs posted to your repo
+3. Run: `python github-monitor.py --owner YOU --repo REPO --auto-fix`
+4. AI detects the failure
+5. Fix is generated and auto-committed
+6. PR created with the fix (optional)
+
+---
+
+## Project Structure
+
+```
+AI-BASED-debugger/
+├── analyzer.py           # Manual log analysis
+├── auto-fixer.py         # Automatic detection & fix + commit
+├── workflow-watcher.py   # Continuous directory monitoring
+├── github-monitor.py     # GitHub Actions integration
+├── requirements.txt      # Dependencies
+├── sample-log.txt        # Example failure log
+└── README.md            # This file
+```
+
+---
+
+## VM Resource Notes
+
+**Your VM Specs:**
+- 8 GB RAM (sufficient for llama3)
+- 2+ CPU cores (good)
+
+If you encounter memory issues:
+1. Use a smaller model: `ollama pull mistral` or `ollama pull phi`
+2. Reduce max_tokens in auto-fixer.py
+3. Monitor with `top` or Task Manager
+
+---
+
+## Limitations & Future
+
+### Current Limitations
+- Fixes are generated once and committed immediately (no review step)
+- Works best with structured logs (GitHub Actions, Docker, pytest)
+- Limited to local Ollama models
+
+### Future Improvements
+- PR creation with fixes for review
+- Slack notifications
+- Historical failure learning
+- Multi-model support
+- WebUI dashboard
