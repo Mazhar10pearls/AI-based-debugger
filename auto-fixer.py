@@ -17,11 +17,10 @@ from pathlib import Path
 import requests
 
 DEFAULT_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/v1/completions")
-DEFAULT_MODEL   = os.environ.get("OLLAMA_MODEL", "llama3")
+DEFAULT_MODEL   = os.environ.get("OLLAMA_MODEL", "llama3.2")
 
-# Send only the most relevant portion of the log to Ollama.
-# CPU-only VMs time out on large contexts — keep this small.
-MAX_LOG_CHARS = 4_000
+# Keep this small — llama3.2 is fast but has a limited context window
+MAX_LOG_CHARS = 2_000
 
 
 class WorkflowAnalyzer:
@@ -32,8 +31,8 @@ class WorkflowAnalyzer:
     def _extract_relevant_lines(self, log_text: str) -> str:
         """
         Filter the log down to lines that actually matter.
-        GitHub Actions logs are full of git/setup noise — strip it out
-        so Ollama only sees the error-relevant lines.
+        GitHub Actions logs are full of git/setup noise — strip it
+        so llama3.2 only sees the error-relevant lines.
         """
         error_keywords = [
             "error", "failed", "failure", "exception", "traceback",
@@ -48,7 +47,7 @@ class WorkflowAnalyzer:
             if any(k in line.lower() for k in error_keywords)
         ]
 
-        # Always include the last 60 lines — the failure summary lives here
+        # Always include the last 60 lines — failure summary lives here
         tail = lines[-60:]
 
         # Merge, deduplicate, preserve order
@@ -73,23 +72,17 @@ class WorkflowAnalyzer:
         # Trim to MAX_LOG_CHARS from the tail (most recent = most relevant)
         if len(filtered) > MAX_LOG_CHARS:
             filtered = filtered[-MAX_LOG_CHARS:]
-            print(f"[INFO] Further trimmed to last {MAX_LOG_CHARS} chars for model context.")
+            print(f"[INFO] Trimmed to last {MAX_LOG_CHARS} chars for model context.")
 
         prompt = textwrap.dedent(f"""
-            You are an expert DevOps engineer.
-            Below is a filtered CI/CD failure log from GitHub Actions.
-            Your job:
-            1. Identify exactly what caused the failure.
-            2. Identify which repository file needs to be changed.
-            3. Return the COMPLETE corrected file content.
+            You are a DevOps expert. Analyze this CI/CD failure log and return a JSON fix.
 
             Rules:
-            - Respond ONLY with valid JSON — no text outside the JSON.
-            - Do NOT use markdown code fences.
+            - Respond ONLY with valid JSON, no text outside it, no markdown fences.
             - "fixed_content" must be the COMPLETE corrected file, not a diff.
             - Common fixes: wrong python-version in workflow YAML, bad package
-              version in requirements.txt, broken Dockerfile base image, etc.
-            - If unsure, set fixed_file to "unknown" and fixed_content to "".
+              version in requirements.txt, broken Dockerfile base image.
+            - If unsure set fixed_file to "unknown" and fixed_content to "".
 
             JSON format:
             {{
@@ -102,14 +95,14 @@ class WorkflowAnalyzer:
                 "explanation": "one or two sentences explaining the fix"
             }}
 
-            Filtered failure log:
+            Failure log:
             {filtered}
         """).strip()
 
         payload = {
             "model":       self.model,
             "prompt":      prompt,
-            "max_tokens":  2000,
+            "max_tokens":  1500,
             "temperature": 0.1,
         }
 
@@ -117,12 +110,11 @@ class WorkflowAnalyzer:
         print(f"[AI] Prompt size: {len(prompt)} chars")
 
         try:
-            resp = requests.post(self.api_url, json=payload, timeout=180)
+            resp = requests.post(self.api_url, json=payload, timeout=120)
             resp.raise_for_status()
         except requests.exceptions.Timeout:
             raise RuntimeError(
-                "Ollama timed out (180s). The log may still be too large, "
-                "or the model is under heavy load. Try reducing MAX_LOG_CHARS further."
+                "Ollama timed out (120s). Try reducing MAX_LOG_CHARS further."
             )
         except requests.exceptions.RequestException as exc:
             raise RuntimeError(
@@ -133,7 +125,7 @@ class WorkflowAnalyzer:
         raw  = data.get("choices", [{}])[0].get("text", "")
 
         print(f"[AI] Response received ({len(raw)} chars)")
-        print(f"[AI] Preview: {raw[:300]}{'...' if len(raw) > 300 else ''}")
+        print(f"[AI] Preview: {raw[:400]}{'...' if len(raw) > 400 else ''}")
 
         # Strip markdown fences if the model added them anyway
         raw = re.sub(r"```(?:json)?", "", raw).strip()
