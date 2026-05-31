@@ -15,13 +15,14 @@ jobs:
   auto-fix:
     if: ${{ github.event.workflow_run.conclusion == 'failure' }}
     name: Auto-Fix Failed Workflow and Retry
-    runs-on: [self-hosted, linux, vm-runner]
+    runs-on: [self-hosted, linux, ai-runner]
+    environment: prod
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          persist-credentials: true
           fetch-depth: 0
 
       - name: Set up Python
@@ -30,20 +31,22 @@ jobs:
           python-version: '3.12'
 
       - name: Install auto-fixer dependencies
+        run: pip install requests --quiet || true
+
+      - name: Validate required secrets
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install requests
+          : "${OLLAMA_API_URL:?Secret OLLAMA_API_URL is not set}"
+          : "${OLLAMA_MODEL:?Secret OLLAMA_MODEL is not set}"
+        env:
+          OLLAMA_API_URL: ${{ secrets.OLLAMA_API_URL }}
+          OLLAMA_MODEL: ${{ secrets.OLLAMA_MODEL }}
 
       - name: Download failed workflow logs
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python - <<'PY'
-          import json
-          import os
-          import pathlib
-          import requests
-          import zipfile
+          python3 - <<'PY'
+          import json, os, pathlib, requests, zipfile, sys
 
           event_path = os.environ['GITHUB_EVENT_PATH']
           with open(event_path, 'r', encoding='utf-8') as f:
@@ -58,7 +61,9 @@ jobs:
           url = f'https://api.github.com/repos/{repo_full}/actions/runs/{run_id}/logs'
 
           resp = requests.get(url, headers=headers, timeout=120)
-          resp.raise_for_status()
+          if resp.status_code != 200:
+              print(f'Failed to download logs: HTTP {resp.status_code}', file=sys.stderr)
+              sys.exit(1)
 
           with open('workflow_logs.zip', 'wb') as fh:
               fh.write(resp.content)
@@ -75,39 +80,56 @@ jobs:
                   out.write(path.read_text(encoding='utf-8', errors='replace'))
                   out.write('\n\n')
 
-          print(f'Generated failure log at {out_path}')
+          print(f'Generated failure.log ({out_path.stat().st_size} bytes)')
           PY
+
+      - name: Check failure log is non-empty
+        run: |
+          if [ ! -s failure.log ]; then
+            echo "failure.log is empty — nothing to fix."
+            exit 1
+          fi
 
       - name: Run auto-fixer on failure logs
         env:
           OLLAMA_API_URL: ${{ secrets.OLLAMA_API_URL }}
           OLLAMA_MODEL: ${{ secrets.OLLAMA_MODEL }}
-        run: |
-          python auto-fixer.py --input failure.log
+        run: python3 auto-fixer.py --input failure.log
 
-      - name: Rerun failed workflow
+      - name: Commit and push auto-fix
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No file changes to commit — fix may have been non-file-based."
+          else
+            git commit -m "fix: auto-fixer patch from failed run ${{ github.event.workflow_run.id }}"
+            git push
+          fi
+
+      - name: Re-trigger workflow via dispatch
         if: success()
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python - <<'PY'
-          import json
-          import os
-          import requests
+          python3 - <<'PY'
+          import json, os, requests, sys
 
           event_path = os.environ['GITHUB_EVENT_PATH']
           with open(event_path, 'r', encoding='utf-8') as f:
               event = json.load(f)
 
-          run_id = event['workflow_run']['id']
           repo_full = event['repository']['full_name']
+          branch = event['workflow_run']['head_branch']
           headers = {
               'Authorization': f"Bearer {os.environ['GITHUB_TOKEN']}",
               'Accept': 'application/vnd.github+json'
           }
-          url = f'https://api.github.com/repos/{repo_full}/actions/runs/{run_id}/rerun'
-
-          resp = requests.post(url, headers=headers, timeout=120)
-          resp.raise_for_status()
-          print('Requested workflow rerun for run', run_id)
+          url = f'https://api.github.com/repos/{repo_full}/actions/workflows/ci-local-deploy.yml/dispatches'
+          resp = requests.post(url, headers=headers, json={'ref': branch}, timeout=60)
+          if resp.status_code not in (200, 204):
+              print(f'Dispatch failed: HTTP {resp.status_code} — {resp.text}', file=sys.stderr)
+              sys.exit(1)
+          print(f'Dispatched new run on branch {branch}')
           PY
