@@ -2,7 +2,7 @@
 """
 AI-Powered Auto-Fixer for CI/CD Workflows
 100% AI-driven: no keyword matching, no hardcoded failure types.
-Ollama reads the full log and decides what to fix.
+Ollama reads the filtered log and decides what to fix.
 """
 
 import argparse
@@ -19,9 +19,9 @@ import requests
 DEFAULT_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/v1/completions")
 DEFAULT_MODEL   = os.environ.get("OLLAMA_MODEL", "llama3")
 
-# How many characters of the log to send to Ollama.
-# Logs can be huge; the first 12 000 chars contain the failure in almost every case.
-MAX_LOG_CHARS = 12_000
+# Send only the most relevant portion of the log to Ollama.
+# CPU-only VMs time out on large contexts — keep this small.
+MAX_LOG_CHARS = 4_000
 
 
 class WorkflowAnalyzer:
@@ -29,60 +29,101 @@ class WorkflowAnalyzer:
         self.model   = model
         self.api_url = api_url
 
+    def _extract_relevant_lines(self, log_text: str) -> str:
+        """
+        Filter the log down to lines that actually matter.
+        GitHub Actions logs are full of git/setup noise — strip it out
+        so Ollama only sees the error-relevant lines.
+        """
+        error_keywords = [
+            "error", "failed", "failure", "exception", "traceback",
+            "exit code", "no module", "not found", "invalid", "fatal",
+            "warning", "denied", "timeout", "killed", "cannot", "unable",
+            "python-version", "setup-python", "syntaxerror", "importerror",
+        ]
+        lines = log_text.splitlines()
+
+        relevant = [
+            line for line in lines
+            if any(k in line.lower() for k in error_keywords)
+        ]
+
+        # Always include the last 60 lines — the failure summary lives here
+        tail = lines[-60:]
+
+        # Merge, deduplicate, preserve order
+        seen = set()
+        out = []
+        for line in relevant + tail:
+            if line not in seen:
+                seen.add(line)
+                out.append(line)
+
+        result = "\n".join(out)
+        print(f"[INFO] Filtered log: {len(lines)} lines → {len(out)} relevant lines ({len(result)} chars)")
+        return result
+
     def analyze(self, log_text: str) -> dict:
         """
-        Send the raw CI/CD failure log to Ollama.
-        Ollama identifies the root cause and returns the exact fix as JSON.
-        No keyword matching — the AI does all the thinking.
+        Send the filtered CI/CD failure log to Ollama.
+        The AI identifies the root cause and returns the exact fix as JSON.
         """
-        # Trim log so we stay inside the model context window
-        trimmed = log_text[:MAX_LOG_CHARS]
-        if len(log_text) > MAX_LOG_CHARS:
-            trimmed += "\n... [log truncated] ..."
+        filtered = self._extract_relevant_lines(log_text)
+
+        # Trim to MAX_LOG_CHARS from the tail (most recent = most relevant)
+        if len(filtered) > MAX_LOG_CHARS:
+            filtered = filtered[-MAX_LOG_CHARS:]
+            print(f"[INFO] Further trimmed to last {MAX_LOG_CHARS} chars for model context.")
 
         prompt = textwrap.dedent(f"""
             You are an expert DevOps engineer.
-            Below is a raw CI/CD failure log from GitHub Actions.
-            Your job is to:
+            Below is a filtered CI/CD failure log from GitHub Actions.
+            Your job:
             1. Identify exactly what caused the failure.
-            2. Identify which file in the repository needs to be changed.
+            2. Identify which repository file needs to be changed.
             3. Return the COMPLETE corrected file content.
 
-            Important rules:
-            - Respond ONLY with valid JSON — no explanation outside the JSON.
-            - Do NOT wrap the JSON in markdown code fences.
-            - "fixed_content" must be the COMPLETE file, not a diff or snippet.
-            - If the fix requires changing a workflow YAML (e.g. wrong python-version),
-              return the corrected YAML as fixed_content.
-            - If you cannot determine the fix, still return valid JSON with
-              fixed_file set to "unknown" and fixed_content set to "".
+            Rules:
+            - Respond ONLY with valid JSON — no text outside the JSON.
+            - Do NOT use markdown code fences.
+            - "fixed_content" must be the COMPLETE corrected file, not a diff.
+            - Common fixes: wrong python-version in workflow YAML, bad package
+              version in requirements.txt, broken Dockerfile base image, etc.
+            - If unsure, set fixed_file to "unknown" and fixed_content to "".
 
-            Required JSON format:
+            JSON format:
             {{
                 "root_cause": "one-line description of what went wrong",
                 "severity": "critical|high|medium|low",
                 "fix_type": "dependency|dockerfile|github-action|config|code",
-                "fixed_file": "relative path to the file that needs changing",
+                "fixed_file": "relative/path/to/file",
                 "fixed_content": "complete corrected file content",
-                "commit_message": "fix: short description of the fix",
+                "commit_message": "fix: short description",
                 "explanation": "one or two sentences explaining the fix"
             }}
 
-            CI/CD Failure Log:
-            {trimmed}
+            Filtered failure log:
+            {filtered}
         """).strip()
 
         payload = {
             "model":       self.model,
             "prompt":      prompt,
-            "max_tokens":  3000,
+            "max_tokens":  2000,
             "temperature": 0.1,
         }
 
-        print(f"[AI] Sending log to Ollama ({self.api_url}) with model '{self.model}'...")
+        print(f"[AI] Contacting Ollama at {self.api_url} with model '{self.model}'...")
+        print(f"[AI] Prompt size: {len(prompt)} chars")
+
         try:
-            resp = requests.post(self.api_url, json=payload, timeout=300)
+            resp = requests.post(self.api_url, json=payload, timeout=180)
             resp.raise_for_status()
+        except requests.exceptions.Timeout:
+            raise RuntimeError(
+                "Ollama timed out (180s). The log may still be too large, "
+                "or the model is under heavy load. Try reducing MAX_LOG_CHARS further."
+            )
         except requests.exceptions.RequestException as exc:
             raise RuntimeError(
                 f"Cannot reach Ollama at {self.api_url}. Is it running?\n{exc}"
@@ -91,12 +132,13 @@ class WorkflowAnalyzer:
         data = resp.json()
         raw  = data.get("choices", [{}])[0].get("text", "")
 
-        print(f"[AI] Raw response ({len(raw)} chars):\n{raw[:500]}{'...' if len(raw) > 500 else ''}")
+        print(f"[AI] Response received ({len(raw)} chars)")
+        print(f"[AI] Preview: {raw[:300]}{'...' if len(raw) > 300 else ''}")
 
-        # Strip markdown fences if the model wrapped the JSON anyway
+        # Strip markdown fences if the model added them anyway
         raw = re.sub(r"```(?:json)?", "", raw).strip()
+        raw = raw.replace("```", "").strip()
 
-        # Extract the first JSON object from the response
         json_match = re.search(r"\{.*\}", raw, re.DOTALL)
         if not json_match:
             raise ValueError(f"Ollama did not return valid JSON.\nFull response:\n{raw}")
@@ -127,7 +169,7 @@ class AutoFixer:
         with open(fixed_file, "w", encoding="utf-8") as f:
             f.write(fixed_content)
 
-        print(f"[FIXED] Written to {fixed_file}")
+        print(f"[FIXED] Written: {fixed_file}")
         return True
 
     def commit_fix(self, fix_data: dict) -> bool:
@@ -143,13 +185,13 @@ class AutoFixer:
             )
             subprocess.run(["git", "add", "-A"], check=True, capture_output=True)
 
-            # Check if there is actually anything to commit
+            # Only commit if there are actual changes
             diff = subprocess.run(
                 ["git", "diff", "--cached", "--quiet"],
                 capture_output=True
             )
             if diff.returncode == 0:
-                print("[INFO] No file changes detected — nothing to commit.")
+                print("[INFO] No file changes to commit.")
                 return True
 
             subprocess.run(
@@ -160,7 +202,7 @@ class AutoFixer:
             print(f"[COMMITTED] {commit_msg}")
             return True
         except subprocess.CalledProcessError as exc:
-            print(f"[ERROR] Git operation failed: {exc.stderr.decode()}", file=sys.stderr)
+            print(f"[ERROR] Git failed: {exc.stderr.decode()}", file=sys.stderr)
             return False
 
     def auto_fix(self, fix_data: dict, commit: bool = True) -> bool:
@@ -188,12 +230,11 @@ def main() -> int:
     if not log_path.is_file():
         print(f"[ERROR] File not found: {args.input}", file=sys.stderr)
         return 1
-
     log_content = log_path.read_text(encoding="utf-8", errors="replace")
-    print(f"[INFO] Log size: {len(log_content)} chars")
+    print(f"[INFO] Raw log size: {len(log_content)} chars")
 
     # ── Step 2: Send to Ollama ────────────────────────────────────────────────
-    print("[STEP 2] Sending log to Ollama for AI analysis...")
+    print("[STEP 2] Sending filtered log to Ollama...")
     analyzer = WorkflowAnalyzer(model=args.model, api_url=args.api_url)
     try:
         fix_data = analyzer.analyze(log_content)
@@ -208,7 +249,7 @@ def main() -> int:
     print(f"  File to fix: {fix_data.get('fixed_file', 'unknown')}")
     print(f"  Explanation: {fix_data.get('explanation', '')}")
 
-    # ── Step 3: Apply fix and commit ──────────────────────────────────────────
+    # ── Step 3: Apply and commit ──────────────────────────────────────────────
     print("\n[STEP 3] Applying fix...")
     fixer = AutoFixer(repo_path=args.repo)
     if not fixer.auto_fix(fix_data, commit=not args.no_commit):
