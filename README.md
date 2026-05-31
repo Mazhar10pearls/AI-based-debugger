@@ -63,6 +63,7 @@ Use this pipeline when you want a **real GitHub Actions job** to deploy to your 
 - Docker installed on that VM
 - The runner tagged for `self-hosted` and `linux`
 - `sample_app/` code present in repository
+- GitHub secrets set: `OLLAMA_API_URL`, `OLLAMA_MODEL`
 
 ### How it works
 

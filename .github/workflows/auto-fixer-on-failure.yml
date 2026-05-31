@@ -1,0 +1,113 @@
+name: Auto Fix Failed Local CI
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_run:
+    workflows:
+      - Local CI/CD Deploy
+    types:
+      - completed
+
+jobs:
+  auto-fix:
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    name: Auto-Fix Failed Workflow and Retry
+    runs-on: [self-hosted, linux, vm-runner]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install auto-fixer dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests
+
+      - name: Download failed workflow logs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import requests
+          import zipfile
+
+          event_path = os.environ['GITHUB_EVENT_PATH']
+          with open(event_path, 'r', encoding='utf-8') as f:
+              event = json.load(f)
+
+          run_id = event['workflow_run']['id']
+          repo_full = event['repository']['full_name']
+          headers = {
+              'Authorization': f"Bearer {os.environ['GITHUB_TOKEN']}",
+              'Accept': 'application/vnd.github+json'
+          }
+          url = f'https://api.github.com/repos/{repo_full}/actions/runs/{run_id}/logs'
+
+          resp = requests.get(url, headers=headers, timeout=120)
+          resp.raise_for_status()
+
+          with open('workflow_logs.zip', 'wb') as fh:
+              fh.write(resp.content)
+
+          extract_dir = pathlib.Path('logs')
+          extract_dir.mkdir(parents=True, exist_ok=True)
+          with zipfile.ZipFile('workflow_logs.zip', 'r') as zf:
+              zf.extractall(extract_dir)
+
+          out_path = pathlib.Path('failure.log')
+          with out_path.open('w', encoding='utf-8') as out:
+              for path in sorted(extract_dir.rglob('*.txt')):
+                  out.write(f'=== {path.relative_to(extract_dir)} ===\n')
+                  out.write(path.read_text(encoding='utf-8', errors='replace'))
+                  out.write('\n\n')
+
+          print(f'Generated failure log at {out_path}')
+          PY
+
+      - name: Run auto-fixer on failure logs
+        env:
+          OLLAMA_API_URL: ${{ secrets.OLLAMA_API_URL }}
+          OLLAMA_MODEL: ${{ secrets.OLLAMA_MODEL }}
+        run: |
+          python auto-fixer.py --input failure.log
+
+      - name: Rerun failed workflow
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import requests
+
+          event_path = os.environ['GITHUB_EVENT_PATH']
+          with open(event_path, 'r', encoding='utf-8') as f:
+              event = json.load(f)
+
+          run_id = event['workflow_run']['id']
+          repo_full = event['repository']['full_name']
+          headers = {
+              'Authorization': f"Bearer {os.environ['GITHUB_TOKEN']}",
+              'Accept': 'application/vnd.github+json'
+          }
+          url = f'https://api.github.com/repos/{repo_full}/actions/runs/{run_id}/rerun'
+
+          resp = requests.post(url, headers=headers, timeout=120)
+          resp.raise_for_status()
+          print('Requested workflow rerun for run', run_id)
+          PY

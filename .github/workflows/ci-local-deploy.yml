@@ -8,11 +8,14 @@ on:
 jobs:
   build-and-deploy:
     name: Build, Test, and Deploy Local App
-    runs-on: [self-hosted, linux, docker, ci]
+    runs-on: [self-hosted, linux, vm-runner]
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
