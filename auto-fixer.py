@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 AI-Powered Auto-Fixer for CI/CD Workflows
-100% AI-driven. Minimal prompt to work within CPU inference speed limits.
+100% AI-driven. Minimal prompt optimized for CPU inference speed.
 """
 
 import argparse
@@ -16,58 +16,53 @@ import requests
 
 DEFAULT_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/v1/completions")
 DEFAULT_MODEL   = os.environ.get("OLLAMA_MODEL", "llama3.2")
-
-# At 20s per 118 tokens on this VM, keep total prompt under 200 tokens (~800 chars)
-MAX_LOG_CHARS = 800
+MAX_LOG_CHARS   = 800
 
 
 class WorkflowAnalyzer:
-    def __init__(self, model: str = DEFAULT_MODEL, api_url: str = DEFAULT_API_URL):
+    def __init__(self, model=DEFAULT_MODEL, api_url=DEFAULT_API_URL):
         self.model   = model
         self.api_url = api_url
 
-    def _extract_error_lines(self, log_text: str) -> str:
-        """Pull only the most critical error lines from the log."""
-        error_keywords = [
+    def _extract_error_lines(self, log_text):
+        """Pull only critical error lines from the raw log."""
+        keywords = [
             "error", "failed", "failure", "exception", "traceback",
             "exit code", "no module", "not found", "invalid", "fatal",
             "python-version", "syntaxerror", "importerror", "cannot",
         ]
-        lines = log_text.splitlines()
+        lines    = log_text.splitlines()
+        relevant = [l.strip() for l in lines if any(k in l.lower() for k in keywords)]
+        tail     = [l.strip() for l in lines[-20:]]
 
-        # Grab error lines + last 20 lines (failure summary)
-        relevant = [
-            line.strip() for line in lines
-            if any(k in line.lower() for k in error_keywords)
-        ]
-        tail = [line.strip() for line in lines[-20:]]
-
-        seen = set()
-        out = []
-        for line in relevant + tail:
-            if line and line not in seen:
-                seen.add(line)
-                out.append(line)
+        seen, out = set(), []
+        for l in relevant + tail:
+            if l and l not in seen:
+                seen.add(l)
+                out.append(l)
 
         result = "\n".join(out)
         print(f"[INFO] Extracted {len(out)} error lines ({len(result)} chars)")
-        return result[-MAX_LOG_CHARS:]  # take the tail (most recent errors)
+        # Return the tail — most recent errors are most relevant
+        return result[-MAX_LOG_CHARS:]
 
-    def analyze(self, log_text: str) -> dict:
-        error_snippet = self._extract_error_lines(log_text)
-        print(f"[INFO] Sending {len(error_snippet)} chars to Ollama...")
+    def analyze(self, log_text):
+        snippet = self._extract_error_lines(log_text)
+        print(f"[INFO] Sending {len(snippet)} chars to Ollama...")
 
-        # Minimal prompt — every extra word costs ~2s on this VM
         prompt = (
-            "CI/CD failure log:\n"
-            f"{error_snippet}\n\n"
-            "Return ONLY valid JSON, no other text:\n"
-            '{"root_cause":"...","severity":"critical|high|medium|low",'
-            '"fix_type":"dependency|dockerfile|github-action|config|code",'
-            '"fixed_file":"relative/path/to/file",'
-            '"fixed_content":"complete corrected file content",'
-            '"commit_message":"fix: ...",'
-            '"explanation":"..."}'
+            "You are a DevOps expert. Analyze this CI/CD failure and return a JSON fix.\n\n"
+            "Failure log:\n"
+            f"{snippet}\n\n"
+            "Respond with a single JSON object with these exact fields:\n"
+            "- root_cause: what went wrong\n"
+            "- severity: critical, high, medium, or low\n"
+            "- fix_type: dependency, dockerfile, github-action, config, or code\n"
+            "- fixed_file: relative path to the file that needs fixing\n"
+            "- fixed_content: the COMPLETE corrected file content\n"
+            "- commit_message: a short git commit message starting with fix:\n"
+            "- explanation: one sentence explaining the fix\n\n"
+            "Return ONLY the JSON object, no other text."
         )
 
         payload = {
@@ -84,29 +79,31 @@ class WorkflowAnalyzer:
             resp = requests.post(self.api_url, json=payload, timeout=180)
             resp.raise_for_status()
         except requests.exceptions.Timeout:
-            raise RuntimeError("Ollama timed out. VM CPU may be overloaded.")
+            raise RuntimeError("Ollama timed out (180s). VM CPU may be overloaded.")
         except requests.exceptions.RequestException as exc:
             raise RuntimeError(f"Cannot reach Ollama at {self.api_url}.\n{exc}")
 
         raw = resp.json().get("choices", [{}])[0].get("text", "")
-        print(f"[AI] Response ({len(raw)} chars): {raw[:300]}{'...' if len(raw)>300 else ''}")
+        print(f"[AI] Response ({len(raw)} chars): {raw[:400]}{'...' if len(raw) > 400 else ''}")
 
-        # Clean up markdown fences if model added them
+        # Strip markdown fences if model added them
         raw = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
 
-        json_match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not json_match:
-            raise ValueError(f"No JSON in Ollama response:\n{raw}")
+        # Model sometimes outputs an empty {} before the real answer.
+        # Collect ALL JSON objects and pick the longest (most complete) one.
+        matches = re.findall(r"\{.*?\}", raw, re.DOTALL)
+        if not matches:
+            raise ValueError(f"No JSON found in Ollama response:\n{raw}")
 
-        return json.loads(json_match.group())
+        best = max(matches, key=len)
+        return json.loads(best)
 
 
 class AutoFixer:
-    def __init__(self, repo_path: str = "."):
-        self.repo_path = repo_path
+    def __init__(self, repo_path="."):
         os.chdir(repo_path)
 
-    def apply_fix(self, fix_data: dict) -> bool:
+    def apply_fix(self, fix_data):
         fixed_file    = fix_data.get("fixed_file", "")
         fixed_content = fix_data.get("fixed_content", "")
 
@@ -118,15 +115,14 @@ class AutoFixer:
             return False
 
         Path(fixed_file).parent.mkdir(parents=True, exist_ok=True)
-        with open(fixed_file, "w", encoding="utf-8") as f:
-            f.write(fixed_content)
+        Path(fixed_file).write_text(fixed_content, encoding="utf-8")
         print(f"[FIXED] Written: {fixed_file}")
         return True
 
-    def commit_fix(self, fix_data: dict) -> bool:
+    def commit_fix(self, fix_data):
         commit_msg = fix_data.get("commit_message", "fix: auto-fixer patch")
         try:
-            subprocess.run(["git", "config", "user.name",  "github-actions[bot]"], check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name",  "github-actions[bot]"],             check=True, capture_output=True)
             subprocess.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"], check=True, capture_output=True)
             subprocess.run(["git", "add", "-A"], check=True, capture_output=True)
 
@@ -136,14 +132,14 @@ class AutoFixer:
                 return True
 
             subprocess.run(["git", "commit", "-m", commit_msg], check=True, capture_output=True)
-            subprocess.run(["git", "push"], check=True, capture_output=True)
+            subprocess.run(["git", "push"],                      check=True, capture_output=True)
             print(f"[COMMITTED] {commit_msg}")
             return True
         except subprocess.CalledProcessError as exc:
             print(f"[ERROR] Git failed: {exc.stderr.decode()}", file=sys.stderr)
             return False
 
-    def auto_fix(self, fix_data: dict, commit: bool = True) -> bool:
+    def auto_fix(self, fix_data, commit=True):
         if not self.apply_fix(fix_data):
             return False
         if commit:
@@ -151,20 +147,20 @@ class AutoFixer:
         return True
 
 
-def main() -> int:
+def main():
     parser = argparse.ArgumentParser(description="AI Auto-Fixer for CI/CD failures.")
-    parser.add_argument("--input",     "-i", required=True)
-    parser.add_argument("--model",     default=DEFAULT_MODEL)
-    parser.add_argument("--api-url",   default=DEFAULT_API_URL)
-    parser.add_argument("--no-commit", action="store_true")
-    parser.add_argument("--repo",      default=".")
+    parser.add_argument("--input",     "-i", required=True,          help="Path to failure log.")
+    parser.add_argument("--model",           default=DEFAULT_MODEL,  help="Ollama model name.")
+    parser.add_argument("--api-url",         default=DEFAULT_API_URL,help="Ollama API endpoint.")
+    parser.add_argument("--no-commit",       action="store_true",    help="Skip git commit.")
+    parser.add_argument("--repo",            default=".",            help="Path to git repo.")
     args = parser.parse_args()
 
     # Step 1: Read log
     print("[STEP 1] Reading failure log...")
     log_path = Path(args.input)
     if not log_path.is_file():
-        print(f"[ERROR] Not found: {args.input}", file=sys.stderr)
+        print(f"[ERROR] File not found: {args.input}", file=sys.stderr)
         return 1
     log_content = log_path.read_text(encoding="utf-8", errors="replace")
     print(f"[INFO] Raw log: {len(log_content)} chars")
