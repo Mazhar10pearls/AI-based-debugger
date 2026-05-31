@@ -8,7 +8,7 @@ on:
 jobs:
   build-and-deploy:
     name: Build, Test, and Deploy Local App
-    runs-on: [self-hosted, linux, vm-runner]
+    runs-on: [self-hosted, linux, docker, ci]
 
     steps:
       - name: Checkout repository
