@@ -3,7 +3,6 @@ name: Auto Fix Failed Local CI
 permissions:
   contents: write
   actions: write
-  workflows: write      # required to push changes to .github/workflows/*.yml
 
 on:
   workflow_run:
@@ -25,6 +24,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # Use PAT so git push can update workflow files
+          token: ${{ secrets.GH_PAT }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -38,9 +39,11 @@ jobs:
         run: |
           : "${OLLAMA_API_URL:?Secret OLLAMA_API_URL is not set}"
           : "${OLLAMA_MODEL:?Secret OLLAMA_MODEL is not set}"
+          : "${GH_PAT:?Secret GH_PAT is not set}"
         env:
           OLLAMA_API_URL: ${{ secrets.OLLAMA_API_URL }}
           OLLAMA_MODEL: ${{ secrets.OLLAMA_MODEL }}
+          GH_PAT: ${{ secrets.GH_PAT }}
 
       - name: Download failed workflow logs
         env:
@@ -53,9 +56,9 @@ jobs:
           with open(event_path, 'r', encoding='utf-8') as f:
               event = json.load(f)
 
-          run_id     = event['workflow_run']['id']
-          repo_full  = event['repository']['full_name']
-          headers    = {
+          run_id    = event['workflow_run']['id']
+          repo_full = event['repository']['full_name']
+          headers   = {
               'Authorization': f"Bearer {os.environ['GITHUB_TOKEN']}",
               'Accept': 'application/vnd.github+json'
           }
@@ -100,7 +103,7 @@ jobs:
       - name: Re-trigger workflow via dispatch
         if: success()
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           python3 - <<'PY'
           import json, os, requests, sys
@@ -112,7 +115,7 @@ jobs:
           repo_full = event['repository']['full_name']
           branch    = event['workflow_run']['head_branch']
           headers   = {
-              'Authorization': f"Bearer {os.environ['GITHUB_TOKEN']}",
+              'Authorization': f"Bearer {os.environ['GH_PAT']}",
               'Accept': 'application/vnd.github+json'
           }
           url  = f'https://api.github.com/repos/{repo_full}/actions/workflows/ci-local-deploy.yml/dispatches'
