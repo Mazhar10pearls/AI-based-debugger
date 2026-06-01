@@ -1,0 +1,74 @@
+﻿2026-06-01T13:50:30.7476461Z ##[group]Run actions/checkout@v4
+2026-06-01T13:50:30.7477392Z with:
+2026-06-01T13:50:30.7477772Z   persist-credentials: true
+2026-06-01T13:50:30.7478171Z   fetch-depth: 0
+2026-06-01T13:50:30.7478570Z   repository: Mazhar10pearls/AI-based-debugger
+2026-06-01T13:50:30.7483734Z   token: ***
+2026-06-01T13:50:30.7484091Z   ssh-strict: true
+2026-06-01T13:50:30.7484445Z   ssh-user: git
+2026-06-01T13:50:30.7484790Z   clean: true
+2026-06-01T13:50:30.7485152Z   sparse-checkout-cone-mode: true
+2026-06-01T13:50:30.7485598Z   fetch-tags: false
+2026-06-01T13:50:30.7485972Z   show-progress: true
+2026-06-01T13:50:30.7486352Z   lfs: false
+2026-06-01T13:50:30.7486693Z   submodules: false
+2026-06-01T13:50:30.7487073Z   set-safe-directory: true
+2026-06-01T13:50:30.7487787Z ##[endgroup]
+2026-06-01T13:50:30.9112449Z Syncing repository: Mazhar10pearls/AI-based-debugger
+2026-06-01T13:50:30.9115004Z ##[group]Getting Git version info
+2026-06-01T13:50:30.9115803Z Working directory is '/home/ubuntu/actions-runner/_work/AI-based-debugger/AI-based-debugger'
+2026-06-01T13:50:30.9116937Z [command]/usr/bin/git version
+2026-06-01T13:50:30.9117410Z git version 2.43.0
+2026-06-01T13:50:30.9118759Z ##[endgroup]
+2026-06-01T13:50:30.9123335Z Temporarily overriding HOME='/home/ubuntu/actions-runner/_work/_temp/e49fdae5-d292-45fe-bb6f-bdb8f81758dd' before making global git config changes
+2026-06-01T13:50:30.9126016Z Adding repository directory to the temporary git global config as a safe directory
+2026-06-01T13:50:30.9127991Z [command]/usr/bin/git config --global --add safe.directory /home/ubuntu/actions-runner/_work/AI-based-debugger/AI-based-debugger
+2026-06-01T13:50:30.9129546Z [command]/usr/bin/git config --local --get remote.origin.url
+2026-06-01T13:50:30.9148783Z https://github.com/Mazhar10pearls/AI-based-debugger
+2026-06-01T13:50:30.9167822Z ##[group]Removing previously created refs, to avoid conflicts
+2026-06-01T13:50:30.9173635Z [command]/usr/bin/git rev-parse --symbolic-full-name --verify --quiet HEAD
+2026-06-01T13:50:30.9197040Z refs/heads/main
+2026-06-01T13:50:30.9208239Z [command]/usr/bin/git checkout --detach
+2026-06-01T13:50:30.9247144Z HEAD is now at d861a30 added permission
+2026-06-01T13:50:30.9291978Z [command]/usr/bin/git branch --delete --force main
+2026-06-01T13:50:30.9323750Z Deleted branch main (was d861a30).
+2026-06-01T13:50:30.9367315Z ##[endgroup]
+2026-06-01T13:50:30.9371107Z [command]/usr/bin/git submodule status
+2026-06-01T13:50:30.9613728Z ##[group]Cleaning the repository
+2026-06-01T13:50:30.9619979Z [command]/usr/bin/git clean -ffdx
+2026-06-01T13:50:30.9660332Z [command]/usr/bin/git reset --hard HEAD
+2026-06-01T13:50:30.9701796Z HEAD is now at d861a30 added permission
+2026-06-01T13:50:30.9709359Z ##[endgroup]
+2026-06-01T13:50:30.9711362Z ##[group]Disabling automatic garbage collection
+2026-06-01T13:50:30.9713810Z [command]/usr/bin/git config --local gc.auto 0
+2026-06-01T13:50:30.9742561Z ##[endgroup]
+2026-06-01T13:50:30.9743177Z ##[group]Setting up auth
+2026-06-01T13:50:30.9750551Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-06-01T13:50:30.9795066Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-06-01T13:50:31.0042121Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-06-01T13:50:31.0077358Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-06-01T13:50:31.0337774Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-06-01T13:50:31.0375873Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-06-01T13:50:31.0630881Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2026-06-01T13:50:31.0677755Z ##[endgroup]
+2026-06-01T13:50:31.0679363Z ##[group]Fetching the repository
+2026-06-01T13:50:31.0690973Z [command]/usr/bin/git -c protocol.version=2 fetch --prune --no-recurse-submodules origin +refs/heads/*:refs/remotes/origin/* +refs/tags/*:refs/tags/*
+2026-06-01T13:50:32.4265457Z From https://github.com/Mazhar10pearls/AI-based-debugger
+2026-06-01T13:50:32.4266136Z    d861a30..30ca237  main       -> origin/main
+2026-06-01T13:50:32.4308189Z [command]/usr/bin/git branch --list --remote origin/main
+2026-06-01T13:50:32.4351497Z   origin/main
+2026-06-01T13:50:32.4361778Z [command]/usr/bin/git rev-parse refs/remotes/origin/main
+2026-06-01T13:50:32.4388247Z 30ca237ee3a3c49aaa0f2cb249a14a285d7a55d3
+2026-06-01T13:50:32.4395095Z ##[endgroup]
+2026-06-01T13:50:32.4396268Z ##[group]Determining the checkout info
+2026-06-01T13:50:32.4397531Z ##[endgroup]
+2026-06-01T13:50:32.4416232Z [command]/usr/bin/git sparse-checkout disable
+2026-06-01T13:50:32.4456207Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-06-01T13:50:32.4492463Z ##[group]Checking out the ref
+2026-06-01T13:50:32.4495683Z [command]/usr/bin/git checkout --progress --force -B main refs/remotes/origin/main
+2026-06-01T13:50:32.4537559Z Previous HEAD position was d861a30 added permission
+2026-06-01T13:50:32.4552300Z Switched to a new branch 'main'
+2026-06-01T13:50:32.4553919Z branch 'main' set up to track 'origin/main'.
+2026-06-01T13:50:32.4559746Z ##[endgroup]
+2026-06-01T13:50:32.4613098Z [command]/usr/bin/git log -1 --format=%H
+2026-06-01T13:50:32.4643643Z 30ca237ee3a3c49aaa0f2cb249a14a285d7a55d3

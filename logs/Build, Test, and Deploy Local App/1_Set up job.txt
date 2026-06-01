@@ -1,0 +1,16 @@
+﻿2026-06-01T13:50:25.6055025Z Current runner version: '2.334.0'
+2026-06-01T13:50:25.6065430Z Runner name: 'vm-runner'
+2026-06-01T13:50:25.6066429Z Runner group name: 'Default'
+2026-06-01T13:50:25.6067531Z Machine name: 'ubuntu'
+2026-06-01T13:50:25.6070978Z ##[group]GITHUB_TOKEN Permissions
+2026-06-01T13:50:25.6074006Z Contents: read
+2026-06-01T13:50:25.6074795Z Metadata: read
+2026-06-01T13:50:25.6075514Z Packages: read
+2026-06-01T13:50:25.6076253Z ##[endgroup]
+2026-06-01T13:50:25.6078922Z Secret source: Actions
+2026-06-01T13:50:25.6080101Z Prepare workflow directory
+2026-06-01T13:50:25.6617176Z Prepare all required actions
+2026-06-01T13:50:25.6667392Z Getting action download info
+2026-06-01T13:50:26.7882395Z Download action repository 'actions/checkout@v4' (SHA:34e114876b0b11c390a56381ad16ebd13914f8d5)
+2026-06-01T13:50:28.2746655Z Download action repository 'actions/setup-python@v5' (SHA:a26af69be951a213d495a4c3e4e4022e16d87065)
+2026-06-01T13:50:30.6358814Z Complete job name: Build, Test, and Deploy Local App
