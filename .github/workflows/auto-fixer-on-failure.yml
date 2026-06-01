@@ -3,6 +3,7 @@ name: Auto Fix Failed Local CI
 permissions:
   contents: write
   actions: write
+  workflows: write      # required to push changes to .github/workflows/*.yml
 
 on:
   workflow_run:
@@ -30,7 +31,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install auto-fixer dependencies
+      - name: Install dependencies
         run: pip install requests --quiet || true
 
       - name: Validate required secrets
@@ -52,9 +53,9 @@ jobs:
           with open(event_path, 'r', encoding='utf-8') as f:
               event = json.load(f)
 
-          run_id = event['workflow_run']['id']
-          repo_full = event['repository']['full_name']
-          headers = {
+          run_id     = event['workflow_run']['id']
+          repo_full  = event['repository']['full_name']
+          headers    = {
               'Authorization': f"Bearer {os.environ['GITHUB_TOKEN']}",
               'Accept': 'application/vnd.github+json'
           }
@@ -96,18 +97,6 @@ jobs:
           OLLAMA_MODEL: ${{ secrets.OLLAMA_MODEL }}
         run: python3 auto-fixer.py --input failure.log
 
-      - name: Commit and push auto-fix
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No file changes to commit — fix may have been non-file-based."
-          else
-            git commit -m "fix: auto-fixer patch from failed run ${{ github.event.workflow_run.id }}"
-            git push
-          fi
-
       - name: Re-trigger workflow via dispatch
         if: success()
         env:
@@ -121,12 +110,12 @@ jobs:
               event = json.load(f)
 
           repo_full = event['repository']['full_name']
-          branch = event['workflow_run']['head_branch']
-          headers = {
+          branch    = event['workflow_run']['head_branch']
+          headers   = {
               'Authorization': f"Bearer {os.environ['GITHUB_TOKEN']}",
               'Accept': 'application/vnd.github+json'
           }
-          url = f'https://api.github.com/repos/{repo_full}/actions/workflows/ci-local-deploy.yml/dispatches'
+          url  = f'https://api.github.com/repos/{repo_full}/actions/workflows/ci-local-deploy.yml/dispatches'
           resp = requests.post(url, headers=headers, json={'ref': branch}, timeout=60)
           if resp.status_code not in (200, 204):
               print(f'Dispatch failed: HTTP {resp.status_code} — {resp.text}', file=sys.stderr)

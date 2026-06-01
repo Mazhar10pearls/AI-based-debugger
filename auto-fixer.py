@@ -25,25 +25,59 @@ class WorkflowAnalyzer:
         self.api_url = api_url
 
     def _extract_error_lines(self, log_text):
-        """Pull only critical error lines from the raw log."""
-        keywords = [
+        """
+        Pull only critical error lines from the raw log.
+        Excludes noisy-but-normal lines like allow-prereleases, fetch-depth etc.
+        """
+        # Lines containing these are actual errors
+        error_keywords = [
             "error", "failed", "failure", "exception", "traceback",
             "exit code", "no module", "not found", "invalid", "fatal",
-            "python-version", "syntaxerror", "importerror", "cannot",
+            "syntaxerror", "importerror", "cannot", "refused", "rejected",
+            "killed", "denied", "timeout", "unavailable", "missing",
         ]
+
+        # Lines containing these are normal setup output — skip them
+        noise_keywords = [
+            "allow-prereleases",
+            "fetch-depth",
+            "persist-credentials",
+            "set-safe-directory",
+            "sparse-checkout",
+            "update-environment",
+            "freethreaded",
+            "check-latest",
+            "##[group]",
+            "##[endgroup]",
+            "git config",
+            "git submodule",
+        ]
+
         lines    = log_text.splitlines()
-        relevant = [l.strip() for l in lines if any(k in l.lower() for k in keywords)]
-        tail     = [l.strip() for l in lines[-20:]]
+        relevant = []
+        for l in lines:
+            stripped = l.strip()
+            if not stripped:
+                continue
+            low = stripped.lower()
+            # Skip noise lines
+            if any(n in low for n in noise_keywords):
+                continue
+            # Keep error lines
+            if any(k in low for k in error_keywords):
+                relevant.append(stripped)
+
+        # Always include last 20 lines — job conclusion lives here
+        tail = [l.strip() for l in lines[-20:] if l.strip()]
 
         seen, out = set(), []
         for l in relevant + tail:
-            if l and l not in seen:
+            if l not in seen:
                 seen.add(l)
                 out.append(l)
 
         result = "\n".join(out)
         print(f"[INFO] Extracted {len(out)} error lines ({len(result)} chars)")
-        # Return the tail — most recent errors are most relevant
         return result[-MAX_LOG_CHARS:]
 
     def analyze(self, log_text):
@@ -51,16 +85,19 @@ class WorkflowAnalyzer:
         print(f"[INFO] Sending {len(snippet)} chars to Ollama...")
 
         prompt = (
-            "You are a DevOps expert. Analyze this CI/CD failure and return a JSON fix.\n\n"
+            "You are a DevOps expert. Analyze this GitHub Actions failure log.\n\n"
             "Failure log:\n"
             f"{snippet}\n\n"
-            "Respond with a single JSON object with these exact fields:\n"
+            "Identify the root cause and which file needs to be fixed.\n"
+            "Common causes: wrong runner labels in runs-on, wrong python-version,\n"
+            "bad package version in requirements.txt, broken Dockerfile.\n\n"
+            "Respond with a single JSON object with these fields:\n"
             "- root_cause: what went wrong\n"
             "- severity: critical, high, medium, or low\n"
             "- fix_type: dependency, dockerfile, github-action, config, or code\n"
             "- fixed_file: relative path to the file that needs fixing\n"
             "- fixed_content: the COMPLETE corrected file content\n"
-            "- commit_message: a short git commit message starting with fix:\n"
+            "- commit_message: short git commit message starting with fix:\n"
             "- explanation: one sentence explaining the fix\n\n"
             "Return ONLY the JSON object, no other text."
         )
@@ -89,8 +126,7 @@ class WorkflowAnalyzer:
         # Strip markdown fences if model added them
         raw = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
 
-        # Model sometimes outputs an empty {} before the real answer.
-        # Collect ALL JSON objects and pick the longest (most complete) one.
+        # Model sometimes outputs empty {} before the real answer — take the longest match
         matches = re.findall(r"\{.*?\}", raw, re.DOTALL)
         if not matches:
             raise ValueError(f"No JSON found in Ollama response:\n{raw}")
@@ -122,17 +158,22 @@ class AutoFixer:
     def commit_fix(self, fix_data):
         commit_msg = fix_data.get("commit_message", "fix: auto-fixer patch")
         try:
-            subprocess.run(["git", "config", "user.name",  "github-actions[bot]"],             check=True, capture_output=True)
-            subprocess.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"], check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name",  "github-actions[bot]"],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email",
+                            "github-actions[bot]@users.noreply.github.com"],
+                           check=True, capture_output=True)
             subprocess.run(["git", "add", "-A"], check=True, capture_output=True)
 
-            diff = subprocess.run(["git", "diff", "--cached", "--quiet"], capture_output=True)
+            diff = subprocess.run(["git", "diff", "--cached", "--quiet"],
+                                  capture_output=True)
             if diff.returncode == 0:
                 print("[INFO] No changes to commit.")
                 return True
 
-            subprocess.run(["git", "commit", "-m", commit_msg], check=True, capture_output=True)
-            subprocess.run(["git", "push"],                      check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", commit_msg],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "push"], check=True, capture_output=True)
             print(f"[COMMITTED] {commit_msg}")
             return True
         except subprocess.CalledProcessError as exc:
@@ -149,14 +190,13 @@ class AutoFixer:
 
 def main():
     parser = argparse.ArgumentParser(description="AI Auto-Fixer for CI/CD failures.")
-    parser.add_argument("--input",     "-i", required=True,          help="Path to failure log.")
-    parser.add_argument("--model",           default=DEFAULT_MODEL,  help="Ollama model name.")
-    parser.add_argument("--api-url",         default=DEFAULT_API_URL,help="Ollama API endpoint.")
-    parser.add_argument("--no-commit",       action="store_true",    help="Skip git commit.")
-    parser.add_argument("--repo",            default=".",            help="Path to git repo.")
+    parser.add_argument("--input",     "-i", required=True)
+    parser.add_argument("--model",           default=DEFAULT_MODEL)
+    parser.add_argument("--api-url",         default=DEFAULT_API_URL)
+    parser.add_argument("--no-commit",       action="store_true")
+    parser.add_argument("--repo",            default=".")
     args = parser.parse_args()
 
-    # Step 1: Read log
     print("[STEP 1] Reading failure log...")
     log_path = Path(args.input)
     if not log_path.is_file():
@@ -165,7 +205,6 @@ def main():
     log_content = log_path.read_text(encoding="utf-8", errors="replace")
     print(f"[INFO] Raw log: {len(log_content)} chars")
 
-    # Step 2: AI analysis
     print("[STEP 2] Analyzing with Ollama...")
     analyzer = WorkflowAnalyzer(model=args.model, api_url=args.api_url)
     try:
@@ -181,7 +220,6 @@ def main():
     print(f"  File to fix: {fix_data.get('fixed_file', 'unknown')}")
     print(f"  Explanation: {fix_data.get('explanation', '')}")
 
-    # Step 3: Apply and commit
     print("\n[STEP 3] Applying fix...")
     fixer = AutoFixer(repo_path=args.repo)
     if not fixer.auto_fix(fix_data, commit=not args.no_commit):
