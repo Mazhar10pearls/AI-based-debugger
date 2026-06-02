@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AI-Powered Auto-Fixer for CI/CD Workflows (Production-Ready)
+AI-Powered Auto-Fixer for CI/CD Workflows (Stable + YAML Safe)
 """
 
 import argparse
@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 import requests
+import yaml
 
 DEFAULT_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/v1/completions")
 DEFAULT_MODEL   = os.environ.get("OLLAMA_MODEL", "llama3.2")
@@ -23,7 +24,6 @@ MAX_LOG_CHARS   = 600
 # ---------------------------
 
 def extract_json(text):
-    """Extract valid JSON using bracket matching."""
     start = text.find("{")
     if start == -1:
         raise ValueError("No JSON found")
@@ -41,37 +41,59 @@ def extract_json(text):
 
 
 def safe_load_json(text):
-    """Attempt to repair and load JSON."""
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         print("[WARN] Repairing JSON...")
-
         text = text.replace('"{}"', '{}')
         text = re.sub(r",\s*}", "}", text)
         text = re.sub(r",\s*]", "]", text)
-
         return json.loads(text)
 
 
 def extract_yaml(text):
-    """Extract YAML from messy AI output."""
-    text = re.sub(r"```(?:yaml|json)?", "", text)
+    """Extract ONLY valid YAML (strip AI explanations)."""
+
+    # Remove markdown
+    text = re.sub(r"```(?:yaml|yml|json)?", "", text)
     text = text.replace("```", "").strip()
 
-    # Heuristic: YAML starts with 'name:' or 'on:'
+    # Find YAML start
     match = re.search(r"(name:.*)", text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
+    if not match:
+        return text.strip()
 
-    return text.strip()
+    yaml_text = match.group(1)
+
+    # 🚨 Stop at garbage markers
+    stop_markers = [
+        "\nChanges made",
+        "\nExplanation",
+        "\nFix:",
+        "\nSummary",
+        "\n---",
+    ]
+
+    for marker in stop_markers:
+        if marker in yaml_text:
+            yaml_text = yaml_text.split(marker)[0]
+
+    return yaml_text.strip()
 
 
 def normalize_path(path):
-    """Ensure workflow path is correct."""
     if not path.startswith(".github/workflows"):
         return f".github/workflows/{path}"
     return path
+
+
+def is_valid_yaml(content):
+    try:
+        yaml.safe_load(content)
+        return True
+    except Exception as e:
+        print(f"[WARN] Invalid YAML: {e}")
+        return False
 
 
 # ---------------------------
@@ -91,10 +113,8 @@ class WorkflowAnalyzer:
         tail = [l.strip() for l in lines[-15:] if l.strip()]
 
         merged = list(dict.fromkeys(relevant + tail))
-        result = "\n".join(merged)
-
         print(f"[INFO] Extracted {len(merged)} error lines")
-        return result[-MAX_LOG_CHARS:]
+        return "\n".join(merged)[-MAX_LOG_CHARS:]
 
     def _find_workflow_file(self):
         p = Path(".github/workflows/ci-local-deploy.yml")
@@ -114,7 +134,7 @@ class WorkflowAnalyzer:
             f"Workflow:\n{workflow}\n\n"
             "Return ONLY valid JSON.\n"
             "fixed_content MUST be a STRING (YAML).\n"
-            "No triple quotes.\n"
+            "Do NOT include explanations inside YAML.\n"
         )
 
         payload = {
@@ -130,23 +150,21 @@ class WorkflowAnalyzer:
         raw = resp.json().get("choices", [{}])[0].get("text", "")
         print(f"[AI RAW]: {raw[:300]}...")
 
-        # ---------------------------
-        # ✅ Try JSON Mode
-        # ---------------------------
+        # Try JSON mode
         try:
             extracted = extract_json(raw)
             data = safe_load_json(extracted)
 
             if "fixed_content" in data:
-                data["fixed_file"] = normalize_path(data.get("fixed_file", "ci-local-deploy.yml"))
+                data["fixed_file"] = normalize_path(
+                    data.get("fixed_file", "ci-local-deploy.yml")
+                )
                 return data
 
         except Exception as e:
             print(f"[WARN] JSON failed: {e}")
 
-        # ---------------------------
-        # 🔥 FALLBACK YAML MODE
-        # ---------------------------
+        # 🔥 Fallback YAML mode
         print("[INFO] Switching to YAML fallback mode")
 
         yaml_content = extract_yaml(raw)
@@ -176,6 +194,11 @@ class AutoFixer:
 
         if not file or not content:
             print("[ERROR] Invalid fix data")
+            return False
+
+        # ✅ Validate YAML before writing
+        if not is_valid_yaml(content):
+            print("[ERROR] YAML invalid — rejecting AI fix")
             return False
 
         Path(file).parent.mkdir(parents=True, exist_ok=True)
@@ -221,7 +244,6 @@ def main():
 
     analyzer = WorkflowAnalyzer()
 
-    # ✅ Retry logic
     for attempt in range(3):
         try:
             fix = analyzer.analyze(log)
