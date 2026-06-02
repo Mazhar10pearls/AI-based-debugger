@@ -1,119 +1,119 @@
-﻿2026-06-02T16:37:35.8222322Z Current runner version: '2.334.0'
-2026-06-02T16:37:35.8229853Z Runner name: 'vm-runner'
-2026-06-02T16:37:35.8230755Z Runner group name: 'Default'
-2026-06-02T16:37:35.8232097Z Machine name: 'ubuntu'
-2026-06-02T16:37:35.8236459Z ##[group]GITHUB_TOKEN Permissions
-2026-06-02T16:37:35.8239219Z Contents: read
-2026-06-02T16:37:35.8240117Z Metadata: read
-2026-06-02T16:37:35.8240854Z Packages: read
-2026-06-02T16:37:35.8241778Z ##[endgroup]
-2026-06-02T16:37:35.8244773Z Secret source: Actions
-2026-06-02T16:37:35.8245696Z Prepare workflow directory
-2026-06-02T16:37:35.8775524Z Prepare all required actions
-2026-06-02T16:37:35.8824175Z Getting action download info
-2026-06-02T16:37:37.0310483Z Download action repository 'actions/checkout@v4' (SHA:34e114876b0b11c390a56381ad16ebd13914f8d5)
-2026-06-02T16:37:38.7474697Z Download action repository 'actions/setup-python@v5' (SHA:a26af69be951a213d495a4c3e4e4022e16d87065)
-2026-06-02T16:37:41.8270737Z Complete job name: Build, Test, and Deploy Local App
-2026-06-02T16:37:41.9302903Z ##[group]Run actions/checkout@v4
-2026-06-02T16:37:41.9303731Z with:
-2026-06-02T16:37:41.9304085Z   persist-credentials: true
-2026-06-02T16:37:41.9304470Z   fetch-depth: 0
-2026-06-02T16:37:41.9304856Z   repository: Mazhar10pearls/AI-based-debugger
-2026-06-02T16:37:41.9308864Z   token: ***
-2026-06-02T16:37:41.9309190Z   ssh-strict: true
-2026-06-02T16:37:41.9309522Z   ssh-user: git
-2026-06-02T16:37:41.9309847Z   clean: true
-2026-06-02T16:37:41.9310198Z   sparse-checkout-cone-mode: true
-2026-06-02T16:37:41.9310606Z   fetch-tags: false
-2026-06-02T16:37:41.9311577Z   show-progress: true
-2026-06-02T16:37:41.9312016Z   lfs: false
-2026-06-02T16:37:41.9312340Z   submodules: false
-2026-06-02T16:37:41.9312711Z   set-safe-directory: true
-2026-06-02T16:37:41.9313488Z ##[endgroup]
-2026-06-02T16:37:42.1186969Z Syncing repository: Mazhar10pearls/AI-based-debugger
-2026-06-02T16:37:42.1190112Z ##[group]Getting Git version info
-2026-06-02T16:37:42.1191068Z Working directory is '/home/ubuntu/actions-runner/_work/AI-based-debugger/AI-based-debugger'
-2026-06-02T16:37:42.1193192Z [command]/usr/bin/git version
-2026-06-02T16:37:42.1194146Z git version 2.43.0
-2026-06-02T16:37:42.1195545Z ##[endgroup]
-2026-06-02T16:37:42.1200131Z Temporarily overriding HOME='/home/ubuntu/actions-runner/_work/_temp/64c5618a-c3c3-4edd-be06-0633d7383710' before making global git config changes
-2026-06-02T16:37:42.1201695Z Adding repository directory to the temporary git global config as a safe directory
-2026-06-02T16:37:42.1202881Z [command]/usr/bin/git config --global --add safe.directory /home/ubuntu/actions-runner/_work/AI-based-debugger/AI-based-debugger
-2026-06-02T16:37:42.1204472Z [command]/usr/bin/git config --local --get remote.origin.url
-2026-06-02T16:37:42.1205175Z https://github.com/Mazhar10pearls/AI-based-debugger
-2026-06-02T16:37:42.1206637Z ##[group]Removing previously created refs, to avoid conflicts
-2026-06-02T16:37:42.1207402Z [command]/usr/bin/git rev-parse --symbolic-full-name --verify --quiet HEAD
-2026-06-02T16:37:42.1208086Z refs/heads/main
-2026-06-02T16:37:42.1208984Z [command]/usr/bin/git checkout --detach
-2026-06-02T16:37:42.1232318Z HEAD is now at 4808992 fixed applied on py files
-2026-06-02T16:37:42.1279638Z [command]/usr/bin/git branch --delete --force main
-2026-06-02T16:37:42.1311795Z Deleted branch main (was 4808992).
-2026-06-02T16:37:42.1352316Z ##[endgroup]
-2026-06-02T16:37:42.1356552Z [command]/usr/bin/git submodule status
-2026-06-02T16:37:42.1607705Z ##[group]Cleaning the repository
-2026-06-02T16:37:42.1613651Z [command]/usr/bin/git clean -ffdx
-2026-06-02T16:37:42.1654980Z [command]/usr/bin/git reset --hard HEAD
-2026-06-02T16:37:42.1697029Z HEAD is now at 4808992 fixed applied on py files
-2026-06-02T16:37:42.1703642Z ##[endgroup]
-2026-06-02T16:37:42.1706151Z ##[group]Disabling automatic garbage collection
-2026-06-02T16:37:42.1711400Z [command]/usr/bin/git config --local gc.auto 0
-2026-06-02T16:37:42.1741618Z ##[endgroup]
-2026-06-02T16:37:42.1742715Z ##[group]Setting up auth
-2026-06-02T16:37:42.1749852Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
-2026-06-02T16:37:42.1794697Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
-2026-06-02T16:37:42.2088598Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
-2026-06-02T16:37:42.2120595Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
-2026-06-02T16:37:42.2362515Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
-2026-06-02T16:37:42.2400758Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
-2026-06-02T16:37:42.2670055Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
-2026-06-02T16:37:42.2726433Z ##[endgroup]
-2026-06-02T16:37:42.2727326Z ##[group]Fetching the repository
-2026-06-02T16:37:42.2740743Z [command]/usr/bin/git -c protocol.version=2 fetch --prune --no-recurse-submodules origin +refs/heads/*:refs/remotes/origin/* +refs/tags/*:refs/tags/*
-2026-06-02T16:37:43.6170693Z From https://github.com/Mazhar10pearls/AI-based-debugger
-2026-06-02T16:37:43.6176685Z    4808992..961c88c  main       -> origin/main
-2026-06-02T16:37:43.6209007Z [command]/usr/bin/git branch --list --remote origin/main
-2026-06-02T16:37:43.6240696Z   origin/main
-2026-06-02T16:37:43.6251440Z [command]/usr/bin/git rev-parse refs/remotes/origin/main
-2026-06-02T16:37:43.6279565Z 961c88c7554959b68b3a81b8515f485c959ae705
-2026-06-02T16:37:43.6285780Z ##[endgroup]
-2026-06-02T16:37:43.6286894Z ##[group]Determining the checkout info
-2026-06-02T16:37:43.6288001Z ##[endgroup]
-2026-06-02T16:37:43.6292635Z [command]/usr/bin/git sparse-checkout disable
-2026-06-02T16:37:43.6338177Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
-2026-06-02T16:37:43.6372419Z ##[group]Checking out the ref
-2026-06-02T16:37:43.6377154Z [command]/usr/bin/git checkout --progress --force -B main refs/remotes/origin/main
-2026-06-02T16:37:43.6413986Z Previous HEAD position was 4808992 fixed applied on py files
-2026-06-02T16:37:43.6424547Z Switched to a new branch 'main'
-2026-06-02T16:37:43.6425653Z branch 'main' set up to track 'origin/main'.
-2026-06-02T16:37:43.6431824Z ##[endgroup]
-2026-06-02T16:37:43.6475155Z [command]/usr/bin/git log -1 --format=%H
-2026-06-02T16:37:43.6502947Z 961c88c7554959b68b3a81b8515f485c959ae705
-2026-06-02T16:37:43.6762112Z ##[group]Run actions/setup-python@v5
-2026-06-02T16:37:43.6762534Z with:
-2026-06-02T16:37:43.6762816Z   python-version: 3.2
-2026-06-02T16:37:43.6763130Z   check-latest: false
-2026-06-02T16:37:43.6767130Z   token: ***
-2026-06-02T16:37:43.6767419Z   update-environment: true
-2026-06-02T16:37:43.6767757Z   allow-prereleases: false
-2026-06-02T16:37:43.6768086Z   freethreaded: false
-2026-06-02T16:37:43.6768403Z ##[endgroup]
-2026-06-02T16:37:43.8959314Z ##[group]Installed versions
-2026-06-02T16:37:43.9011973Z Version 3.2 was not found in the local cache
-2026-06-02T16:37:46.2039105Z ##[error]The version '3.2' with architecture 'x64' was not found for Ubuntu 24.04.
+﻿2026-06-02T19:40:36.2700829Z Current runner version: '2.334.0'
+2026-06-02T19:40:36.2709115Z Runner name: 'vm-runner'
+2026-06-02T19:40:36.2710115Z Runner group name: 'Default'
+2026-06-02T19:40:36.2711348Z Machine name: 'ubuntu'
+2026-06-02T19:40:36.2714678Z ##[group]GITHUB_TOKEN Permissions
+2026-06-02T19:40:36.2717340Z Contents: read
+2026-06-02T19:40:36.2718305Z Metadata: read
+2026-06-02T19:40:36.2719040Z Packages: read
+2026-06-02T19:40:36.2719709Z ##[endgroup]
+2026-06-02T19:40:36.2723477Z Secret source: Actions
+2026-06-02T19:40:36.2724411Z Prepare workflow directory
+2026-06-02T19:40:36.3272624Z Prepare all required actions
+2026-06-02T19:40:36.3322285Z Getting action download info
+2026-06-02T19:40:37.4353261Z Download action repository 'actions/checkout@v4' (SHA:34e114876b0b11c390a56381ad16ebd13914f8d5)
+2026-06-02T19:40:39.6915413Z Download action repository 'actions/setup-python@v5' (SHA:a26af69be951a213d495a4c3e4e4022e16d87065)
+2026-06-02T19:40:41.9067048Z Complete job name: Build, Test, and Deploy Local App
+2026-06-02T19:40:42.0258634Z ##[group]Run actions/checkout@v4
+2026-06-02T19:40:42.0259571Z with:
+2026-06-02T19:40:42.0259955Z   persist-credentials: true
+2026-06-02T19:40:42.0260378Z   fetch-depth: 0
+2026-06-02T19:40:42.0260806Z   repository: Mazhar10pearls/AI-based-debugger
+2026-06-02T19:40:42.0265276Z   token: ***
+2026-06-02T19:40:42.0265649Z   ssh-strict: true
+2026-06-02T19:40:42.0266014Z   ssh-user: git
+2026-06-02T19:40:42.0266365Z   clean: true
+2026-06-02T19:40:42.0266751Z   sparse-checkout-cone-mode: true
+2026-06-02T19:40:42.0267211Z   fetch-tags: false
+2026-06-02T19:40:42.0267593Z   show-progress: true
+2026-06-02T19:40:42.0267980Z   lfs: false
+2026-06-02T19:40:42.0268331Z   submodules: false
+2026-06-02T19:40:42.0268718Z   set-safe-directory: true
+2026-06-02T19:40:42.0269464Z ##[endgroup]
+2026-06-02T19:40:42.2292984Z Syncing repository: Mazhar10pearls/AI-based-debugger
+2026-06-02T19:40:42.2294789Z ##[group]Getting Git version info
+2026-06-02T19:40:42.2295657Z Working directory is '/home/ubuntu/actions-runner/_work/AI-based-debugger/AI-based-debugger'
+2026-06-02T19:40:42.2297653Z [command]/usr/bin/git version
+2026-06-02T19:40:42.2298170Z git version 2.43.0
+2026-06-02T19:40:42.2342425Z ##[endgroup]
+2026-06-02T19:40:42.2363913Z Temporarily overriding HOME='/home/ubuntu/actions-runner/_work/_temp/feb774e2-24ad-43e2-8069-7412ecaf8f02' before making global git config changes
+2026-06-02T19:40:42.2365562Z Adding repository directory to the temporary git global config as a safe directory
+2026-06-02T19:40:42.2372700Z [command]/usr/bin/git config --global --add safe.directory /home/ubuntu/actions-runner/_work/AI-based-debugger/AI-based-debugger
+2026-06-02T19:40:42.2432159Z [command]/usr/bin/git config --local --get remote.origin.url
+2026-06-02T19:40:42.2456238Z https://github.com/Mazhar10pearls/AI-based-debugger
+2026-06-02T19:40:42.2475559Z ##[group]Removing previously created refs, to avoid conflicts
+2026-06-02T19:40:42.2481627Z [command]/usr/bin/git rev-parse --symbolic-full-name --verify --quiet HEAD
+2026-06-02T19:40:42.2505172Z refs/heads/main
+2026-06-02T19:40:42.2516217Z [command]/usr/bin/git checkout --detach
+2026-06-02T19:40:42.2561438Z HEAD is now at 7116bd7 Update persist-credentials to fetch-depth in actions/checkout
+2026-06-02T19:40:42.2610445Z [command]/usr/bin/git branch --delete --force main
+2026-06-02T19:40:42.2642065Z Deleted branch main (was 7116bd7).
+2026-06-02T19:40:42.2682898Z ##[endgroup]
+2026-06-02T19:40:42.2687465Z [command]/usr/bin/git submodule status
+2026-06-02T19:40:42.2979804Z ##[group]Cleaning the repository
+2026-06-02T19:40:42.2987860Z [command]/usr/bin/git clean -ffdx
+2026-06-02T19:40:42.3029260Z [command]/usr/bin/git reset --hard HEAD
+2026-06-02T19:40:42.3079496Z HEAD is now at 7116bd7 Update persist-credentials to fetch-depth in actions/checkout
+2026-06-02T19:40:42.3087621Z ##[endgroup]
+2026-06-02T19:40:42.3089590Z ##[group]Disabling automatic garbage collection
+2026-06-02T19:40:42.3092689Z [command]/usr/bin/git config --local gc.auto 0
+2026-06-02T19:40:42.3138773Z ##[endgroup]
+2026-06-02T19:40:42.3140195Z ##[group]Setting up auth
+2026-06-02T19:40:42.3145386Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-06-02T19:40:42.3209733Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-06-02T19:40:42.3454670Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-06-02T19:40:42.3498903Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-06-02T19:40:42.3740430Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-06-02T19:40:42.3790328Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-06-02T19:40:42.4059610Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2026-06-02T19:40:42.4100380Z ##[endgroup]
+2026-06-02T19:40:42.4102316Z ##[group]Fetching the repository
+2026-06-02T19:40:42.4110918Z [command]/usr/bin/git -c protocol.version=2 fetch --prune --no-recurse-submodules origin +refs/heads/*:refs/remotes/origin/* +refs/tags/*:refs/tags/*
+2026-06-02T19:40:43.8087486Z From https://github.com/Mazhar10pearls/AI-based-debugger
+2026-06-02T19:40:43.8089368Z    7116bd7..094bc86  main       -> origin/main
+2026-06-02T19:40:43.8141467Z [command]/usr/bin/git branch --list --remote origin/main
+2026-06-02T19:40:43.8173382Z   origin/main
+2026-06-02T19:40:43.8186561Z [command]/usr/bin/git rev-parse refs/remotes/origin/main
+2026-06-02T19:40:43.8215342Z 094bc86d5ea1192d5d265210be7d5a9b4ee279db
+2026-06-02T19:40:43.8222534Z ##[endgroup]
+2026-06-02T19:40:43.8223444Z ##[group]Determining the checkout info
+2026-06-02T19:40:43.8224537Z ##[endgroup]
+2026-06-02T19:40:43.8229517Z [command]/usr/bin/git sparse-checkout disable
+2026-06-02T19:40:43.8270583Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-06-02T19:40:43.8312120Z ##[group]Checking out the ref
+2026-06-02T19:40:43.8317428Z [command]/usr/bin/git checkout --progress --force -B main refs/remotes/origin/main
+2026-06-02T19:40:43.8351989Z Previous HEAD position was 7116bd7 Update persist-credentials to fetch-depth in actions/checkout
+2026-06-02T19:40:43.8361859Z Switched to a new branch 'main'
+2026-06-02T19:40:43.8362913Z branch 'main' set up to track 'origin/main'.
+2026-06-02T19:40:43.8366893Z ##[endgroup]
+2026-06-02T19:40:43.8408804Z [command]/usr/bin/git log -1 --format=%H
+2026-06-02T19:40:43.8435551Z 094bc86d5ea1192d5d265210be7d5a9b4ee279db
+2026-06-02T19:40:43.8693128Z ##[group]Run actions/setup-python@v5
+2026-06-02T19:40:43.8693546Z with:
+2026-06-02T19:40:43.8693936Z   python-version: 3.2
+2026-06-02T19:40:43.8694268Z   check-latest: false
+2026-06-02T19:40:43.8698119Z   token: ***
+2026-06-02T19:40:43.8698589Z   update-environment: true
+2026-06-02T19:40:43.8698985Z   allow-prereleases: false
+2026-06-02T19:40:43.8699335Z   freethreaded: false
+2026-06-02T19:40:43.8699654Z ##[endgroup]
+2026-06-02T19:40:44.1204714Z ##[group]Installed versions
+2026-06-02T19:40:44.1345257Z Version 3.2 was not found in the local cache
+2026-06-02T19:40:47.8243884Z ##[error]The version '3.2' with architecture 'x64' was not found for Ubuntu 24.04.
 The list of all available versions can be found here: https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json
-2026-06-02T16:37:46.2276906Z Post job cleanup.
-2026-06-02T16:37:46.3800266Z [command]/usr/bin/git version
-2026-06-02T16:37:46.3922533Z git version 2.43.0
-2026-06-02T16:37:46.4128128Z Temporarily overriding HOME='/home/ubuntu/actions-runner/_work/_temp/956b22d5-cd5f-4e63-8e11-239ef1e01e89' before making global git config changes
-2026-06-02T16:37:46.4139699Z Adding repository directory to the temporary git global config as a safe directory
-2026-06-02T16:37:46.4144302Z [command]/usr/bin/git config --global --add safe.directory /home/ubuntu/actions-runner/_work/AI-based-debugger/AI-based-debugger
-2026-06-02T16:37:46.4219146Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
-2026-06-02T16:37:46.4260954Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
-2026-06-02T16:37:46.4607646Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
-2026-06-02T16:37:46.4638816Z http.https://github.com/.extraheader
-2026-06-02T16:37:46.4792128Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
-2026-06-02T16:37:46.4795292Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
-2026-06-02T16:37:46.4979993Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
-2026-06-02T16:37:46.5018108Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
-2026-06-02T16:37:46.5418259Z Cleaning up orphan processes
-2026-06-02T16:37:46.5740257Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: actions/checkout@v4, actions/setup-python@v5. Actions will be forced to run with Node.js 24 by default starting June 16th, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+2026-06-02T19:40:47.8480026Z Post job cleanup.
+2026-06-02T19:40:47.9753362Z [command]/usr/bin/git version
+2026-06-02T19:40:47.9820401Z git version 2.43.0
+2026-06-02T19:40:47.9875851Z Temporarily overriding HOME='/home/ubuntu/actions-runner/_work/_temp/c0a0e69b-d057-4f76-ac9c-9b4809d00ed6' before making global git config changes
+2026-06-02T19:40:47.9883289Z Adding repository directory to the temporary git global config as a safe directory
+2026-06-02T19:40:47.9888118Z [command]/usr/bin/git config --global --add safe.directory /home/ubuntu/actions-runner/_work/AI-based-debugger/AI-based-debugger
+2026-06-02T19:40:48.0097516Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-06-02T19:40:48.0105031Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-06-02T19:40:48.0256909Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-06-02T19:40:48.0285054Z http.https://github.com/.extraheader
+2026-06-02T19:40:48.0297707Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+2026-06-02T19:40:48.0338783Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-06-02T19:40:48.0588923Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-06-02T19:40:48.0630411Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-06-02T19:40:48.1039956Z Cleaning up orphan processes
+2026-06-02T19:40:48.1405895Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: actions/checkout@v4, actions/setup-python@v5. Actions will be forced to run with Node.js 24 by default starting June 16th, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/

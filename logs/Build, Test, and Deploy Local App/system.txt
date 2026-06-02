@@ -1,7 +1,7 @@
-2026-06-02T16:37:31.1360000Z Evaluating build-and-deploy.if
-2026-06-02T16:37:31.1360000Z Evaluating: success()
-2026-06-02T16:37:31.1360000Z Result: true
-2026-06-02T16:37:31.1390000Z Requested labels: self-hosted, linux, docker, ci
-2026-06-02T16:37:31.1390000Z Job defined at: Mazhar10pearls/AI-based-debugger/.github/workflows/ci-local-deploy.yml@refs/heads/main
-2026-06-02T16:37:31.1390000Z Waiting for a runner to pick up this job...
-2026-06-02T16:37:31.1440000Z Job is about to start running on the runner: vm-runner
+2026-06-02T19:40:31.7760000Z Evaluating build-and-deploy.if
+2026-06-02T19:40:31.7760000Z Evaluating: success()
+2026-06-02T19:40:31.7760000Z Result: true
+2026-06-02T19:40:31.7870000Z Job is about to start running on the runner: vm-runner
+2026-06-02T19:40:31.7780000Z Requested labels: self-hosted, linux, docker, ci
+2026-06-02T19:40:31.7780000Z Job defined at: Mazhar10pearls/AI-based-debugger/.github/workflows/ci-local-deploy.yml@refs/heads/main
+2026-06-02T19:40:31.7780000Z Waiting for a runner to pick up this job...
