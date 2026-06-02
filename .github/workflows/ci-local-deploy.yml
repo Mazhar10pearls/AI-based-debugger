@@ -1,45 +1,5 @@
-name: Local CI/CD Deploy
-
-on:
-  push:
-    branches:
-      - main
-  workflow_dispatch:          # ← this was missing, causing the 422
-
+name: Mazhar10pearls/AI-based-debugger
+on: [self-hosted]
 jobs:
-  build-and-deploy:
-    name: Build, Test, and Deploy Local App
-    runs-on: [self-hosted, linux, docker, ci]
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: true
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.2'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r sample_app/requirements.txt
-
-      - name: Run unit tests
-        run: |
-          python -m pytest sample_app/test_app.py
-
-      - name: Build & Run Local Docker App
-        run: |
-          chmod +x sample_app/deploy_local.sh
-          bash sample_app/deploy_local.sh
-
-      - name: Wait for app startup
-        run: sleep 5
-
-      - name: Verify deployment
-        run: |
-          curl -f http://127.0.0.1:5000
+  build-and-test:
+    runs-on: [linux, docker, ci]

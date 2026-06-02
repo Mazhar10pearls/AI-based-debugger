@@ -1,13 +1,13 @@
-﻿2026-06-01T13:50:32.4941624Z ##[group]Run actions/setup-python@v5
-2026-06-01T13:50:32.4942114Z with:
-2026-06-01T13:50:32.4942406Z   python-version: 3.2
-2026-06-01T13:50:32.4942718Z   check-latest: false
-2026-06-01T13:50:32.4948785Z   token: ***
-2026-06-01T13:50:32.4949123Z   update-environment: true
-2026-06-01T13:50:32.4949484Z   allow-prereleases: false
-2026-06-01T13:50:32.4949810Z   freethreaded: false
-2026-06-01T13:50:32.4950131Z ##[endgroup]
-2026-06-01T13:50:32.7268072Z ##[group]Installed versions
-2026-06-01T13:50:32.7316133Z Version 3.2 was not found in the local cache
-2026-06-01T13:50:35.1988768Z ##[error]The version '3.2' with architecture 'x64' was not found for Ubuntu 24.04.
+﻿2026-06-01T14:06:28.3066162Z ##[group]Run actions/setup-python@v5
+2026-06-01T14:06:28.3066591Z with:
+2026-06-01T14:06:28.3066866Z   python-version: 3.2
+2026-06-01T14:06:28.3067192Z   check-latest: false
+2026-06-01T14:06:28.3072047Z   token: ***
+2026-06-01T14:06:28.3072360Z   update-environment: true
+2026-06-01T14:06:28.3072721Z   allow-prereleases: false
+2026-06-01T14:06:28.3073057Z   freethreaded: false
+2026-06-01T14:06:28.3073381Z ##[endgroup]
+2026-06-01T14:06:28.5450888Z ##[group]Installed versions
+2026-06-01T14:06:28.5520959Z Version 3.2 was not found in the local cache
+2026-06-01T14:06:30.6684138Z ##[error]The version '3.2' with architecture 'x64' was not found for Ubuntu 24.04.
 The list of all available versions can be found here: https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json
