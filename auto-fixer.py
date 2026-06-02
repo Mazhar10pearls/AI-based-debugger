@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AI-Powered Auto-Fixer for CI/CD Workflows (Hardened संस्करण)
+AI-Powered Auto-Fixer for CI/CD Workflows (Production-Ready)
 """
 
 import argparse
@@ -12,7 +12,6 @@ import sys
 from pathlib import Path
 
 import requests
-import yaml
 
 DEFAULT_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/v1/completions")
 DEFAULT_MODEL   = os.environ.get("OLLAMA_MODEL", "llama3.2")
@@ -20,14 +19,14 @@ MAX_LOG_CHARS   = 600
 
 
 # ---------------------------
-# 🔧 JSON Utilities (FIXED)
+# 🔧 Extraction Utilities
 # ---------------------------
 
 def extract_json(text):
-    """Safely extract first valid JSON object using bracket matching."""
+    """Extract valid JSON using bracket matching."""
     start = text.find("{")
     if start == -1:
-        raise ValueError("No JSON object found")
+        raise ValueError("No JSON found")
 
     stack = 0
     for i in range(start, len(text)):
@@ -38,15 +37,15 @@ def extract_json(text):
             if stack == 0:
                 return text[start:i+1]
 
-    raise ValueError("Incomplete JSON object")
+    raise ValueError("Incomplete JSON")
 
 
 def safe_load_json(text):
-    """Try parsing JSON with fallback cleanup."""
+    """Attempt to repair and load JSON."""
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        print("[WARN] JSON invalid, attempting repair...")
+        print("[WARN] Repairing JSON...")
 
         text = text.replace('"{}"', '{}')
         text = re.sub(r",\s*}", "}", text)
@@ -55,11 +54,24 @@ def safe_load_json(text):
         return json.loads(text)
 
 
-def normalize_content(content):
-    """Ensure content is string (convert dict → YAML if needed)."""
-    if isinstance(content, dict):
-        return yaml.dump(content, sort_keys=False)
-    return content
+def extract_yaml(text):
+    """Extract YAML from messy AI output."""
+    text = re.sub(r"```(?:yaml|json)?", "", text)
+    text = text.replace("```", "").strip()
+
+    # Heuristic: YAML starts with 'name:' or 'on:'
+    match = re.search(r"(name:.*)", text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+
+    return text.strip()
+
+
+def normalize_path(path):
+    """Ensure workflow path is correct."""
+    if not path.startswith(".github/workflows"):
+        return f".github/workflows/{path}"
+    return path
 
 
 # ---------------------------
@@ -68,85 +80,41 @@ def normalize_content(content):
 
 class WorkflowAnalyzer:
     def __init__(self, model=DEFAULT_MODEL, api_url=DEFAULT_API_URL):
-        self.model   = model
+        self.model = model
         self.api_url = api_url
 
     def _extract_error_lines(self, log_text):
-        error_keywords = [
-            "error", "failed", "failure", "exception", "traceback",
-            "exit code", "no module", "not found", "invalid", "fatal",
-            "syntaxerror", "importerror", "cannot", "refused", "rejected",
-            "killed", "denied", "unavailable", "missing",
-        ]
-
-        noise_keywords = [
-            "allow-prereleases", "fetch-depth", "persist-credentials",
-            "set-safe-directory", "sparse-checkout", "update-environment",
-        ]
-
+        keywords = ["error", "failed", "exception", "exit code", "invalid"]
         lines = log_text.splitlines()
-        relevant = []
 
-        for l in lines:
-            s = l.strip()
-            low = s.lower()
-            if not s:
-                continue
-            if any(n in low for n in noise_keywords):
-                continue
-            if any(k in low for k in error_keywords):
-                relevant.append(s)
-
+        relevant = [l.strip() for l in lines if any(k in l.lower() for k in keywords)]
         tail = [l.strip() for l in lines[-15:] if l.strip()]
 
-        seen, out = set(), []
-        for l in relevant + tail:
-            if l not in seen:
-                seen.add(l)
-                out.append(l)
+        merged = list(dict.fromkeys(relevant + tail))
+        result = "\n".join(merged)
 
-        result = "\n".join(out)
-        print(f"[INFO] Extracted {len(out)} error lines")
+        print(f"[INFO] Extracted {len(merged)} error lines")
         return result[-MAX_LOG_CHARS:]
 
     def _find_workflow_file(self):
-        workflow_dir = Path(".github/workflows")
-        if not workflow_dir.exists():
-            return ""
-
-        for name in ["ci-local-deploy.yml", "ci-local-deploy.yaml"]:
-            p = workflow_dir / name
-            if p.exists():
-                content = p.read_text()
-                print(f"[INFO] Found workflow file: {p}")
-                return content
+        p = Path(".github/workflows/ci-local-deploy.yml")
+        if p.exists():
+            content = p.read_text()
+            print(f"[INFO] Found workflow file: {p}")
+            return content
         return ""
 
     def analyze(self, log_text):
-        snippet  = self._extract_error_lines(log_text)
+        snippet = self._extract_error_lines(log_text)
         workflow = self._find_workflow_file()
 
-        workflow_section = f"\nCurrent workflow:\n{workflow}\n" if workflow else ""
-
         prompt = (
-            "You are a DevOps expert fixing GitHub Actions.\n\n"
-            f"Error log:\n{snippet}\n"
-            f"{workflow_section}\n"
-            "Return ONLY valid JSON.\n\n"
-            "Rules:\n"
-            "- fixed_content MUST be a STRING (valid YAML)\n"
-            "- No trailing commas\n"
-            "- No explanations\n\n"
-            "Schema:\n"
-            "{\n"
-            '  "root_cause": "...",\n'
-            '  "severity": "critical|high|medium|low",\n'
-            '  "fix_type": "...",\n'
-            '  "fixed_file": "...",\n'
-            '  "fixed_content": "...",\n'
-            '  "commit_message": "...",\n'
-            '  "explanation": "..."\n'
-            "}"
+            "Fix this GitHub Actions workflow.\n\n"
+            f"Errors:\n{snippet}\n\n"
+            f"Workflow:\n{workflow}\n\n"
+            "Return ONLY valid JSON.\n"
+            "fixed_content MUST be a STRING (YAML).\n"
+            "No triple quotes.\n"
         )
 
         payload = {
@@ -160,12 +128,38 @@ class WorkflowAnalyzer:
         resp.raise_for_status()
 
         raw = resp.json().get("choices", [{}])[0].get("text", "")
-        raw = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
-
         print(f"[AI RAW]: {raw[:300]}...")
 
-        extracted = extract_json(raw)
-        return safe_load_json(extracted)
+        # ---------------------------
+        # ✅ Try JSON Mode
+        # ---------------------------
+        try:
+            extracted = extract_json(raw)
+            data = safe_load_json(extracted)
+
+            if "fixed_content" in data:
+                data["fixed_file"] = normalize_path(data.get("fixed_file", "ci-local-deploy.yml"))
+                return data
+
+        except Exception as e:
+            print(f"[WARN] JSON failed: {e}")
+
+        # ---------------------------
+        # 🔥 FALLBACK YAML MODE
+        # ---------------------------
+        print("[INFO] Switching to YAML fallback mode")
+
+        yaml_content = extract_yaml(raw)
+
+        return {
+            "root_cause": "fallback_yaml_mode",
+            "severity": "critical",
+            "fix_type": "config",
+            "fixed_file": ".github/workflows/ci-local-deploy.yml",
+            "fixed_content": yaml_content,
+            "commit_message": "fix: auto-fixer fallback YAML mode",
+            "explanation": "Recovered from invalid AI JSON output"
+        }
 
 
 # ---------------------------
@@ -177,17 +171,17 @@ class AutoFixer:
         os.chdir(repo_path)
 
     def apply_fix(self, fix_data):
-        fixed_file = fix_data.get("fixed_file")
-        content    = normalize_content(fix_data.get("fixed_content"))
+        file = fix_data["fixed_file"]
+        content = fix_data["fixed_content"]
 
-        if not fixed_file or not content:
+        if not file or not content:
             print("[ERROR] Invalid fix data")
             return False
 
-        Path(fixed_file).parent.mkdir(parents=True, exist_ok=True)
-        Path(fixed_file).write_text(content)
+        Path(file).parent.mkdir(parents=True, exist_ok=True)
+        Path(file).write_text(content)
 
-        print(f"[FIXED] {fixed_file}")
+        print(f"[FIXED] {file}")
         return True
 
     def commit_fix(self, fix_data):
@@ -238,12 +232,16 @@ def main():
         print("[ERROR] AI failed after retries")
         return 2
 
+    print("\n[ANALYSIS]")
+    print(f"Root cause: {fix.get('root_cause')}")
+    print(f"File: {fix.get('fixed_file')}")
+
     fixer = AutoFixer()
 
     if not fixer.auto_fix(fix):
         return 3
 
-    print("✅ AUTO-FIX COMPLETE")
+    print("\n✅ AUTO-FIX COMPLETE")
     return 0
 
 
