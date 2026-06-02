@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # Use PAT so git push can update workflow files
+          ref: ${{ github.event.workflow_run.head_branch }}
           token: ${{ secrets.GH_PAT }}
 
       - name: Set up Python
@@ -33,7 +33,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install requests --quiet || true
+        run: pip install requests pyyaml --quiet || true
 
       - name: Validate required secrets
         run: |
@@ -42,12 +42,12 @@ jobs:
           : "${GH_PAT:?Secret GH_PAT is not set}"
         env:
           OLLAMA_API_URL: ${{ secrets.OLLAMA_API_URL }}
-          OLLAMA_MODEL: ${{ secrets.OLLAMA_MODEL }}
-          GH_PAT: ${{ secrets.GH_PAT }}
+          OLLAMA_MODEL:   ${{ secrets.OLLAMA_MODEL }}
+          GH_PAT:         ${{ secrets.GH_PAT }}
 
       - name: Download failed workflow logs
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           python3 - <<'PY'
           import json, os, pathlib, requests, zipfile, sys
@@ -59,14 +59,14 @@ jobs:
           run_id    = event['workflow_run']['id']
           repo_full = event['repository']['full_name']
           headers   = {
-              'Authorization': f"Bearer {os.environ['GITHUB_TOKEN']}",
+              'Authorization': f"Bearer {os.environ['GH_PAT']}",
               'Accept': 'application/vnd.github+json'
           }
           url = f'https://api.github.com/repos/{repo_full}/actions/runs/{run_id}/logs'
 
           resp = requests.get(url, headers=headers, timeout=120)
           if resp.status_code != 200:
-              print(f'Failed to download logs: HTTP {resp.status_code}', file=sys.stderr)
+              print(f'Failed to download logs: HTTP {resp.status_code} — {resp.text}', file=sys.stderr)
               sys.exit(1)
 
           with open('workflow_logs.zip', 'wb') as fh:
@@ -94,10 +94,16 @@ jobs:
             exit 1
           fi
 
+      - name: Configure git with PAT remote
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ github.repository }}.git"
+
       - name: Run auto-fixer on failure logs
         env:
           OLLAMA_API_URL: ${{ secrets.OLLAMA_API_URL }}
-          OLLAMA_MODEL: ${{ secrets.OLLAMA_MODEL }}
+          OLLAMA_MODEL:   ${{ secrets.OLLAMA_MODEL }}
         run: python3 auto-fixer.py --input failure.log
 
       - name: Re-trigger workflow via dispatch

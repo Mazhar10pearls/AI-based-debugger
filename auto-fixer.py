@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import requests
+import yaml
 
 DEFAULT_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/v1/completions")
 DEFAULT_MODEL   = os.environ.get("OLLAMA_MODEL", "llama3.2")
@@ -29,7 +30,6 @@ class WorkflowAnalyzer:
         Pull only critical error lines from the raw log.
         Excludes noisy-but-normal lines like allow-prereleases, fetch-depth etc.
         """
-        # Lines containing these are actual errors
         error_keywords = [
             "error", "failed", "failure", "exception", "traceback",
             "exit code", "no module", "not found", "invalid", "fatal",
@@ -37,7 +37,6 @@ class WorkflowAnalyzer:
             "killed", "denied", "timeout", "unavailable", "missing",
         ]
 
-        # Lines containing these are normal setup output — skip them
         noise_keywords = [
             "allow-prereleases",
             "fetch-depth",
@@ -60,10 +59,8 @@ class WorkflowAnalyzer:
             if not stripped:
                 continue
             low = stripped.lower()
-            # Skip noise lines
             if any(n in low for n in noise_keywords):
                 continue
-            # Keep error lines
             if any(k in low for k in error_keywords):
                 relevant.append(stripped)
 
@@ -126,8 +123,8 @@ class WorkflowAnalyzer:
         # Strip markdown fences if model added them
         raw = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
 
-        # Model sometimes outputs empty {} before the real answer — take the longest match
-        matches = re.findall(r"\{.*?\}", raw, re.DOTALL)
+        # FIX: greedy match to capture the full JSON object, not the first small {}
+        matches = re.findall(r"\{.*\}", raw, re.DOTALL)
         if not matches:
             raise ValueError(f"No JSON found in Ollama response:\n{raw}")
 
@@ -139,6 +136,68 @@ class AutoFixer:
     def __init__(self, repo_path="."):
         os.chdir(repo_path)
 
+    def _sanitize_workflow(self, filepath, ai_content):
+        """
+        Validate and sanitize AI-generated workflow YAML before writing.
+        - Must parse as valid YAML
+        - Must have 'jobs' key (minimum valid workflow)
+        - Always injects workflow_dispatch so re-trigger never 422s again
+        - Preserves original workflow name if AI set it to garbage
+        """
+        # Parse AI content
+        try:
+            ai_yaml = yaml.safe_load(ai_content)
+        except yaml.YAMLError as e:
+            print(f"[WARN] AI workflow content is invalid YAML: {e}", file=sys.stderr)
+            return None
+
+        if not isinstance(ai_yaml, dict):
+            print("[WARN] AI workflow content is not a YAML mapping — rejecting.", file=sys.stderr)
+            return None
+
+        if "jobs" not in ai_yaml:
+            print("[WARN] AI workflow content has no 'jobs' key — garbage output, rejecting.", file=sys.stderr)
+            return None
+
+        # Read original file if it exists so we can preserve key fields
+        original_path = Path(filepath)
+        original_yaml = {}
+        if original_path.exists():
+            try:
+                original_yaml = yaml.safe_load(original_path.read_text(encoding="utf-8")) or {}
+            except Exception:
+                original_yaml = {}
+
+        # Always inject workflow_dispatch into the 'on' section
+        on_section = ai_yaml.get("on", {})
+
+        if on_section is None:
+            on_section = {}
+
+        if isinstance(on_section, str):
+            # e.g. on: push  →  expand to dict
+            on_section = {on_section: None}
+        elif isinstance(on_section, list):
+            # e.g. on: [push, pull_request]  →  expand to dict
+            on_section = {k: None for k in on_section}
+
+        # Now it's a dict — inject workflow_dispatch
+        if "workflow_dispatch" not in on_section:
+            on_section["workflow_dispatch"] = None
+            print("[INFO] Injected workflow_dispatch trigger into workflow.")
+
+        ai_yaml["on"] = on_section
+
+        # Preserve original workflow name if AI set it to something wrong
+        # (e.g. AI set it to the repo full name like "org/repo")
+        ai_name = str(ai_yaml.get("name", ""))
+        if not ai_yaml.get("name") or "/" in ai_name:
+            if original_yaml.get("name"):
+                ai_yaml["name"] = original_yaml["name"]
+                print(f"[INFO] Restored original workflow name: {original_yaml['name']}")
+
+        return yaml.dump(ai_yaml, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
     def apply_fix(self, fix_data):
         fixed_file    = fix_data.get("fixed_file", "")
         fixed_content = fix_data.get("fixed_content", "")
@@ -149,6 +208,15 @@ class AutoFixer:
         if not fixed_content:
             print("[WARN] AI returned empty fixed_content.", file=sys.stderr)
             return False
+
+        # Sanitize workflow files before writing — prevents Ollama from
+        # overwriting with garbage and stripping workflow_dispatch trigger
+        if fixed_file.startswith(".github/workflows/") and fixed_file.endswith(".yml"):
+            sanitized = self._sanitize_workflow(fixed_file, fixed_content)
+            if sanitized is None:
+                print("[WARN] Skipping overwrite — AI content failed validation.", file=sys.stderr)
+                return False
+            fixed_content = sanitized
 
         Path(fixed_file).parent.mkdir(parents=True, exist_ok=True)
         Path(fixed_file).write_text(fixed_content, encoding="utf-8")
@@ -173,8 +241,21 @@ class AutoFixer:
 
             subprocess.run(["git", "commit", "-m", commit_msg],
                            check=True, capture_output=True)
-            subprocess.run(["git", "push"], check=True, capture_output=True)
-            print(f"[COMMITTED] {commit_msg}")
+
+            # Explicitly push to origin HEAD branch — avoids detached HEAD failure
+            # which is common in workflow_run triggered jobs
+            branch = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True, text=True, check=True
+            ).stdout.strip()
+
+            if branch == "HEAD":
+                # Detached HEAD — fall back to main
+                branch = "main"
+
+            subprocess.run(["git", "push", "origin", f"HEAD:{branch}"],
+                           check=True, capture_output=True)
+            print(f"[COMMITTED] {commit_msg} → pushed to {branch}")
             return True
         except subprocess.CalledProcessError as exc:
             print(f"[ERROR] Git failed: {exc.stderr.decode()}", file=sys.stderr)
