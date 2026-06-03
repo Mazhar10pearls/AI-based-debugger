@@ -19,7 +19,6 @@ DEFAULT_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/v1/co
 DEFAULT_MODEL   = os.environ.get("OLLAMA_MODEL", "llama3.2")
 MAX_LOG_CHARS   = 1200
 
-# Commit messages written by THIS bot — used to detect loop commits
 BOT_COMMIT_PREFIXES = ("fix: auto-fixer", "fix: apply known patch", "fix: fallback")
 
 
@@ -48,21 +47,17 @@ def extract_json_block(text):
 def extract_yaml_fallback(text):
     text = re.sub(r"```(?:yaml|yml|json)?", "", text)
     text = text.replace("```", "").strip()
-
     match = re.search(r"(name:.*)", text, re.DOTALL)
     if not match:
         return text
-
     yaml_text = match.group(1)
     for marker in ["\nChanges made", "\nExplanation", "\nSummary"]:
         if marker in yaml_text:
             yaml_text = yaml_text.split(marker)[0]
-
     return yaml_text.strip()
 
 
 def is_valid_workflow_yaml(content):
-    """YAML must parse cleanly AND contain a 'jobs' key."""
     if not content or not isinstance(content, str):
         return False
     try:
@@ -80,46 +75,31 @@ def is_valid_workflow_yaml(content):
 
 
 def normalise_fixed_content(data: dict) -> dict:
-    """
-    Ollama returns fixed_content in three broken shapes — normalise all to a plain string:
-      (a) dict          → yaml.dump()
-      (b) fenced string → strip ```yaml ... ```
-      (c) \\n-escaped   → unescape to real newlines
-    """
     fc = data.get("fixed_content")
     if fc is None:
         return data
-
     if isinstance(fc, dict):
         print("[WARN] fixed_content is a dict — converting to YAML string")
         data["fixed_content"] = yaml.dump(fc, sort_keys=False, allow_unicode=True)
         return data
-
     if isinstance(fc, str):
         fc = re.sub(r"^```(?:yaml|yml)?\s*\n?", "", fc.strip())
         fc = re.sub(r"\n?```\s*$", "", fc)
         if "\\n" in fc and "\n" not in fc:
             fc = fc.replace("\\n", "\n")
         data["fixed_content"] = fc.strip()
-
     return data
 
 
 def last_commit_was_bot() -> bool:
-    """
-    Returns True if the most recent commit on this branch was already made by
-    the auto-fixer bot — used as a local loop guard in addition to the workflow
-    'if' condition, in case the script is run outside of Actions.
-    """
     try:
         result = subprocess.run(
             ["git", "log", "-1", "--pretty=%an|%s"],
             capture_output=True, text=True, check=True
         )
-        line = result.stdout.strip()
-        author, subject = line.split("|", 1)
+        author, subject = result.stdout.strip().split("|", 1)
         if author == "github-actions[bot]" and any(subject.startswith(p) for p in BOT_COMMIT_PREFIXES):
-            print(f"[GUARD] Last commit was already a bot fix: '{subject}' — stopping to prevent loop.")
+            print(f"[GUARD] Last commit was already a bot fix: '{subject}' — stopping loop.")
             return True
     except Exception:
         pass
@@ -147,7 +127,7 @@ class WorkflowAnalyzer:
             "set-safe-directory", "##[group]", "##[endgroup]",
             "git config", "git submodule", "extraheader",
         ]
-        lines = log_text.splitlines()
+        lines    = log_text.splitlines()
         relevant = [
             l for l in lines
             if any(k in l.lower() for k in keywords)
@@ -169,9 +149,8 @@ class WorkflowAnalyzer:
         return "", ""
 
     def analyze(self, log_text: str) -> dict:
-        snippet   = self._extract_error_lines(log_text)
+        snippet          = self._extract_error_lines(log_text)
         wf_path, wf_content = self._get_workflow()
-
         workflow_section = f"\nCurrent workflow file ({wf_path}):\n{wf_content}\n" if wf_content else ""
 
         prompt = f"""You are a DevOps expert fixing a broken GitHub Actions workflow.
@@ -211,7 +190,6 @@ Return ONLY the JSON. No markdown fences, no extra text."""
         raw = resp.json().get("choices", [{}])[0].get("text", "").strip()
         print(f"[AI] Response ({len(raw)} chars): {raw[:300]}{'...' if len(raw) > 300 else ''}")
 
-        # ── Try JSON parse ────────────────────────────────────────────────────
         try:
             block = extract_json_block(raw)
             if block:
@@ -221,7 +199,6 @@ Return ONLY the JSON. No markdown fences, no extra text."""
         except Exception as e:
             print(f"[WARN] JSON parse failed: {e}")
 
-        # ── YAML fallback ─────────────────────────────────────────────────────
         print("[WARN] Falling back to raw YAML extraction")
         yaml_content = extract_yaml_fallback(raw)
         return {
@@ -241,7 +218,6 @@ Return ONLY the JSON. No markdown fences, no extra text."""
 
 class AutoFixer:
 
-    # Deterministic regex patches applied when AI output is rejected
     KNOWN_PATCHES = [
         ("python-version 3.2 → 3.12",
          re.compile(r"(python-version:\s*['\"]?)3\.2(['\"]?)"),
@@ -260,21 +236,18 @@ class AutoFixer:
             print(f"[ERROR] Path traversal rejected: {file}", file=sys.stderr)
             return False
 
-        # ── AI content valid? ─────────────────────────────────────────────────
         if is_valid_workflow_yaml(content):
             Path(file).parent.mkdir(parents=True, exist_ok=True)
             Path(file).write_text(content, encoding="utf-8")
             print(f"[FIX] Written AI fix → {file}")
             return True
 
-        # ── Fallback: known patches ───────────────────────────────────────────
         print("[WARN] AI content invalid — trying known patches")
         return self._apply_known_patches(file, fix)
 
     def _apply_known_patches(self, workflow_file: str, fix: dict) -> bool:
         p = Path(workflow_file)
         if not p.exists():
-            # Try to find it ourselves
             for name in ["ci-local-deploy.yml", "ci-local-deploy.yaml"]:
                 candidate = Path(".github/workflows") / name
                 if candidate.exists():
@@ -313,16 +286,46 @@ class AutoFixer:
                             "github-actions[bot]@users.noreply.github.com"],
                            check=True, capture_output=True)
 
-            # Rebase before push to handle concurrent commits cleanly
-            subprocess.run(["git", "pull", "--rebase", "origin", "main"],
-                           check=True, capture_output=True)
-
+            # ── FIX: stage ALL changes BEFORE pulling ─────────────────────────
+            # git pull --rebase refuses to run when there are unstaged changes.
+            # We stash, rebase, pop — so the patch survives the rebase cleanly.
             subprocess.run(["git", "add", "-A"],
                            check=True, capture_output=True)
 
+            # Check whether we actually have staged changes before doing anything
+            has_staged = subprocess.run(
+                ["git", "diff", "--cached", "--quiet"],
+                capture_output=True
+            ).returncode != 0
+
+            if not has_staged:
+                print("[COMMIT] No changes to commit")
+                return True
+
+            # Stash the staged changes, pull, then pop
+            subprocess.run(["git", "stash"],
+                           check=True, capture_output=True)
+
+            pull = subprocess.run(
+                ["git", "pull", "--rebase", "origin", "main"],
+                capture_output=True, text=True
+            )
+            if pull.returncode != 0:
+                # Pull failed (e.g. network) — restore stash and continue anyway
+                print(f"[WARN] git pull failed (non-fatal): {pull.stderr.strip()}")
+                subprocess.run(["git", "stash", "pop"], capture_output=True)
+            else:
+                subprocess.run(["git", "stash", "pop"],
+                               check=True, capture_output=True)
+
+            # Re-stage after pop (stash pop leaves files as working-tree changes)
+            subprocess.run(["git", "add", "-A"],
+                           check=True, capture_output=True)
+
+            # Final check — something to commit?
             if subprocess.run(["git", "diff", "--cached", "--quiet"],
                                capture_output=True).returncode == 0:
-                print("[COMMIT] No changes to commit")
+                print("[COMMIT] No changes after rebase — already up to date")
                 return True
 
             subprocess.run(["git", "commit", "-m", msg],
@@ -331,7 +334,7 @@ class AutoFixer:
                            check=True, capture_output=True)
 
             print(f"[COMMIT] Pushed: {msg}")
-            print("[COMMIT] 'Local CI/CD Deploy' will trigger automatically from this push.")
+            print("[COMMIT] 'Local CI/CD Deploy' will trigger from this push automatically.")
             return True
 
         except subprocess.CalledProcessError as exc:
@@ -356,7 +359,6 @@ def main():
         print(f"[ERROR] Log file not found: {args.input}", file=sys.stderr)
         sys.exit(1)
 
-    # Local loop guard (belt-and-suspenders alongside the workflow 'if' condition)
     if last_commit_was_bot():
         sys.exit(0)
 
@@ -368,6 +370,7 @@ def main():
         fix = analyzer.analyze(log)
     except Exception as e:
         print(f"[ERROR] AI analysis failed: {e}", file=sys.stderr)
+        # AI failed — let known patches take over
         fix = {
             "fixed_file":     ".github/workflows/ci-local-deploy.yml",
             "fixed_content":  None,
