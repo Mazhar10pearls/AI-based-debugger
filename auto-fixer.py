@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
-Self-Healing CI Auto-Fixer — Prompt-Optimised Edition
-======================================================
-Root cause of previous timeouts: 19,905 char prompt → llama3.2 times out.
-
-Fix: keep total prompt under 3,000 chars by:
-  - Sending ONLY files directly mentioned in the error log
-  - Capping error signal to the 20 most relevant lines
-  - Stripping comments and blank lines from context files
-  - Hard prompt size cap with truncation warning
-
-Pipeline: DETECT → ANALYSE → VALIDATE → PATCH → TEST → COMMIT → PR
+Self-Healing CI Auto-Fixer — Context-Aware Edition
+===================================================
+Key improvements:
+  - Always sends the most relevant files to AI (workflow + Dockerfile + requirements)
+  - Error keywords cover Docker, pytest, pip, shell failures
+  - find/replace is surgical — AI never rewrites whole files
+  - Prompt stays under 4000 chars to avoid Ollama timeout
 """
 
 import argparse
@@ -29,10 +25,9 @@ import yaml
 DEFAULT_API_URL      = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/v1/completions")
 DEFAULT_MODEL        = os.environ.get("OLLAMA_MODEL",   "llama3.2")
 
-MAX_ERROR_LINES      = 20      # max lines of error signal sent to AI
-MAX_FILE_CHARS       = 800     # max chars per file in context
-MAX_CONTEXT_FILES    = 4       # max number of files sent as context
-MAX_PROMPT_CHARS     = 4000    # hard cap — llama3.2 reliable limit
+MAX_ERROR_LINES      = 25
+MAX_FILE_CHARS       = 600    # tight per-file cap to stay under prompt limit
+MAX_PROMPT_CHARS     = 3800   # safe limit for llama3.2
 MAX_PATCHES          = 5
 CONFIDENCE_THRESHOLD = 0.5
 MAX_RETRIES          = 3
@@ -48,19 +43,31 @@ BLOCKED_PATHS = [
     ".github/workflows/auto-fix-ci.yml",
 ]
 
-# All candidate files — ranked by relevance (checked in order)
-CONTEXT_PRIORITY = [
+# ── Core files always sent to AI regardless of error type ─────────────────────
+# These are the files that MOST CI failures involve.
+# Order matters — most important first (workflow → docker → deps → app code)
+ALWAYS_INCLUDE = [
     ".github/workflows/ci-local-deploy.yml",
     ".github/workflows/ci-local-deploy.yaml",
-    "requirements.txt",
-    "sample_app/requirements.txt",
-    "Dockerfile",
     "sample_app/Dockerfile",
-    "docker-compose.yml",
-    "setup.py",
-    "pyproject.toml",
-    "package.json",
+    "Dockerfile",
+    "sample_app/requirements.txt",
+    "requirements.txt",
+    "sample_app/deploy_local.sh",
 ]
+
+# ── Additional files pulled in ONLY when their keywords appear in the error ───
+CONDITIONAL_FILES = {
+    # keyword in error log → file to add
+    "pytest":           "sample_app/test_app.py",
+    "test_app":         "sample_app/test_app.py",
+    "app.py":           "sample_app/app.py",
+    "setup.py":         "setup.py",
+    "pyproject":        "pyproject.toml",
+    "package.json":     "package.json",
+    "docker-compose":   "docker-compose.yml",
+    "makefile":         "Makefile",
+}
 
 SKIP_DIRS = {
     ".git", "__pycache__", "node_modules", ".venv", "venv",
@@ -88,141 +95,183 @@ def last_commit_was_bot() -> bool:
     return False
 
 
-# ── Smart context builder ─────────────────────────────────────────────────────
-
-def strip_noise(content: str, filepath: str) -> str:
-    """Remove comments and blank lines to shrink file size."""
-    lines = content.splitlines()
-    cleaned = []
-    for line in lines:
-        stripped = line.strip()
-        # Skip blank lines
-        if not stripped:
-            continue
-        # Skip comment-only lines (Python, YAML, shell, Dockerfile)
-        if stripped.startswith("#"):
-            continue
-        cleaned.append(line)
-    return "\n".join(cleaned)
-
-
-def files_mentioned_in_error(error_signal: str) -> list[str]:
-    """
-    Extract file paths that appear in the error log.
-    These are the highest-priority files to send as context.
-    """
-    # Match things like: sample_app/app.py, requirements.txt, Dockerfile
-    pattern = re.compile(
-        r'(?:^|[\s"\'])([a-zA-Z0-9_\-./]+\.(?:py|yml|yaml|txt|sh|js|ts|json|toml|cfg|rb|go|java|Dockerfile\S*))',
-        re.MULTILINE
-    )
-    found = []
-    seen  = set()
-    for m in pattern.finditer(error_signal):
-        path = m.group(1).lstrip("./")
-        if path not in seen and Path(path).is_file():
-            seen.add(path)
-            found.append(path)
-    return found
-
-
-def collect_smart_context(error_signal: str) -> str:
-    """
-    Build the smallest useful context:
-    1. Files directly mentioned in the error log  (highest signal)
-    2. Priority list files that exist on disk     (config files likely involved)
-    Stop once MAX_CONTEXT_FILES reached.
-    """
-    selected = []
-    seen     = set()
-
-    # Pass 1 — files the error log explicitly mentions
-    for path in files_mentioned_in_error(error_signal):
-        if path not in seen and len(selected) < MAX_CONTEXT_FILES:
-            selected.append(path)
-            seen.add(path)
-
-    # Pass 2 — priority config files not yet included
-    for path_str in CONTEXT_PRIORITY:
-        if len(selected) >= MAX_CONTEXT_FILES:
-            break
-        p = Path(path_str)
-        if p.exists() and path_str not in seen:
-            selected.append(path_str)
-            seen.add(path_str)
-
-    # Build context block
-    parts = []
-    for path_str in selected:
-        try:
-            content = Path(path_str).read_text(encoding="utf-8", errors="replace")
-            content = strip_noise(content, path_str)
-            if len(content) > MAX_FILE_CHARS:
-                content = content[:MAX_FILE_CHARS] + "\n...(truncated)"
-            parts.append(f"### {path_str}\n```\n{content}\n```")
-        except Exception as exc:
-            parts.append(f"### {path_str}\n(unreadable: {exc})")
-
-    result = "\n\n".join(parts)
-    print(f"[DETECT] Context: {len(selected)} files — {list(selected)} — {len(result)} chars")
-    return result
-
-
 # ── Error signal extraction ───────────────────────────────────────────────────
 
 def extract_error_signal(log_text: str) -> str:
     ERROR_KW = [
+        # General
         "error", "failed", "failure", "exception", "traceback",
-        "exit code", "exitcode", "no module", "not found", "invalid",
-        "fatal", "syntaxerror", "importerror", "nameerror", "typeerror",
-        "valueerror", "attributeerror", "assertionerror", "runtimeerror",
-        "cannot", "refused", "rejected", "killed", "denied", "missing",
+        "exit code", "exitcode", "invalid", "fatal", "cannot",
+        "refused", "rejected", "killed", "denied", "missing",
         "undefined", "permission denied", "command not found",
-        "connectionerror", "step failed", "build failed", "test failed",
-        "pytest", "npm err", "returned non-zero",
+        "returned non-zero",
+        # Python
+        "syntaxerror", "importerror", "nameerror", "typeerror",
+        "valueerror", "attributeerror", "assertionerror", "runtimeerror",
+        "no module named", "not found",
+        # Docker
+        "not implemented",        # your exact docker error
+        "media type",             # manifest v1 error
+        "containerd",
+        "docker daemon",
+        "step 1", "step 2", "step 3", "step 4", "step 5",
+        "no such image",
+        "pull access denied",
+        "manifest unknown",
+        "build context",
+        "dockerfile",
+        # pip / packages
+        "could not find", "no matching", "pip",
+        "requirement", "version",
+        # Tests
+        "pytest", "test failed", "assert",
+        # Shell
+        "bash", "sh:", "chmod",
+        # Network
+        "connectionerror", "timeout", "curl",
     ]
     NOISE_KW = [
-        "allow-prereleases", "fetch-depth", "persist-credentials",
-        "set-safe-directory", "##[group]", "##[endgroup]", "extraheader",
-        "post job cleanup", "set up job", "complete job", "add mask",
+        "##[group]", "##[endgroup]", "extraheader", "sshcommand",
+        "safe.directory", "worktreeconfig", "sparse-checkout",
+        "submodule foreach", "check-latest", "allow-prereleases",
+        "freethreaded", "persist-credentials", "fetch-depth",
+        "set up job", "complete job", "post job", "add mask",
+        "removing .pytest_cache", "removing __pycache__",
+        "cacheprovider", "rootdir:", "configfile:",
+        "no warnings", "warnings summary", "short test summary",
+        "passed in", "collecting ",
+        "git config", "git version", "git submodule",
     ]
+
     lines    = log_text.splitlines()
-    relevant = [
-        l.strip() for l in lines
-        if any(k in l.lower() for k in ERROR_KW)
-        and not any(n in l.lower() for n in NOISE_KW)
-        and l.strip()
-    ]
-    # Keep only the last N most relevant lines — earlier lines are usually setup noise
+    relevant = []
+    for l in lines:
+        s   = l.strip()
+        low = s.lower()
+        if not s:
+            continue
+        if any(n in low for n in NOISE_KW):
+            continue
+        if any(k in low for k in ERROR_KW):
+            relevant.append(s)
+
+    # Deduplicate, keep last MAX_ERROR_LINES
     relevant = list(dict.fromkeys(relevant))[-MAX_ERROR_LINES:]
-    # Always include last 10 lines of the log (failure context)
-    tail = [l.strip() for l in lines[-10:] if l.strip()]
+
+    # Always include last 15 lines — failure context is almost always at the end
+    tail = [l.strip() for l in lines[-15:] if l.strip()
+            and not any(n in l.lower() for n in NOISE_KW)]
+
     merged = list(dict.fromkeys(relevant + tail))
     result = "\n".join(merged)
     print(f"[DETECT] Error signal: {len(merged)} lines, {len(result)} chars")
     return result
 
 
+# ── Smart context builder ─────────────────────────────────────────────────────
+
+def strip_file_noise(content: str) -> str:
+    """Remove blank lines and comment-only lines to shrink file size."""
+    out = []
+    for line in content.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("#"):
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def collect_context(error_signal: str) -> tuple[str, list[str]]:
+    """
+    Build the smallest useful context for the AI.
+
+    Strategy:
+      1. Always include ALWAYS_INCLUDE files (workflow, Dockerfile, requirements)
+         — these cover 95% of CI failures
+      2. Add CONDITIONAL_FILES whose keyword appears in the error signal
+         — only pull in extra files when the error actually mentions them
+      3. Hard cap: MAX_FILE_CHARS per file, stop when prompt would overflow
+
+    Returns (context_string, list_of_included_paths)
+    """
+    error_low = error_signal.lower()
+    selected  = []
+    seen      = set()
+
+    # Pass 1: always-include files
+    for path_str in ALWAYS_INCLUDE:
+        p = Path(path_str)
+        if p.exists() and path_str not in seen:
+            selected.append(path_str)
+            seen.add(path_str)
+
+    # Pass 2: conditional files triggered by error keywords
+    for keyword, path_str in CONDITIONAL_FILES.items():
+        if keyword in error_low:
+            p = Path(path_str)
+            if p.exists() and path_str not in seen:
+                selected.append(path_str)
+                seen.add(path_str)
+
+    # Build context blocks
+    parts         = []
+    total_chars   = 0
+    included      = []
+    char_budget   = MAX_PROMPT_CHARS - 800  # reserve 800 for prompt template + error
+
+    for path_str in selected:
+        try:
+            content = Path(path_str).read_text(encoding="utf-8", errors="replace")
+            content = strip_file_noise(content)
+            if len(content) > MAX_FILE_CHARS:
+                content = content[:MAX_FILE_CHARS] + "\n...(truncated)"
+            block = f"### {path_str}\n```\n{content}\n```"
+            if total_chars + len(block) > char_budget:
+                print(f"[DETECT] Skipping {path_str} — would exceed prompt budget")
+                break
+            parts.append(block)
+            total_chars += len(block)
+            included.append(path_str)
+        except Exception as exc:
+            parts.append(f"### {path_str}\n(unreadable: {exc})")
+            included.append(path_str)
+
+    result = "\n\n".join(parts)
+    print(f"[DETECT] Context: {len(included)} files — {included}")
+    print(f"[DETECT] Context size: {len(result)} chars")
+    return result, included
+
+
 # ── AI call ───────────────────────────────────────────────────────────────────
 
 PROMPT = """\
-CI pipeline failed. Find the bug and return a surgical fix.
+CI/CD pipeline failed. Find ALL bugs and return surgical fixes.
 
-## Error
+## Error log
 {error_signal}
 
-## Files
+## Relevant files
 {repo_context}
 
-Return ONLY this JSON (no markdown):
+## Instructions
+- Look at EVERY file shown above for problems
+- Common bugs: wrong python version, wrong Docker image tag, \
+missing pip package, shell script error, import typo
+- Return one patch per bug found
+- "find" must be an EXACT substring currently in the file
+- "replace" is the corrected version
+
+Return ONLY this JSON (no markdown, no extra text):
 {{
-  "root_cause": "one sentence",
+  "root_cause": "one sentence listing ALL bugs found",
   "confidence": 0.9,
   "commit_message": "fix: description",
   "patches": [
     {{
-      "file": "path/to/file",
-      "find": "exact string in file",
+      "file": "relative/path/to/file",
+      "find": "exact string in file right now",
       "replace": "corrected string"
     }}
   ]
@@ -235,15 +284,14 @@ def build_prompt(error_signal: str, repo_context: str) -> str:
         repo_context=repo_context,
     )
     if len(prompt) > MAX_PROMPT_CHARS:
-        # Trim repo_context to fit
-        overhead    = len(PROMPT.format(error_signal=error_signal, repo_context=""))
-        allowed     = MAX_PROMPT_CHARS - overhead - 50
-        repo_context = repo_context[:allowed] + "\n...(trimmed to fit model)"
-        prompt      = PROMPT.format(
+        overhead     = len(PROMPT.format(error_signal=error_signal, repo_context=""))
+        allowed      = MAX_PROMPT_CHARS - overhead - 100
+        repo_context = repo_context[:allowed] + "\n...(trimmed)"
+        prompt       = PROMPT.format(
             error_signal=error_signal,
             repo_context=repo_context,
         )
-        print(f"[AI] Prompt trimmed to {len(prompt)} chars to fit model context")
+        print(f"[AI] Prompt trimmed to {len(prompt)} chars")
     return prompt
 
 
@@ -254,7 +302,7 @@ def call_ai(error_signal: str, repo_context: str,
         "model":       model,
         "prompt":      prompt,
         "temperature": 0.1,
-        "max_tokens":  600,   # patches are short — find+replace needs very few tokens
+        "max_tokens":  800,
     }
     print(f"[AI] Prompt: {len(prompt)} chars (~{len(prompt)//4} tokens)")
 
@@ -265,12 +313,12 @@ def call_ai(error_signal: str, repo_context: str,
             resp = requests.post(api_url, json=payload, timeout=120)
             resp.raise_for_status()
             raw = resp.json().get("choices", [{}])[0].get("text", "").strip()
-            print(f"[AI] Got {len(raw)} chars: {raw[:200]}{'...' if len(raw) > 200 else ''}")
+            print(f"[AI] Got {len(raw)} chars: {raw[:300]}{'...' if len(raw) > 300 else ''}")
             return raw
         except requests.exceptions.Timeout as e:
             last_exc = e
             wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
-            print(f"[AI] Timeout on attempt {attempt + 1}. Waiting {wait}s...")
+            print(f"[AI] Timeout attempt {attempt + 1}. Waiting {wait}s...")
             if attempt < MAX_RETRIES - 1:
                 time.sleep(wait)
         except requests.exceptions.RequestException as e:
@@ -343,11 +391,19 @@ def validate_patch(patch: dict) -> tuple[bool, str]:
         return False, f"file not found: {file}"
 
     content = Path(file).read_text(encoding="utf-8", errors="replace")
+
     if find not in content:
-        return False, f"find string not in {file}: {repr(find[:60])}"
+        # Show what IS in the file to help debug AI hallucinations
+        preview = " | ".join(content.splitlines()[:8])
+        return False, (
+            f"find string not in {file}\n"
+            f"  AI wanted : {repr(find[:80])}\n"
+            f"  File has  : {preview[:200]}"
+        )
 
     patched = content.replace(find, replace, 1)
 
+    # Workflow YAML integrity check
     if re.search(r"\.github/workflows/.+\.ya?ml$", file):
         try:
             parsed = yaml.safe_load(patched)
@@ -356,6 +412,7 @@ def validate_patch(patch: dict) -> tuple[bool, str]:
         except yaml.YAMLError as exc:
             return False, f"{file}: patched YAML invalid — {exc}"
 
+    # Python syntax check
     if file.endswith(".py"):
         try:
             compile(patched, file, "exec")
@@ -370,10 +427,13 @@ def apply_patch(patch: dict) -> bool:
     find    = patch["find"]
     replace = patch["replace"]
     content = Path(file).read_text(encoding="utf-8", errors="replace")
+    count   = content.count(find)
+    if count > 1:
+        print(f"  [WARN] find string appears {count}x — replacing first only")
     Path(file).write_text(content.replace(find, replace, 1), encoding="utf-8")
     print(f"  ✓ {file}")
-    print(f"    - {repr(find[:70])}")
-    print(f"    + {repr(replace[:70])}")
+    print(f"    - {repr(find[:80])}")
+    print(f"    + {repr(replace[:80])}")
     return True
 
 
@@ -400,11 +460,9 @@ def run_tests() -> bool:
         )
         for line in (result.stdout + result.stderr).splitlines()[-20:]:
             print(f"  {line}")
-        if result.returncode == 0:
-            print("[TEST] ✓ Passed")
-            return True
-        print("[TEST] ✗ Failed")
-        return False
+        passed = result.returncode == 0
+        print(f"[TEST] {'✓ Passed' if passed else '✗ Failed'}")
+        return passed
     except FileNotFoundError:
         print("[TEST] pytest not found — skipping")
         return True
@@ -433,7 +491,9 @@ def commit_to_branch_and_pr(commit_msg: str, root_cause: str) -> bool:
         run_git("config", "user.name",  BOT_NAME)
         run_git("config", "user.email", BOT_EMAIL)
 
+        print("[COMMIT] Fetching remote...")
         run_git("fetch", "origin")
+
         merge = subprocess.run(
             ["git", "merge", "-X", "ours", "origin/main",
              "--no-edit", "-m", "merge: sync before fix"],
@@ -479,7 +539,11 @@ def _open_pr(token, repo, branch, commit_msg, root_cause):
             "title": commit_msg,
             "head":  branch,
             "base":  "main",
-            "body":  f"**Root cause:** {root_cause}\n\nAutomated fix — please review before merging.",
+            "body":  (
+                f"## 🤖 Auto-fix\n\n"
+                f"**Root cause:** {root_cause}\n\n"
+                f"Please review before merging."
+            ),
         },
         headers={
             "Authorization": f"Bearer {token}",
@@ -498,11 +562,11 @@ def _open_pr(token, repo, branch, commit_msg, root_cause):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input",       required=True)
-    parser.add_argument("--model",       default=DEFAULT_MODEL)
-    parser.add_argument("--api-url",     default=DEFAULT_API_URL)
-    parser.add_argument("--dry-run",     action="store_true")
-    parser.add_argument("--skip-tests",  action="store_true")
+    parser.add_argument("--input",      required=True)
+    parser.add_argument("--model",      default=DEFAULT_MODEL)
+    parser.add_argument("--api-url",    default=DEFAULT_API_URL)
+    parser.add_argument("--dry-run",    action="store_true")
+    parser.add_argument("--skip-tests", action="store_true")
     args = parser.parse_args()
 
     log_path = Path(args.input)
@@ -517,7 +581,7 @@ def main():
     print("\n━━━ STAGE 1: DETECT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     log_text     = log_path.read_text(encoding="utf-8", errors="replace")
     error_signal = extract_error_signal(log_text)
-    repo_context = collect_smart_context(error_signal)
+    repo_context, included = collect_context(error_signal)
 
     # ── ANALYSE ───────────────────────────────────────────────────────────────
     print("\n━━━ STAGE 2: ANALYSE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -537,10 +601,12 @@ def main():
     print(f"  confidence : {confidence:.0%}")
     print(f"  patches    : {len(patches)}")
     for p in patches:
-        print(f"    → {p.get('file','?')}  find: {repr(str(p.get('find',''))[:50])}")
+        print(f"    → {p.get('file','?')}")
+        print(f"      find   : {repr(str(p.get('find',''))[:70])}")
+        print(f"      replace: {repr(str(p.get('replace',''))[:70])}")
 
     if confidence < CONFIDENCE_THRESHOLD:
-        print(f"[SKIP] Confidence {confidence:.0%} below threshold — not applying.")
+        print(f"[SKIP] Confidence {confidence:.0%} below threshold.")
         sys.exit(0)
 
     if not patches:
