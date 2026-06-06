@@ -1,0 +1,44 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs and temp files
+*.log
+logs/
+temp/
+.tmp/
+
+# Git & deployment
+.git/
+.gitignore
+*.pushlog
+
+# Environment files
+.env
+.env.local
+
+# AI/ML cache
+ollama/
+models/
+
+# OS
+.DS_Store
+Thumbs.db
+
+failure.log
+workflow_logs.zip
+logs/
