@@ -3,6 +3,7 @@ name: Auto Fix Failed Local CI
 permissions:
   contents: write
   actions: write
+  pull-requests: write
 
 on:
   workflow_run:
@@ -13,16 +14,12 @@ on:
 
 jobs:
   auto-fix:
-    # ── LOOP GUARD ────────────────────────────────────────────────────────────
-    # Only run if:
-    #   1. The triggering workflow actually failed
-    #   2. The commit that caused it was NOT made by the bot itself
-    #      (prevents: bot commits fix → CI fails again → bot runs again → ...)
+    # Only run if CI failed AND the commit was NOT made by the bot
     if: |
       github.event.workflow_run.conclusion == 'failure' &&
       github.event.workflow_run.head_commit.author.name != 'github-actions[bot]'
 
-    name: Auto-Fix Failed Workflow and Retry
+    name: Auto-Fix Failed Workflow
     runs-on: [self-hosted, linux, ai-runner]
     environment: prod
     timeout-minutes: 15
@@ -41,7 +38,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install requests pyyaml --quiet || true
+        run: pip install requests pyyaml --quiet
 
       - name: Validate required secrets
         run: |
@@ -71,10 +68,9 @@ jobs:
               'Accept': 'application/vnd.github+json'
           }
           url = f'https://api.github.com/repos/{repo_full}/actions/runs/{run_id}/logs'
-
           resp = requests.get(url, headers=headers, timeout=120)
           if resp.status_code != 200:
-              print(f'Failed to download logs: HTTP {resp.status_code} — {resp.text}', file=sys.stderr)
+              print(f'Failed to download logs: HTTP {resp.status_code}', file=sys.stderr)
               sys.exit(1)
 
           with open('workflow_logs.zip', 'wb') as fh:
@@ -106,22 +102,26 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote set-url origin "https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ github.repository }}.git"
+          git remote set-url origin \
+            "https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ github.repository }}.git"
 
-      - name: Run auto-fixer on failure logs
+      - name: Run auto-fixer
         env:
-          OLLAMA_API_URL: ${{ secrets.OLLAMA_API_URL }}
-          OLLAMA_MODEL:   ${{ secrets.OLLAMA_MODEL }}
-        run: python3 auto-fixer.py --input failure.log
+          OLLAMA_API_URL:     ${{ secrets.OLLAMA_API_URL }}
+          OLLAMA_MODEL:       ${{ secrets.OLLAMA_MODEL }}
+          GITHUB_TOKEN:       ${{ secrets.GH_PAT }}
+          GITHUB_REPOSITORY:  ${{ github.repository }}
+        run: python3 auto-fixer.py --input failure.log --skip-tests
 
-      # ── NO workflow_dispatch here ─────────────────────────────────────────
-      # The auto-fixer already commits + pushes the fix to main.
-      # That push event naturally triggers "Local CI/CD Deploy" on its own.
-      # Adding an extra dispatch on top = double trigger + loop risk.
-      # Remove the Re-trigger step entirely.
-
-      - name: Summary
-        if: success()
+      # ── If auto-fixer could not fix it → open a GitHub Issue so a human knows ──
+      - name: Open issue if fixer failed
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          echo "✅ Fix committed and pushed."
-          echo "Local CI/CD Deploy will re-run automatically from the new commit."
+          gh issue create \
+            --title "🚨 Auto-fixer could not fix CI failure — manual review needed" \
+            --body "The auto-fixer ran but could not produce a valid patch.
+            Please review the failed Actions run and fix manually.
+            Run: ${{ github.event.workflow_run.html_url }}" \
+            --label "bug" || true
