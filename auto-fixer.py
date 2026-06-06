@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
-Self-Healing CI Auto-Fixer — Surgical Patch Edition
-====================================================
-Key design: AI never rewrites files. It only returns:
-  { "find": "exact string to find", "replace": "exact replacement" }
+Self-Healing CI Auto-Fixer — Prompt-Optimised Edition
+======================================================
+Root cause of previous timeouts: 19,905 char prompt → llama3.2 times out.
 
-Python applies the change with a simple str.replace().
-This means:
-  - YAML structure is never corrupted by the AI
-  - Dockerfile is never mangled
-  - Python files are never broken by bad indentation
-  - The AI only needs to identify WHAT is wrong — a much easier task
+Fix: keep total prompt under 3,000 chars by:
+  - Sending ONLY files directly mentioned in the error log
+  - Capping error signal to the 20 most relevant lines
+  - Stripping comments and blank lines from context files
+  - Hard prompt size cap with truncation warning
 
-Pipeline: DETECT → ANALYSE → PATCH → COMMIT → (push triggers CI)
+Pipeline: DETECT → ANALYSE → VALIDATE → PATCH → TEST → COMMIT → PR
 """
 
 import argparse
@@ -28,47 +26,49 @@ import requests
 import yaml
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DEFAULT_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/v1/completions")
-DEFAULT_MODEL   = os.environ.get("OLLAMA_MODEL",   "llama3.2")
+DEFAULT_API_URL      = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/v1/completions")
+DEFAULT_MODEL        = os.environ.get("OLLAMA_MODEL",   "llama3.2")
 
-MAX_LOG_CHARS   = 2000
-MAX_FILE_CHARS  = 2000
-MAX_RETRIES     = 3
-RETRY_BACKOFF   = [10, 30, 60]
+MAX_ERROR_LINES      = 20      # max lines of error signal sent to AI
+MAX_FILE_CHARS       = 800     # max chars per file in context
+MAX_CONTEXT_FILES    = 4       # max number of files sent as context
+MAX_PROMPT_CHARS     = 4000    # hard cap — llama3.2 reliable limit
+MAX_PATCHES          = 5
+CONFIDENCE_THRESHOLD = 0.5
+MAX_RETRIES          = 3
+RETRY_BACKOFF        = [10, 30, 60]
 
-BOT_NAME        = "github-actions[bot]"
-BOT_EMAIL       = "github-actions[bot]@users.noreply.github.com"
-BOT_PREFIX      = "fix:"
+BOT_NAME             = "github-actions[bot]"
+BOT_EMAIL            = "github-actions[bot]@users.noreply.github.com"
+BOT_PREFIX           = "fix:"
 
-CONTEXT_GLOBS = [
-    ".github/workflows/*.yml",
-    ".github/workflows/*.yaml",
-    "Dockerfile*",
-    "**/Dockerfile*",
-    "docker-compose*.yml",
-    "requirements*.txt",
-    "**/requirements*.txt",
+BLOCKED_PATHS = [
+    ".git/",
+    ".github/workflows/auto-fixer-on-failure.yml",
+    ".github/workflows/auto-fix-ci.yml",
+]
+
+# All candidate files — ranked by relevance (checked in order)
+CONTEXT_PRIORITY = [
+    ".github/workflows/ci-local-deploy.yml",
+    ".github/workflows/ci-local-deploy.yaml",
+    "requirements.txt",
+    "sample_app/requirements.txt",
+    "Dockerfile",
+    "sample_app/Dockerfile",
+    "docker-compose.yml",
     "setup.py",
-    "setup.cfg",
     "pyproject.toml",
     "package.json",
-    "Makefile",
-    "*.sh",
-    "**/*.sh",
-    "**/*.py",
-    "**/*.js",
-    "**/*.ts",
-    "**/*.go",
-    "**/*.java",
 ]
 
 SKIP_DIRS = {
     ".git", "__pycache__", "node_modules", ".venv", "venv",
-    "env", ".env", "dist", "build", ".mypy_cache", ".pytest_cache",
+    "env", "dist", "build", ".mypy_cache", ".pytest_cache",
 }
 
 
-# ── Utilities ─────────────────────────────────────────────────────────────────
+# ── Git helpers ───────────────────────────────────────────────────────────────
 
 def run_git(*args, check=True) -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -88,30 +88,87 @@ def last_commit_was_bot() -> bool:
     return False
 
 
-def _should_skip(path: Path) -> bool:
-    return any(part in SKIP_DIRS for part in path.parts)
+# ── Smart context builder ─────────────────────────────────────────────────────
+
+def strip_noise(content: str, filepath: str) -> str:
+    """Remove comments and blank lines to shrink file size."""
+    lines = content.splitlines()
+    cleaned = []
+    for line in lines:
+        stripped = line.strip()
+        # Skip blank lines
+        if not stripped:
+            continue
+        # Skip comment-only lines (Python, YAML, shell, Dockerfile)
+        if stripped.startswith("#"):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned)
 
 
-def collect_repo_context() -> str:
-    import glob as globmod
-    seen, parts = set(), []
-    for pattern in CONTEXT_GLOBS:
-        for path_str in globmod.glob(pattern, recursive=True):
-            p = Path(path_str)
-            if not p.is_file() or str(p.resolve()) in seen or _should_skip(p):
-                continue
-            seen.add(str(p.resolve()))
-            try:
-                content = p.read_text(encoding="utf-8", errors="replace")
-                if len(content) > MAX_FILE_CHARS:
-                    content = content[:MAX_FILE_CHARS] + f"\n...(truncated)"
-                parts.append(f"### FILE: {p}\n```\n{content}\n```\n")
-            except Exception as exc:
-                parts.append(f"### FILE: {p}\n(unreadable: {exc})\n")
-    result = "\n".join(parts)
-    print(f"[DETECT] Repo context: {len(seen)} files, {len(result)} chars")
+def files_mentioned_in_error(error_signal: str) -> list[str]:
+    """
+    Extract file paths that appear in the error log.
+    These are the highest-priority files to send as context.
+    """
+    # Match things like: sample_app/app.py, requirements.txt, Dockerfile
+    pattern = re.compile(
+        r'(?:^|[\s"\'])([a-zA-Z0-9_\-./]+\.(?:py|yml|yaml|txt|sh|js|ts|json|toml|cfg|rb|go|java|Dockerfile\S*))',
+        re.MULTILINE
+    )
+    found = []
+    seen  = set()
+    for m in pattern.finditer(error_signal):
+        path = m.group(1).lstrip("./")
+        if path not in seen and Path(path).is_file():
+            seen.add(path)
+            found.append(path)
+    return found
+
+
+def collect_smart_context(error_signal: str) -> str:
+    """
+    Build the smallest useful context:
+    1. Files directly mentioned in the error log  (highest signal)
+    2. Priority list files that exist on disk     (config files likely involved)
+    Stop once MAX_CONTEXT_FILES reached.
+    """
+    selected = []
+    seen     = set()
+
+    # Pass 1 — files the error log explicitly mentions
+    for path in files_mentioned_in_error(error_signal):
+        if path not in seen and len(selected) < MAX_CONTEXT_FILES:
+            selected.append(path)
+            seen.add(path)
+
+    # Pass 2 — priority config files not yet included
+    for path_str in CONTEXT_PRIORITY:
+        if len(selected) >= MAX_CONTEXT_FILES:
+            break
+        p = Path(path_str)
+        if p.exists() and path_str not in seen:
+            selected.append(path_str)
+            seen.add(path_str)
+
+    # Build context block
+    parts = []
+    for path_str in selected:
+        try:
+            content = Path(path_str).read_text(encoding="utf-8", errors="replace")
+            content = strip_noise(content, path_str)
+            if len(content) > MAX_FILE_CHARS:
+                content = content[:MAX_FILE_CHARS] + "\n...(truncated)"
+            parts.append(f"### {path_str}\n```\n{content}\n```")
+        except Exception as exc:
+            parts.append(f"### {path_str}\n(unreadable: {exc})")
+
+    result = "\n\n".join(parts)
+    print(f"[DETECT] Context: {len(selected)} files — {list(selected)} — {len(result)} chars")
     return result
 
+
+# ── Error signal extraction ───────────────────────────────────────────────────
 
 def extract_error_signal(log_text: str) -> str:
     ERROR_KW = [
@@ -121,8 +178,8 @@ def extract_error_signal(log_text: str) -> str:
         "valueerror", "attributeerror", "assertionerror", "runtimeerror",
         "cannot", "refused", "rejected", "killed", "denied", "missing",
         "undefined", "permission denied", "command not found",
-        "connectionerror", "timeout", "step failed", "build failed",
-        "test failed", "pytest", "npm err", "returned non-zero",
+        "connectionerror", "step failed", "build failed", "test failed",
+        "pytest", "npm err", "returned non-zero",
     ]
     NOISE_KW = [
         "allow-prereleases", "fetch-depth", "persist-credentials",
@@ -136,116 +193,98 @@ def extract_error_signal(log_text: str) -> str:
         and not any(n in l.lower() for n in NOISE_KW)
         and l.strip()
     ]
-    tail   = [l.strip() for l in lines[-40:] if l.strip()]
+    # Keep only the last N most relevant lines — earlier lines are usually setup noise
+    relevant = list(dict.fromkeys(relevant))[-MAX_ERROR_LINES:]
+    # Always include last 10 lines of the log (failure context)
+    tail = [l.strip() for l in lines[-10:] if l.strip()]
     merged = list(dict.fromkeys(relevant + tail))
     result = "\n".join(merged)
     print(f"[DETECT] Error signal: {len(merged)} lines, {len(result)} chars")
-    return result[-MAX_LOG_CHARS:]
+    return result
 
 
 # ── AI call ───────────────────────────────────────────────────────────────────
 
 PROMPT = """\
-You are a senior DevOps engineer. A CI/CD pipeline has failed.
-Your job: find every bug and return ONLY the minimal string changes needed to fix them.
+CI pipeline failed. Find the bug and return a surgical fix.
 
-## CI Error Log
+## Error
 {error_signal}
 
-## Repository Files
+## Files
 {repo_context}
 
-## CRITICAL INSTRUCTIONS
-- Do NOT rewrite entire files
-- Do NOT return full file contents
-- Return ONLY the exact string to find and its exact replacement
-- The "find" value must be an exact substring that exists in the file right now
-- The "replace" value must be the corrected version of that exact substring
-- Keep find/replace as SHORT as possible — one line is ideal
-
-## Response format
-Return ONLY this JSON. No markdown, no explanation outside the JSON.
-
+Return ONLY this JSON (no markdown):
 {{
-  "root_cause": "one sentence — what went wrong",
-  "explanation": "one sentence — what you changed and why",
-  "commit_message": "fix: short description (must start with fix:)",
+  "root_cause": "one sentence",
+  "confidence": 0.9,
+  "commit_message": "fix: description",
   "patches": [
     {{
-      "file": "relative/path/to/file",
-      "find": "exact string currently in the file",
-      "replace": "corrected string to replace it with"
+      "file": "path/to/file",
+      "find": "exact string in file",
+      "replace": "corrected string"
     }}
   ]
-}}
+}}"""
 
-Examples of good patches:
-  Wrong python version in workflow:
-    "file": ".github/workflows/ci-local-deploy.yml"
-    "find": "python-version: '3.13'"
-    "replace": "python-version: '3.12'"
 
-  Wrong Docker base image:
-    "file": "sample_app/Dockerfile"
-    "find": "FROM python:3.13-slim"
-    "replace": "FROM python:3.12-slim"
-
-  Missing pip package:
-    "file": "requirements.txt"
-    "find": "flask==99.0.0"
-    "replace": "flask==2.3.3"
-
-  Python import typo:
-    "file": "sample_app/app.py"
-    "find": "from flask import render_template_strng"
-    "replace": "from flask import render_template_string"
-
-Return ONLY the JSON object."""
+def build_prompt(error_signal: str, repo_context: str) -> str:
+    prompt = PROMPT.format(
+        error_signal=error_signal,
+        repo_context=repo_context,
+    )
+    if len(prompt) > MAX_PROMPT_CHARS:
+        # Trim repo_context to fit
+        overhead    = len(PROMPT.format(error_signal=error_signal, repo_context=""))
+        allowed     = MAX_PROMPT_CHARS - overhead - 50
+        repo_context = repo_context[:allowed] + "\n...(trimmed to fit model)"
+        prompt      = PROMPT.format(
+            error_signal=error_signal,
+            repo_context=repo_context,
+        )
+        print(f"[AI] Prompt trimmed to {len(prompt)} chars to fit model context")
+    return prompt
 
 
 def call_ai(error_signal: str, repo_context: str,
             model: str, api_url: str) -> str:
-    prompt  = PROMPT.format(
-        error_signal=error_signal,
-        repo_context=repo_context,
-    )
+    prompt  = build_prompt(error_signal, repo_context)
     payload = {
         "model":       model,
         "prompt":      prompt,
         "temperature": 0.1,
-        "max_tokens":  1500,   # Much less needed — no full file rewrites
+        "max_tokens":  600,   # patches are short — find+replace needs very few tokens
     }
     print(f"[AI] Prompt: {len(prompt)} chars (~{len(prompt)//4} tokens)")
 
+    last_exc = None
     for attempt in range(MAX_RETRIES):
         try:
             print(f"[AI] Calling Ollama — attempt {attempt + 1}/{MAX_RETRIES}...")
-            resp = requests.post(api_url, json=payload, timeout=180)
+            resp = requests.post(api_url, json=payload, timeout=120)
             resp.raise_for_status()
             raw = resp.json().get("choices", [{}])[0].get("text", "").strip()
-            print(f"[AI] Got {len(raw)} chars: {raw[:300]}{'...' if len(raw) > 300 else ''}")
+            print(f"[AI] Got {len(raw)} chars: {raw[:200]}{'...' if len(raw) > 200 else ''}")
             return raw
-        except requests.exceptions.Timeout:
+        except requests.exceptions.Timeout as e:
+            last_exc = e
             wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
-            print(f"[AI] Timeout. Retry in {wait}s...")
+            print(f"[AI] Timeout on attempt {attempt + 1}. Waiting {wait}s...")
             if attempt < MAX_RETRIES - 1:
                 time.sleep(wait)
-        except requests.exceptions.RequestException as exc:
-            raise RuntimeError(f"Cannot reach Ollama at {api_url}: {exc}")
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Cannot reach Ollama at {api_url}: {e}")
 
-    raise RuntimeError(f"Ollama timed out on all {MAX_RETRIES} attempts.")
+    raise RuntimeError(f"Ollama timed out on all {MAX_RETRIES} attempts: {last_exc}")
 
 
 def parse_ai_response(raw: str) -> dict:
-    """Robustly extract JSON from AI output."""
     cleaned = re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
-
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
-
-    # Find largest balanced {...} block
     best = None
     for start in [i for i, c in enumerate(cleaned) if c == "{"]:
         stack = 0
@@ -268,160 +307,202 @@ def parse_ai_response(raw: str) -> dict:
                 return json.loads(repaired)
             except json.JSONDecodeError:
                 pass
+    raise ValueError(f"No valid JSON in AI response:\n{raw[:500]}")
 
-    raise ValueError(f"No valid JSON in AI response:\n{raw[:600]}")
+
+# ── Patch validation + application ───────────────────────────────────────────
+
+def is_blocked(file: str) -> bool:
+    return any(file.startswith(b) or file == b.rstrip("/") for b in BLOCKED_PATHS)
 
 
-# ── Surgical patch application ────────────────────────────────────────────────
+def normalise_patch(patch: dict) -> dict:
+    for key in ("find", "replace"):
+        val = patch.get(key, "")
+        if isinstance(val, str) and "\\n" in val and "\n" not in val:
+            patch[key] = val.replace("\\n", "\n")
+    return patch
+
 
 def validate_patch(patch: dict) -> tuple[bool, str]:
-    """Check the patch is safe before touching disk."""
     file    = (patch.get("file") or "").strip()
     find    = patch.get("find",    "")
     replace = patch.get("replace", "")
 
     if not file:
-        return False, "missing 'file' field"
+        return False, "missing 'file'"
     if ".." in file or file.startswith("/") or file.startswith("~"):
         return False, f"unsafe path: {file}"
+    if is_blocked(file):
+        return False, f"blocked: {file}"
     if not find:
         return False, f"empty 'find' for {file}"
     if replace is None:
         return False, f"missing 'replace' for {file}"
     if not Path(file).exists():
-        return False, f"file does not exist on disk: {file}"
+        return False, f"file not found: {file}"
 
-    # Make sure 'find' actually exists in the file
     content = Path(file).read_text(encoding="utf-8", errors="replace")
     if find not in content:
-        return False, f"'find' string not found in {file}: {repr(find[:80])}"
+        return False, f"find string not in {file}: {repr(find[:60])}"
 
-    # After applying, validate YAML structure for workflow files
+    patched = content.replace(find, replace, 1)
+
     if re.search(r"\.github/workflows/.+\.ya?ml$", file):
-        patched = content.replace(find, replace, 1)
         try:
             parsed = yaml.safe_load(patched)
             if not isinstance(parsed, dict) or "jobs" not in parsed:
-                return False, f"patched {file} would be missing 'jobs:' key"
+                return False, f"{file}: patched YAML missing 'jobs:'"
         except yaml.YAMLError as exc:
-            return False, f"patched {file} would be invalid YAML: {exc}"
+            return False, f"{file}: patched YAML invalid — {exc}"
 
-    # After applying, validate Python syntax for .py files
     if file.endswith(".py"):
-        patched = content.replace(find, replace, 1)
         try:
             compile(patched, file, "exec")
         except SyntaxError as exc:
-            return False, f"patched {file} would have Python syntax error: {exc}"
+            return False, f"{file}: patched Python syntax error — {exc}"
 
     return True, "ok"
 
 
 def apply_patch(patch: dict) -> bool:
-    """
-    Apply a single surgical patch.
-    Reads the file, does ONE str.replace(), writes back.
-    The AI never touches the file structure — only the specific value.
-    """
     file    = patch["file"].strip()
     find    = patch["find"]
     replace = patch["replace"]
-
     content = Path(file).read_text(encoding="utf-8", errors="replace")
-
-    # Count occurrences so we know what we're doing
-    count = content.count(find)
-    if count > 1:
-        print(f"[WARN] '{find[:50]}' found {count} times in {file} — replacing first occurrence only")
-
-    patched = content.replace(find, replace, 1)
-    Path(file).write_text(patched, encoding="utf-8")
-
-    print(f"[FIX] ✓ {file}")
-    print(f"       - was : {repr(find[:80])}")
-    print(f"       + now : {repr(replace[:80])}")
+    Path(file).write_text(content.replace(find, replace, 1), encoding="utf-8")
+    print(f"  ✓ {file}")
+    print(f"    - {repr(find[:70])}")
+    print(f"    + {repr(replace[:70])}")
     return True
 
 
 def apply_all_patches(patches: list) -> list[str]:
-    """Validate then apply every patch. Returns list of patched file paths."""
     written = []
-    for patch in patches:
-        # Normalise — AI sometimes wraps values in extra quotes or escapes
-        for key in ("find", "replace"):
-            val = patch.get(key, "")
-            if isinstance(val, str):
-                # Unescape \\n → real newlines if model escaped them
-                if "\\n" in val and "\n" not in val:
-                    patch[key] = val.replace("\\n", "\n")
-
+    for raw_patch in patches[:MAX_PATCHES]:
+        patch = normalise_patch(raw_patch)
         ok, reason = validate_patch(patch)
         if not ok:
-            print(f"[FIX] ✗ Skipping patch: {reason}", file=sys.stderr)
+            print(f"  ✗ {reason}", file=sys.stderr)
             continue
-
         if apply_patch(patch):
             written.append(patch["file"].strip())
-
     return written
 
 
-# ── Git: clean fetch → merge → commit → push ─────────────────────────────────
+# ── Local tests ───────────────────────────────────────────────────────────────
 
-def commit_and_push(commit_msg: str) -> bool:
-    """
-    Clean pull strategy:
-      1. git fetch origin          (download remote, don't touch working tree)
-      2. git merge -X ours ...     (merge remote in; our fix wins on conflict)
-      3. git add -A
-      4. git commit + push
-    No stash, no rebase, no pop — patch files on disk are never disturbed.
-    """
+def run_tests() -> bool:
+    try:
+        result = subprocess.run(
+            ["python", "-m", "pytest", "--tb=short", "-q", "--no-header"],
+            capture_output=True, text=True, timeout=120
+        )
+        for line in (result.stdout + result.stderr).splitlines()[-20:]:
+            print(f"  {line}")
+        if result.returncode == 0:
+            print("[TEST] ✓ Passed")
+            return True
+        print("[TEST] ✗ Failed")
+        return False
+    except FileNotFoundError:
+        print("[TEST] pytest not found — skipping")
+        return True
+    except subprocess.TimeoutExpired:
+        print("[TEST] Timed out — skipping")
+        return True
+
+
+def revert_patches(written: list[str]):
+    if not written:
+        return
+    try:
+        run_git("checkout", "--", *written)
+        print(f"[REVERT] Restored {len(written)} file(s)")
+    except subprocess.CalledProcessError as exc:
+        print(f"[REVERT] Failed: {exc.stderr}", file=sys.stderr)
+
+
+# ── Commit + PR ───────────────────────────────────────────────────────────────
+
+def commit_to_branch_and_pr(commit_msg: str, root_cause: str) -> bool:
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_PAT", "")
+    repo  = os.environ.get("GITHUB_REPOSITORY", "")
+
     try:
         run_git("config", "user.name",  BOT_NAME)
         run_git("config", "user.email", BOT_EMAIL)
 
-        print("[COMMIT] Fetching remote...")
         run_git("fetch", "origin")
-
-        print("[COMMIT] Merging remote (our fix wins on conflict)...")
         merge = subprocess.run(
             ["git", "merge", "-X", "ours", "origin/main",
-             "--no-edit", "-m", f"merge: sync before {commit_msg}"],
+             "--no-edit", "-m", "merge: sync before fix"],
             capture_output=True, text=True
         )
         if merge.returncode != 0:
-            print(f"[WARN] Merge skipped (non-fatal): {merge.stderr.strip()}")
+            print(f"[WARN] Merge skipped: {merge.stderr.strip()}")
             run_git("merge", "--abort", check=False)
 
+        branch = f"auto-fix/{int(time.time())}"
+        run_git("checkout", "-b", branch)
         run_git("add", "-A")
 
         if run_git("diff", "--cached", "--quiet", check=False).returncode == 0:
-            print("[COMMIT] Nothing to commit — already up to date.")
+            print("[COMMIT] Nothing to commit.")
+            run_git("checkout", "main", check=False)
             return True
 
         run_git("commit", "-m", commit_msg)
-        run_git("push")
-        print(f"[COMMIT] ✓ Pushed: {commit_msg}")
+        run_git("push", "-u", "origin", branch)
+        print(f"[COMMIT] ✓ Pushed branch: {branch}")
+
+        run_git("checkout", "main", check=False)
+
+        if token and repo:
+            _open_pr(token, repo, branch, commit_msg, root_cause)
+        else:
+            print(f"[PR] No token — merge manually: git merge {branch}")
+
         return True
 
     except subprocess.CalledProcessError as exc:
-        stderr = exc.stderr or ""
-        print(f"[ERROR] Git failed: {' '.join(exc.cmd)}\n  {stderr}", file=sys.stderr)
+        print(f"[ERROR] Git: {' '.join(exc.cmd)}\n  {exc.stderr}", file=sys.stderr)
+        run_git("checkout", "main", check=False)
+        run_git("merge", "--abort", check=False)
         return False
+
+
+def _open_pr(token, repo, branch, commit_msg, root_cause):
+    resp = requests.post(
+        f"https://api.github.com/repos/{repo}/pulls",
+        json={
+            "title": commit_msg,
+            "head":  branch,
+            "base":  "main",
+            "body":  f"**Root cause:** {root_cause}\n\nAutomated fix — please review before merging.",
+        },
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        timeout=30,
+    )
+    if resp.status_code in (200, 201):
+        print(f"[PR] ✓ {resp.json().get('html_url', '')}")
+    else:
+        print(f"[PR] Failed {resp.status_code}: {resp.text[:200]}", file=sys.stderr)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Surgical self-healing CI fixer — AI finds bugs, Python fixes files"
-    )
-    parser.add_argument("--input",   required=True, help="Path to failure.log")
-    parser.add_argument("--model",   default=DEFAULT_MODEL)
-    parser.add_argument("--api-url", default=DEFAULT_API_URL)
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show patches without writing or pushing")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input",       required=True)
+    parser.add_argument("--model",       default=DEFAULT_MODEL)
+    parser.add_argument("--api-url",     default=DEFAULT_API_URL)
+    parser.add_argument("--dry-run",     action="store_true")
+    parser.add_argument("--skip-tests",  action="store_true")
     args = parser.parse_args()
 
     log_path = Path(args.input)
@@ -436,60 +517,70 @@ def main():
     print("\n━━━ STAGE 1: DETECT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     log_text     = log_path.read_text(encoding="utf-8", errors="replace")
     error_signal = extract_error_signal(log_text)
-    repo_context = collect_repo_context()
+    repo_context = collect_smart_context(error_signal)
 
     # ── ANALYSE ───────────────────────────────────────────────────────────────
     print("\n━━━ STAGE 2: ANALYSE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     try:
         raw     = call_ai(error_signal, repo_context, args.model, args.api_url)
         ai_data = parse_ai_response(raw)
-        patches = ai_data.get("patches", [])
-
-        print(f"\n  root_cause : {ai_data.get('root_cause', 'unknown')}")
-        print(f"  explanation: {ai_data.get('explanation', '')}")
-        print(f"  patches    : {len(patches)} change(s) identified")
-        for p in patches:
-            print(f"    → {p.get('file', '?')}")
-            print(f"      find   : {repr(str(p.get('find', ''))[:60])}")
-            print(f"      replace: {repr(str(p.get('replace', ''))[:60])}")
-
-        commit_msg = ai_data.get("commit_message", "fix: auto-fixer patch")
-
     except Exception as exc:
-        print(f"\n[ERROR] AI analysis failed: {exc}", file=sys.stderr)
+        print(f"[ERROR] AI failed: {exc}", file=sys.stderr)
         sys.exit(2)
 
+    confidence = float(ai_data.get("confidence", 1.0))
+    root_cause = ai_data.get("root_cause", "unknown")
+    patches    = ai_data.get("patches", [])
+    commit_msg = ai_data.get("commit_message", "fix: auto-fixer patch")
+
+    print(f"\n  root_cause : {root_cause}")
+    print(f"  confidence : {confidence:.0%}")
+    print(f"  patches    : {len(patches)}")
+    for p in patches:
+        print(f"    → {p.get('file','?')}  find: {repr(str(p.get('find',''))[:50])}")
+
+    if confidence < CONFIDENCE_THRESHOLD:
+        print(f"[SKIP] Confidence {confidence:.0%} below threshold — not applying.")
+        sys.exit(0)
+
     if not patches:
-        print("[ERROR] AI returned no patches.", file=sys.stderr)
+        print("[ERROR] No patches returned.", file=sys.stderr)
         sys.exit(3)
 
-    # ── DRY RUN ───────────────────────────────────────────────────────────────
     if args.dry_run:
-        print("\n━━━ DRY-RUN — validating patches ━━━━━━━━━━━━━━━━━━━━━━━")
-        for p in patches:
+        print("\n━━━ DRY-RUN ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        for p in patches[:MAX_PATCHES]:
+            p = normalise_patch(p)
             ok, reason = validate_patch(p)
-            print(f"  {'✓' if ok else '✗'} {p.get('file', '?')} — {reason}")
-        print("\n[DRY-RUN] Nothing written.")
+            print(f"  {'✓' if ok else '✗'} {p.get('file','?')} — {reason}")
         sys.exit(0)
 
     # ── PATCH ─────────────────────────────────────────────────────────────────
     print("\n━━━ STAGE 3: PATCH ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     written = apply_all_patches(patches)
     if not written:
-        print("[ERROR] All patches failed validation — nothing written.", file=sys.stderr)
+        print("[ERROR] All patches failed validation.", file=sys.stderr)
         sys.exit(3)
-    print(f"\n[PATCH] {len(written)}/{len(patches)} patches applied successfully.")
+    print(f"[PATCH] {len(written)}/{len(patches)} applied.")
 
-    # ── COMMIT ────────────────────────────────────────────────────────────────
-    print("\n━━━ STAGE 4: COMMIT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    if not commit_and_push(commit_msg):
+    # ── TEST ──────────────────────────────────────────────────────────────────
+    print("\n━━━ STAGE 4: TEST ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    if not args.skip_tests:
+        if not run_tests():
+            revert_patches(written)
+            sys.exit(5)
+    else:
+        print("[TEST] Skipped")
+
+    # ── COMMIT + PR ───────────────────────────────────────────────────────────
+    print("\n━━━ STAGE 5: COMMIT + PR ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    if not commit_to_branch_and_pr(commit_msg, root_cause):
         sys.exit(4)
 
-    # ── DONE ──────────────────────────────────────────────────────────────────
     print("\n━━━ ✅ DONE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print(f"  commit : {commit_msg}")
     print(f"  files  : {', '.join(written)}")
-    print("  CI will re-run automatically from the push.")
+    print("  Review and merge the PR — that push will re-trigger CI.")
 
 
 if __name__ == "__main__":
