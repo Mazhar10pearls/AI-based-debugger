@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-    
   workflow_dispatch:
 
 jobs:
@@ -21,7 +20,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
+          python-version: '3.12'
 
       - name: Install dependencies
         run: |
@@ -42,4 +41,3 @@ jobs:
 
       - name: Verify deployment
         run: curl -f http://127.0.0.1:5000
-

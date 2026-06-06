@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-AI Auto-Fixer (Stable Version)
-Detect → Fix → Commit  (push triggers re-run naturally — no dispatch needed)
+Self-Healing CI Auto-Fixer — Surgical Patch Edition
+====================================================
+Key design: AI never rewrites files. It only returns:
+  { "find": "exact string to find", "replace": "exact replacement" }
+
+Python applies the change with a simple str.replace().
+This means:
+  - YAML structure is never corrupted by the AI
+  - Dockerfile is never mangled
+  - Python files are never broken by bad indentation
+  - The AI only needs to identify WHAT is wrong — a much easier task
+
+Pipeline: DETECT → ANALYSE → PATCH → COMMIT → (push triggers CI)
 """
 
 import argparse
@@ -10,389 +21,476 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import requests
 import yaml
 
+# ── Config ────────────────────────────────────────────────────────────────────
 DEFAULT_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/v1/completions")
-DEFAULT_MODEL   = os.environ.get("OLLAMA_MODEL", "llama3.2")
-MAX_LOG_CHARS   = 1200
+DEFAULT_MODEL   = os.environ.get("OLLAMA_MODEL",   "llama3.2")
 
-BOT_COMMIT_PREFIXES = ("fix: auto-fixer", "fix: apply known patch", "fix: fallback")
+MAX_LOG_CHARS   = 2000
+MAX_FILE_CHARS  = 2000
+MAX_RETRIES     = 3
+RETRY_BACKOFF   = [10, 30, 60]
 
+BOT_NAME        = "github-actions[bot]"
+BOT_EMAIL       = "github-actions[bot]@users.noreply.github.com"
+BOT_PREFIX      = "fix:"
 
-# ---------------------------
-# 🔧 Helpers
-# ---------------------------
+CONTEXT_GLOBS = [
+    ".github/workflows/*.yml",
+    ".github/workflows/*.yaml",
+    "Dockerfile*",
+    "**/Dockerfile*",
+    "docker-compose*.yml",
+    "requirements*.txt",
+    "**/requirements*.txt",
+    "setup.py",
+    "setup.cfg",
+    "pyproject.toml",
+    "package.json",
+    "Makefile",
+    "*.sh",
+    "**/*.sh",
+    "**/*.py",
+    "**/*.js",
+    "**/*.ts",
+    "**/*.go",
+    "**/*.java",
+]
 
-def extract_json_block(text):
-    """Return the longest balanced {...} block found in text."""
-    best = None
-    for start in [i for i, c in enumerate(text) if c == "{"]:
-        stack = 0
-        for i in range(start, len(text)):
-            if text[i] == "{":
-                stack += 1
-            elif text[i] == "}":
-                stack -= 1
-                if stack == 0:
-                    candidate = text[start:i + 1]
-                    if best is None or len(candidate) > len(best):
-                        best = candidate
-                    break
-    return best
-
-
-def extract_yaml_fallback(text):
-    text = re.sub(r"```(?:yaml|yml|json)?", "", text)
-    text = text.replace("```", "").strip()
-    match = re.search(r"(name:.*)", text, re.DOTALL)
-    if not match:
-        return text
-    yaml_text = match.group(1)
-    for marker in ["\nChanges made", "\nExplanation", "\nSummary"]:
-        if marker in yaml_text:
-            yaml_text = yaml_text.split(marker)[0]
-    return yaml_text.strip()
+SKIP_DIRS = {
+    ".git", "__pycache__", "node_modules", ".venv", "venv",
+    "env", ".env", "dist", "build", ".mypy_cache", ".pytest_cache",
+}
 
 
-def is_valid_workflow_yaml(content):
-    if not content or not isinstance(content, str):
-        return False
-    try:
-        parsed = yaml.safe_load(content)
-        if not isinstance(parsed, dict):
-            print("[WARN] YAML root is not a mapping")
-            return False
-        if "jobs" not in parsed:
-            print("[WARN] YAML missing 'jobs' key — likely garbage output")
-            return False
-        return True
-    except Exception as e:
-        print(f"[WARN] Invalid YAML: {e}")
-        return False
+# ── Utilities ─────────────────────────────────────────────────────────────────
 
-
-def normalise_fixed_content(data: dict) -> dict:
-    fc = data.get("fixed_content")
-    if fc is None:
-        return data
-    if isinstance(fc, dict):
-        print("[WARN] fixed_content is a dict — converting to YAML string")
-        data["fixed_content"] = yaml.dump(fc, sort_keys=False, allow_unicode=True)
-        return data
-    if isinstance(fc, str):
-        fc = re.sub(r"^```(?:yaml|yml)?\s*\n?", "", fc.strip())
-        fc = re.sub(r"\n?```\s*$", "", fc)
-        if "\\n" in fc and "\n" not in fc:
-            fc = fc.replace("\\n", "\n")
-        data["fixed_content"] = fc.strip()
-    return data
+def run_git(*args, check=True) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args], check=check, capture_output=True, text=True
+    )
 
 
 def last_commit_was_bot() -> bool:
     try:
-        result = subprocess.run(
-            ["git", "log", "-1", "--pretty=%an|%s"],
-            capture_output=True, text=True, check=True
-        )
-        author, subject = result.stdout.strip().split("|", 1)
-        if author == "github-actions[bot]" and any(subject.startswith(p) for p in BOT_COMMIT_PREFIXES):
-            print(f"[GUARD] Last commit was already a bot fix: '{subject}' — stopping loop.")
+        r = run_git("log", "-1", "--pretty=%an|||%s")
+        author, subject = r.stdout.strip().split("|||", 1)
+        if author == BOT_NAME and subject.startswith(BOT_PREFIX):
+            print(f"[GUARD] Last commit was bot fix: '{subject}' — stopping loop.")
             return True
     except Exception:
         pass
     return False
 
 
-# ---------------------------
-# 🧠 Analyzer
-# ---------------------------
-
-class WorkflowAnalyzer:
-
-    def __init__(self, model=DEFAULT_MODEL, api_url=DEFAULT_API_URL):
-        self.model   = model
-        self.api_url = api_url
-
-    def _extract_error_lines(self, log_text):
-        keywords = [
-            "error", "failed", "exception", "exit code", "invalid",
-            "fatal", "traceback", "no module", "not found", "syntaxerror",
-            "importerror", "cannot", "killed", "denied", "missing",
-        ]
-        noise = [
-            "allow-prereleases", "fetch-depth", "persist-credentials",
-            "set-safe-directory", "##[group]", "##[endgroup]",
-            "git config", "git submodule", "extraheader",
-        ]
-        lines    = log_text.splitlines()
-        relevant = [
-            l for l in lines
-            if any(k in l.lower() for k in keywords)
-            and not any(n in l.lower() for n in noise)
-        ]
-        tail   = lines[-20:]
-        merged = list(dict.fromkeys(relevant + [l for l in tail if l.strip()]))
-        result = "\n".join(merged)
-        print(f"[DETECT] Extracted {len(merged)} lines ({len(result)} chars)")
-        return result[-MAX_LOG_CHARS:]
-
-    def _get_workflow(self) -> tuple[str, str]:
-        for name in ["ci-local-deploy.yml", "ci-local-deploy.yaml"]:
-            p = Path(".github/workflows") / name
-            if p.exists():
-                content = p.read_text(encoding="utf-8")
-                print(f"[DETECT] Found workflow: {p}")
-                return str(p), content
-        return "", ""
-
-    def analyze(self, log_text: str) -> dict:
-        snippet          = self._extract_error_lines(log_text)
-        wf_path, wf_content = self._get_workflow()
-        workflow_section = f"\nCurrent workflow file ({wf_path}):\n{wf_content}\n" if wf_content else ""
-
-        prompt = f"""You are a DevOps expert fixing a broken GitHub Actions workflow.
-
-Errors:
-{snippet}
-{workflow_section}
-Return ONLY a JSON object with these exact fields:
-  root_cause     - one sentence describing the bug
-  severity       - critical | high | medium | low
-  fix_type       - dependency | config | code | github-action | dockerfile
-  fixed_file     - relative path e.g. .github/workflows/ci-local-deploy.yml
-  fixed_content  - THE COMPLETE CORRECTED YAML as a plain JSON string.
-                   THIS MUST BE A STRING, NOT A NESTED OBJECT.
-                   Escape all newlines as \\n inside the string.
-                   Example: "fixed_content": "name: CI\\non:\\n  push:\\n    branches: [main]\\njobs:\\n  build:\\n    runs-on: ubuntu-latest\\n"
-  commit_message - short message starting with fix:
-  explanation    - one sentence
-
-Return ONLY the JSON. No markdown fences, no extra text."""
-
-        payload = {
-            "model":       self.model,
-            "prompt":      prompt,
-            "temperature": 0.1,
-            "max_tokens":  2000,
-        }
-
-        try:
-            resp = requests.post(self.api_url, json=payload, timeout=180)
-            resp.raise_for_status()
-        except requests.exceptions.Timeout:
-            raise RuntimeError("Ollama timed out after 180s")
-        except requests.exceptions.RequestException as exc:
-            raise RuntimeError(f"Cannot reach Ollama at {self.api_url}: {exc}")
-
-        raw = resp.json().get("choices", [{}])[0].get("text", "").strip()
-        print(f"[AI] Response ({len(raw)} chars): {raw[:300]}{'...' if len(raw) > 300 else ''}")
-
-        try:
-            block = extract_json_block(raw)
-            if block:
-                data = json.loads(block)
-                data = normalise_fixed_content(data)
-                return data
-        except Exception as e:
-            print(f"[WARN] JSON parse failed: {e}")
-
-        print("[WARN] Falling back to raw YAML extraction")
-        yaml_content = extract_yaml_fallback(raw)
-        return {
-            "root_cause":     "fallback_mode",
-            "severity":       "critical",
-            "fix_type":       "config",
-            "fixed_file":     wf_path or ".github/workflows/ci-local-deploy.yml",
-            "fixed_content":  yaml_content,
-            "commit_message": "fix: auto-fixer fallback",
-            "explanation":    "Recovered from bad AI output",
-        }
+def _should_skip(path: Path) -> bool:
+    return any(part in SKIP_DIRS for part in path.parts)
 
 
-# ---------------------------
-# 🛠 Fixer
-# ---------------------------
+def collect_repo_context() -> str:
+    import glob as globmod
+    seen, parts = set(), []
+    for pattern in CONTEXT_GLOBS:
+        for path_str in globmod.glob(pattern, recursive=True):
+            p = Path(path_str)
+            if not p.is_file() or str(p.resolve()) in seen or _should_skip(p):
+                continue
+            seen.add(str(p.resolve()))
+            try:
+                content = p.read_text(encoding="utf-8", errors="replace")
+                if len(content) > MAX_FILE_CHARS:
+                    content = content[:MAX_FILE_CHARS] + f"\n...(truncated)"
+                parts.append(f"### FILE: {p}\n```\n{content}\n```\n")
+            except Exception as exc:
+                parts.append(f"### FILE: {p}\n(unreadable: {exc})\n")
+    result = "\n".join(parts)
+    print(f"[DETECT] Repo context: {len(seen)} files, {len(result)} chars")
+    return result
 
-class AutoFixer:
 
-    KNOWN_PATCHES = [
-        ("python-version 3.2 → 3.12",
-         re.compile(r"(python-version:\s*['\"]?)3\.2(['\"]?)"),
-         r"\g<1>3.12\g<2>"),
+def extract_error_signal(log_text: str) -> str:
+    ERROR_KW = [
+        "error", "failed", "failure", "exception", "traceback",
+        "exit code", "exitcode", "no module", "not found", "invalid",
+        "fatal", "syntaxerror", "importerror", "nameerror", "typeerror",
+        "valueerror", "attributeerror", "assertionerror", "runtimeerror",
+        "cannot", "refused", "rejected", "killed", "denied", "missing",
+        "undefined", "permission denied", "command not found",
+        "connectionerror", "timeout", "step failed", "build failed",
+        "test failed", "pytest", "npm err", "returned non-zero",
     ]
+    NOISE_KW = [
+        "allow-prereleases", "fetch-depth", "persist-credentials",
+        "set-safe-directory", "##[group]", "##[endgroup]", "extraheader",
+        "post job cleanup", "set up job", "complete job", "add mask",
+    ]
+    lines    = log_text.splitlines()
+    relevant = [
+        l.strip() for l in lines
+        if any(k in l.lower() for k in ERROR_KW)
+        and not any(n in l.lower() for n in NOISE_KW)
+        and l.strip()
+    ]
+    tail   = [l.strip() for l in lines[-40:] if l.strip()]
+    merged = list(dict.fromkeys(relevant + tail))
+    result = "\n".join(merged)
+    print(f"[DETECT] Error signal: {len(merged)} lines, {len(result)} chars")
+    return result[-MAX_LOG_CHARS:]
 
-    def apply_fix(self, fix: dict) -> bool:
-        file    = fix.get("fixed_file", "").strip()
-        content = fix.get("fixed_content")
 
-        if not file:
-            print("[ERROR] No fixed_file specified", file=sys.stderr)
-            return False
+# ── AI call ───────────────────────────────────────────────────────────────────
 
-        if ".." in file or file.startswith("/"):
-            print(f"[ERROR] Path traversal rejected: {file}", file=sys.stderr)
-            return False
+PROMPT = """\
+You are a senior DevOps engineer. A CI/CD pipeline has failed.
+Your job: find every bug and return ONLY the minimal string changes needed to fix them.
 
-        if is_valid_workflow_yaml(content):
-            Path(file).parent.mkdir(parents=True, exist_ok=True)
-            Path(file).write_text(content, encoding="utf-8")
-            print(f"[FIX] Written AI fix → {file}")
-            return True
+## CI Error Log
+{error_signal}
 
-        print("[WARN] AI content invalid — trying known patches")
-        return self._apply_known_patches(file, fix)
+## Repository Files
+{repo_context}
 
-    def _apply_known_patches(self, workflow_file: str, fix: dict) -> bool:
-        p = Path(workflow_file)
-        if not p.exists():
-            for name in ["ci-local-deploy.yml", "ci-local-deploy.yaml"]:
-                candidate = Path(".github/workflows") / name
-                if candidate.exists():
-                    p = candidate
+## CRITICAL INSTRUCTIONS
+- Do NOT rewrite entire files
+- Do NOT return full file contents
+- Return ONLY the exact string to find and its exact replacement
+- The "find" value must be an exact substring that exists in the file right now
+- The "replace" value must be the corrected version of that exact substring
+- Keep find/replace as SHORT as possible — one line is ideal
+
+## Response format
+Return ONLY this JSON. No markdown, no explanation outside the JSON.
+
+{{
+  "root_cause": "one sentence — what went wrong",
+  "explanation": "one sentence — what you changed and why",
+  "commit_message": "fix: short description (must start with fix:)",
+  "patches": [
+    {{
+      "file": "relative/path/to/file",
+      "find": "exact string currently in the file",
+      "replace": "corrected string to replace it with"
+    }}
+  ]
+}}
+
+Examples of good patches:
+  Wrong python version in workflow:
+    "file": ".github/workflows/ci-local-deploy.yml"
+    "find": "python-version: '3.13'"
+    "replace": "python-version: '3.12'"
+
+  Wrong Docker base image:
+    "file": "sample_app/Dockerfile"
+    "find": "FROM python:3.13-slim"
+    "replace": "FROM python:3.12-slim"
+
+  Missing pip package:
+    "file": "requirements.txt"
+    "find": "flask==99.0.0"
+    "replace": "flask==2.3.3"
+
+  Python import typo:
+    "file": "sample_app/app.py"
+    "find": "from flask import render_template_strng"
+    "replace": "from flask import render_template_string"
+
+Return ONLY the JSON object."""
+
+
+def call_ai(error_signal: str, repo_context: str,
+            model: str, api_url: str) -> str:
+    prompt  = PROMPT.format(
+        error_signal=error_signal,
+        repo_context=repo_context,
+    )
+    payload = {
+        "model":       model,
+        "prompt":      prompt,
+        "temperature": 0.1,
+        "max_tokens":  1500,   # Much less needed — no full file rewrites
+    }
+    print(f"[AI] Prompt: {len(prompt)} chars (~{len(prompt)//4} tokens)")
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            print(f"[AI] Calling Ollama — attempt {attempt + 1}/{MAX_RETRIES}...")
+            resp = requests.post(api_url, json=payload, timeout=180)
+            resp.raise_for_status()
+            raw = resp.json().get("choices", [{}])[0].get("text", "").strip()
+            print(f"[AI] Got {len(raw)} chars: {raw[:300]}{'...' if len(raw) > 300 else ''}")
+            return raw
+        except requests.exceptions.Timeout:
+            wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+            print(f"[AI] Timeout. Retry in {wait}s...")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(wait)
+        except requests.exceptions.RequestException as exc:
+            raise RuntimeError(f"Cannot reach Ollama at {api_url}: {exc}")
+
+    raise RuntimeError(f"Ollama timed out on all {MAX_RETRIES} attempts.")
+
+
+def parse_ai_response(raw: str) -> dict:
+    """Robustly extract JSON from AI output."""
+    cleaned = re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Find largest balanced {...} block
+    best = None
+    for start in [i for i, c in enumerate(cleaned) if c == "{"]:
+        stack = 0
+        for i in range(start, len(cleaned)):
+            if cleaned[i] == "{":
+                stack += 1
+            elif cleaned[i] == "}":
+                stack -= 1
+                if stack == 0:
+                    candidate = cleaned[start:i + 1]
+                    if best is None or len(candidate) > len(best):
+                        best = candidate
                     break
+    if best:
+        try:
+            return json.loads(best)
+        except json.JSONDecodeError:
+            repaired = best + "}" * (best.count("{") - best.count("}"))
+            try:
+                return json.loads(repaired)
+            except json.JSONDecodeError:
+                pass
 
-        if not p.exists():
-            print("[ERROR] No workflow file found to patch", file=sys.stderr)
-            return False
+    raise ValueError(f"No valid JSON in AI response:\n{raw[:600]}")
 
-        content = p.read_text(encoding="utf-8")
-        patched = content
-        applied = []
 
-        for desc, pattern, replacement in self.KNOWN_PATCHES:
-            new = pattern.sub(replacement, patched)
-            if new != patched:
-                patched = new
-                applied.append(desc)
+# ── Surgical patch application ────────────────────────────────────────────────
 
-        if applied:
-            p.write_text(patched, encoding="utf-8")
-            fix["fixed_file"]     = str(p)
-            fix["commit_message"] = "fix: apply known patch (" + "; ".join(applied) + ")"
-            print(f"[PATCH] Applied to {p}: {', '.join(applied)}")
+def validate_patch(patch: dict) -> tuple[bool, str]:
+    """Check the patch is safe before touching disk."""
+    file    = (patch.get("file") or "").strip()
+    find    = patch.get("find",    "")
+    replace = patch.get("replace", "")
+
+    if not file:
+        return False, "missing 'file' field"
+    if ".." in file or file.startswith("/") or file.startswith("~"):
+        return False, f"unsafe path: {file}"
+    if not find:
+        return False, f"empty 'find' for {file}"
+    if replace is None:
+        return False, f"missing 'replace' for {file}"
+    if not Path(file).exists():
+        return False, f"file does not exist on disk: {file}"
+
+    # Make sure 'find' actually exists in the file
+    content = Path(file).read_text(encoding="utf-8", errors="replace")
+    if find not in content:
+        return False, f"'find' string not found in {file}: {repr(find[:80])}"
+
+    # After applying, validate YAML structure for workflow files
+    if re.search(r"\.github/workflows/.+\.ya?ml$", file):
+        patched = content.replace(find, replace, 1)
+        try:
+            parsed = yaml.safe_load(patched)
+            if not isinstance(parsed, dict) or "jobs" not in parsed:
+                return False, f"patched {file} would be missing 'jobs:' key"
+        except yaml.YAMLError as exc:
+            return False, f"patched {file} would be invalid YAML: {exc}"
+
+    # After applying, validate Python syntax for .py files
+    if file.endswith(".py"):
+        patched = content.replace(find, replace, 1)
+        try:
+            compile(patched, file, "exec")
+        except SyntaxError as exc:
+            return False, f"patched {file} would have Python syntax error: {exc}"
+
+    return True, "ok"
+
+
+def apply_patch(patch: dict) -> bool:
+    """
+    Apply a single surgical patch.
+    Reads the file, does ONE str.replace(), writes back.
+    The AI never touches the file structure — only the specific value.
+    """
+    file    = patch["file"].strip()
+    find    = patch["find"]
+    replace = patch["replace"]
+
+    content = Path(file).read_text(encoding="utf-8", errors="replace")
+
+    # Count occurrences so we know what we're doing
+    count = content.count(find)
+    if count > 1:
+        print(f"[WARN] '{find[:50]}' found {count} times in {file} — replacing first occurrence only")
+
+    patched = content.replace(find, replace, 1)
+    Path(file).write_text(patched, encoding="utf-8")
+
+    print(f"[FIX] ✓ {file}")
+    print(f"       - was : {repr(find[:80])}")
+    print(f"       + now : {repr(replace[:80])}")
+    return True
+
+
+def apply_all_patches(patches: list) -> list[str]:
+    """Validate then apply every patch. Returns list of patched file paths."""
+    written = []
+    for patch in patches:
+        # Normalise — AI sometimes wraps values in extra quotes or escapes
+        for key in ("find", "replace"):
+            val = patch.get(key, "")
+            if isinstance(val, str):
+                # Unescape \\n → real newlines if model escaped them
+                if "\\n" in val and "\n" not in val:
+                    patch[key] = val.replace("\\n", "\n")
+
+        ok, reason = validate_patch(patch)
+        if not ok:
+            print(f"[FIX] ✗ Skipping patch: {reason}", file=sys.stderr)
+            continue
+
+        if apply_patch(patch):
+            written.append(patch["file"].strip())
+
+    return written
+
+
+# ── Git: clean fetch → merge → commit → push ─────────────────────────────────
+
+def commit_and_push(commit_msg: str) -> bool:
+    """
+    Clean pull strategy:
+      1. git fetch origin          (download remote, don't touch working tree)
+      2. git merge -X ours ...     (merge remote in; our fix wins on conflict)
+      3. git add -A
+      4. git commit + push
+    No stash, no rebase, no pop — patch files on disk are never disturbed.
+    """
+    try:
+        run_git("config", "user.name",  BOT_NAME)
+        run_git("config", "user.email", BOT_EMAIL)
+
+        print("[COMMIT] Fetching remote...")
+        run_git("fetch", "origin")
+
+        print("[COMMIT] Merging remote (our fix wins on conflict)...")
+        merge = subprocess.run(
+            ["git", "merge", "-X", "ours", "origin/main",
+             "--no-edit", "-m", f"merge: sync before {commit_msg}"],
+            capture_output=True, text=True
+        )
+        if merge.returncode != 0:
+            print(f"[WARN] Merge skipped (non-fatal): {merge.stderr.strip()}")
+            run_git("merge", "--abort", check=False)
+
+        run_git("add", "-A")
+
+        if run_git("diff", "--cached", "--quiet", check=False).returncode == 0:
+            print("[COMMIT] Nothing to commit — already up to date.")
             return True
 
-        print("[ERROR] No known patches matched", file=sys.stderr)
+        run_git("commit", "-m", commit_msg)
+        run_git("push")
+        print(f"[COMMIT] ✓ Pushed: {commit_msg}")
+        return True
+
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr or ""
+        print(f"[ERROR] Git failed: {' '.join(exc.cmd)}\n  {stderr}", file=sys.stderr)
         return False
 
-    def commit_and_push(self, msg: str) -> bool:
-        try:
-            subprocess.run(["git", "config", "user.name",  "github-actions[bot]"],
-                           check=True, capture_output=True)
-            subprocess.run(["git", "config", "user.email",
-                            "github-actions[bot]@users.noreply.github.com"],
-                           check=True, capture_output=True)
 
-            # ── FIX: stage ALL changes BEFORE pulling ─────────────────────────
-            # git pull --rebase refuses to run when there are unstaged changes.
-            # We stash, rebase, pop — so the patch survives the rebase cleanly.
-            subprocess.run(["git", "add", "-A"],
-                           check=True, capture_output=True)
-
-            # Check whether we actually have staged changes before doing anything
-            has_staged = subprocess.run(
-                ["git", "diff", "--cached", "--quiet"],
-                capture_output=True
-            ).returncode != 0
-
-            if not has_staged:
-                print("[COMMIT] No changes to commit")
-                return True
-
-            # Stash the staged changes, pull, then pop
-            subprocess.run(["git", "stash"],
-                           check=True, capture_output=True)
-
-            pull = subprocess.run(
-                ["git", "pull", "--rebase", "origin", "main"],
-                capture_output=True, text=True
-            )
-            if pull.returncode != 0:
-                # Pull failed (e.g. network) — restore stash and continue anyway
-                print(f"[WARN] git pull failed (non-fatal): {pull.stderr.strip()}")
-                subprocess.run(["git", "stash", "pop"], capture_output=True)
-            else:
-                subprocess.run(["git", "stash", "pop"],
-                               check=True, capture_output=True)
-
-            # Re-stage after pop (stash pop leaves files as working-tree changes)
-            subprocess.run(["git", "add", "-A"],
-                           check=True, capture_output=True)
-
-            # Final check — something to commit?
-            if subprocess.run(["git", "diff", "--cached", "--quiet"],
-                               capture_output=True).returncode == 0:
-                print("[COMMIT] No changes after rebase — already up to date")
-                return True
-
-            subprocess.run(["git", "commit", "-m", msg],
-                           check=True, capture_output=True)
-            subprocess.run(["git", "push"],
-                           check=True, capture_output=True)
-
-            print(f"[COMMIT] Pushed: {msg}")
-            print("[COMMIT] 'Local CI/CD Deploy' will trigger from this push automatically.")
-            return True
-
-        except subprocess.CalledProcessError as exc:
-            stderr = exc.stderr.decode(errors="replace") if exc.stderr else "(no stderr)"
-            print(f"[ERROR] Git failed: {' '.join(exc.cmd)}\n  {stderr}", file=sys.stderr)
-            return False
-
-
-# ---------------------------
-# 🚀 Main
-# ---------------------------
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Self-healing CI: detect → fix → commit (push re-triggers CI naturally)"
+        description="Surgical self-healing CI fixer — AI finds bugs, Python fixes files"
     )
-    parser.add_argument("--input", required=True, help="Path to failure.log")
+    parser.add_argument("--input",   required=True, help="Path to failure.log")
+    parser.add_argument("--model",   default=DEFAULT_MODEL)
+    parser.add_argument("--api-url", default=DEFAULT_API_URL)
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show patches without writing or pushing")
     args = parser.parse_args()
 
     log_path = Path(args.input)
     if not log_path.is_file():
-        print(f"[ERROR] Log file not found: {args.input}", file=sys.stderr)
+        print(f"[ERROR] Log not found: {args.input}", file=sys.stderr)
         sys.exit(1)
 
     if last_commit_was_bot():
         sys.exit(0)
 
-    log = log_path.read_text(encoding="utf-8", errors="replace")
-    print(f"[DETECT] Log size: {len(log)} chars")
+    # ── DETECT ────────────────────────────────────────────────────────────────
+    print("\n━━━ STAGE 1: DETECT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    log_text     = log_path.read_text(encoding="utf-8", errors="replace")
+    error_signal = extract_error_signal(log_text)
+    repo_context = collect_repo_context()
 
-    analyzer = WorkflowAnalyzer()
+    # ── ANALYSE ───────────────────────────────────────────────────────────────
+    print("\n━━━ STAGE 2: ANALYSE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     try:
-        fix = analyzer.analyze(log)
-    except Exception as e:
-        print(f"[ERROR] AI analysis failed: {e}", file=sys.stderr)
-        # AI failed — let known patches take over
-        fix = {
-            "fixed_file":     ".github/workflows/ci-local-deploy.yml",
-            "fixed_content":  None,
-            "commit_message": "fix: fallback safe mode",
-        }
+        raw     = call_ai(error_signal, repo_context, args.model, args.api_url)
+        ai_data = parse_ai_response(raw)
+        patches = ai_data.get("patches", [])
 
-    print(f"\n[INFO] root_cause  : {fix.get('root_cause', 'unknown')}")
-    print(f"[INFO] fixed_file  : {fix.get('fixed_file', 'unknown')}")
-    print(f"[INFO] explanation : {fix.get('explanation', '')}")
+        print(f"\n  root_cause : {ai_data.get('root_cause', 'unknown')}")
+        print(f"  explanation: {ai_data.get('explanation', '')}")
+        print(f"  patches    : {len(patches)} change(s) identified")
+        for p in patches:
+            print(f"    → {p.get('file', '?')}")
+            print(f"      find   : {repr(str(p.get('find', ''))[:60])}")
+            print(f"      replace: {repr(str(p.get('replace', ''))[:60])}")
 
-    fixer = AutoFixer()
+        commit_msg = ai_data.get("commit_message", "fix: auto-fixer patch")
 
-    if not fixer.apply_fix(fix):
-        print("[ERROR] Could not apply any fix", file=sys.stderr)
+    except Exception as exc:
+        print(f"\n[ERROR] AI analysis failed: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    if not patches:
+        print("[ERROR] AI returned no patches.", file=sys.stderr)
         sys.exit(3)
 
-    if not fixer.commit_and_push(fix.get("commit_message", "fix: auto-fix")):
-        print("[ERROR] Commit/push failed", file=sys.stderr)
+    # ── DRY RUN ───────────────────────────────────────────────────────────────
+    if args.dry_run:
+        print("\n━━━ DRY-RUN — validating patches ━━━━━━━━━━━━━━━━━━━━━━━")
+        for p in patches:
+            ok, reason = validate_patch(p)
+            print(f"  {'✓' if ok else '✗'} {p.get('file', '?')} — {reason}")
+        print("\n[DRY-RUN] Nothing written.")
+        sys.exit(0)
+
+    # ── PATCH ─────────────────────────────────────────────────────────────────
+    print("\n━━━ STAGE 3: PATCH ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    written = apply_all_patches(patches)
+    if not written:
+        print("[ERROR] All patches failed validation — nothing written.", file=sys.stderr)
+        sys.exit(3)
+    print(f"\n[PATCH] {len(written)}/{len(patches)} patches applied successfully.")
+
+    # ── COMMIT ────────────────────────────────────────────────────────────────
+    print("\n━━━ STAGE 4: COMMIT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    if not commit_and_push(commit_msg):
         sys.exit(4)
 
-    print("\n✅ Fix committed. CI will re-run from the new push automatically.")
+    # ── DONE ──────────────────────────────────────────────────────────────────
+    print("\n━━━ ✅ DONE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"  commit : {commit_msg}")
+    print(f"  files  : {', '.join(written)}")
+    print("  CI will re-run automatically from the push.")
 
 
 if __name__ == "__main__":
-    main()  
+    main()
