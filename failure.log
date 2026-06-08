@@ -1,404 +1,410 @@
 === 0_Build, Test, and Deploy Local App.txt ===
-﻿2026-06-08T02:21:47.4599937Z Current runner version: '2.334.0'
-2026-06-08T02:21:47.4608010Z Runner name: 'auto-fixer-runner'
-2026-06-08T02:21:47.4609014Z Runner group name: 'Default'
-2026-06-08T02:21:47.4610149Z Machine name: 'ubuntu'
-2026-06-08T02:21:47.4613812Z ##[group]GITHUB_TOKEN Permissions
-2026-06-08T02:21:47.4616526Z Contents: read
-2026-06-08T02:21:47.4617336Z Metadata: read
-2026-06-08T02:21:47.4618060Z Packages: read
-2026-06-08T02:21:47.4618812Z ##[endgroup]
-2026-06-08T02:21:47.4622077Z Secret source: Actions
-2026-06-08T02:21:47.4623066Z Prepare workflow directory
-2026-06-08T02:21:47.5301113Z Prepare all required actions
-2026-06-08T02:21:47.5349184Z Getting action download info
-2026-06-08T02:21:48.7163051Z Download action repository 'actions/checkout@v4' (SHA:34e114876b0b11c390a56381ad16ebd13914f8d5)
-2026-06-08T02:21:49.9136120Z Download action repository 'actions/setup-python@v5' (SHA:a26af69be951a213d495a4c3e4e4022e16d87065)
-2026-06-08T02:21:52.0525781Z Complete job name: Build, Test, and Deploy Local App
-2026-06-08T02:21:52.1589678Z ##[group]Run actions/checkout@v4
-2026-06-08T02:21:52.1590562Z with:
-2026-06-08T02:21:52.1590936Z   persist-credentials: true
-2026-06-08T02:21:52.1591510Z   fetch-depth: 0
-2026-06-08T02:21:52.1591922Z   repository: Mazhar10pearls/AI-based-debugger
-2026-06-08T02:21:52.1596722Z   token: ***
-2026-06-08T02:21:52.1597067Z   ssh-strict: true
-2026-06-08T02:21:52.1597413Z   ssh-user: git
-2026-06-08T02:21:52.1597743Z   clean: true
-2026-06-08T02:21:52.1598093Z   sparse-checkout-cone-mode: true
-2026-06-08T02:21:52.1598524Z   fetch-tags: false
-2026-06-08T02:21:52.1598891Z   show-progress: true
-2026-06-08T02:21:52.1599256Z   lfs: false
-2026-06-08T02:21:52.1599588Z   submodules: false
-2026-06-08T02:21:52.1599956Z   set-safe-directory: true
-2026-06-08T02:21:52.1600688Z ##[endgroup]
-2026-06-08T02:21:52.3130615Z Syncing repository: Mazhar10pearls/AI-based-debugger
-2026-06-08T02:21:52.3133813Z ##[group]Getting Git version info
-2026-06-08T02:21:52.3135339Z Working directory is '/home/ubuntu/actions-runner-2/_work2/AI-based-debugger/AI-based-debugger'
-2026-06-08T02:21:52.3137446Z [command]/usr/bin/git version
-2026-06-08T02:21:52.3138197Z git version 2.43.0
-2026-06-08T02:21:52.3168825Z ##[endgroup]
-2026-06-08T02:21:52.3187430Z Temporarily overriding HOME='/home/ubuntu/actions-runner-2/_work2/_temp/2749d30c-cb09-4664-bbdb-4d32f030bf21' before making global git config changes
-2026-06-08T02:21:52.3193196Z Adding repository directory to the temporary git global config as a safe directory
-2026-06-08T02:21:52.3197028Z [command]/usr/bin/git config --global --add safe.directory /home/ubuntu/actions-runner-2/_work2/AI-based-debugger/AI-based-debugger
-2026-06-08T02:21:52.3243576Z [command]/usr/bin/git config --local --get remote.origin.url
-2026-06-08T02:21:52.3280508Z ***github.com/Mazhar10pearls/AI-based-debugger.git
-2026-06-08T02:21:52.3290423Z Deleting the contents of '/home/ubuntu/actions-runner-2/_work2/AI-based-debugger/AI-based-debugger'
-2026-06-08T02:21:52.3408121Z ##[group]Initializing the repository
-2026-06-08T02:21:52.3412433Z [command]/usr/bin/git init /home/ubuntu/actions-runner-2/_work2/AI-based-debugger/AI-based-debugger
-2026-06-08T02:21:52.3452724Z hint: Using 'master' as the name for the initial branch. This default branch name
-2026-06-08T02:21:52.3453867Z hint: is subject to change. To configure the initial branch name to use in all
-2026-06-08T02:21:52.3454673Z hint: of your new repositories, which will suppress this warning, call:
-2026-06-08T02:21:52.3455260Z hint: 
-2026-06-08T02:21:52.3455693Z hint: 	git config --global init.defaultBranch <name>
-2026-06-08T02:21:52.3456196Z hint: 
-2026-06-08T02:21:52.3456688Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
-2026-06-08T02:21:52.3457514Z hint: 'development'. The just-created branch can be renamed via this command:
-2026-06-08T02:21:52.3458159Z hint: 
-2026-06-08T02:21:52.3458500Z hint: 	git branch -m <name>
-2026-06-08T02:21:52.3464401Z Initialized empty Git repository in /home/ubuntu/actions-runner-2/_work2/AI-based-debugger/AI-based-debugger/.git/
-2026-06-08T02:21:52.3478515Z [command]/usr/bin/git remote add origin https://github.com/Mazhar10pearls/AI-based-debugger
-2026-06-08T02:21:52.3514793Z ##[endgroup]
-2026-06-08T02:21:52.3515475Z ##[group]Disabling automatic garbage collection
-2026-06-08T02:21:52.3517767Z [command]/usr/bin/git config --local gc.auto 0
-2026-06-08T02:21:52.3548438Z ##[endgroup]
-2026-06-08T02:21:52.3549062Z ##[group]Setting up auth
-2026-06-08T02:21:52.3555029Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
-2026-06-08T02:21:52.3587316Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
-2026-06-08T02:21:52.3843096Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
-2026-06-08T02:21:52.3899715Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
-2026-06-08T02:21:52.4169400Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
-2026-06-08T02:21:52.4206429Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
-2026-06-08T02:21:52.4458295Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
-2026-06-08T02:21:52.4504529Z ##[endgroup]
-2026-06-08T02:21:52.4515228Z ##[group]Fetching the repository
-2026-06-08T02:21:52.4516334Z [command]/usr/bin/git -c protocol.version=2 fetch --prune --no-recurse-submodules origin +refs/heads/*:refs/remotes/origin/* +refs/tags/*:refs/tags/*
-2026-06-08T02:21:53.9998491Z From https://github.com/Mazhar10pearls/AI-based-debugger
-2026-06-08T02:21:54.0000616Z  * [new branch]      main       -> origin/main
-2026-06-08T02:21:54.0033384Z [command]/usr/bin/git branch --list --remote origin/main
-2026-06-08T02:21:54.0061457Z   origin/main
-2026-06-08T02:21:54.0069671Z [command]/usr/bin/git rev-parse refs/remotes/origin/main
-2026-06-08T02:21:54.0095879Z 6114e1315113d2057770e24f65fc16d2289c82e6
-2026-06-08T02:21:54.0101707Z ##[endgroup]
-2026-06-08T02:21:54.0102763Z ##[group]Determining the checkout info
-2026-06-08T02:21:54.0103905Z ##[endgroup]
-2026-06-08T02:21:54.0107686Z [command]/usr/bin/git sparse-checkout disable
-2026-06-08T02:21:54.0151993Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
-2026-06-08T02:21:54.0188537Z ##[group]Checking out the ref
-2026-06-08T02:21:54.0189612Z [command]/usr/bin/git checkout --progress --force -B main refs/remotes/origin/main
-2026-06-08T02:21:54.0246731Z Switched to a new branch 'main'
-2026-06-08T02:21:54.0247786Z branch 'main' set up to track 'origin/main'.
-2026-06-08T02:21:54.0254654Z ##[endgroup]
-2026-06-08T02:21:54.0291521Z [command]/usr/bin/git log -1 --format=%H
-2026-06-08T02:21:54.0319663Z 6114e1315113d2057770e24f65fc16d2289c82e6
-2026-06-08T02:21:54.0568125Z ##[group]Run actions/setup-python@v5
-2026-06-08T02:21:54.0568556Z with:
-2026-06-08T02:21:54.0568846Z   python-version: 3.12
-2026-06-08T02:21:54.0569193Z   check-latest: false
-2026-06-08T02:21:54.0574163Z   token: ***
-2026-06-08T02:21:54.0574462Z   update-environment: true
-2026-06-08T02:21:54.0574987Z   allow-prereleases: false
-2026-06-08T02:21:54.0575344Z   freethreaded: false
-2026-06-08T02:21:54.0575763Z ##[endgroup]
-2026-06-08T02:21:54.3045806Z ##[group]Installed versions
-2026-06-08T02:21:54.3104082Z Successfully set up CPython (3.12.13)
-2026-06-08T02:21:54.3108144Z ##[endgroup]
-2026-06-08T02:21:54.3283587Z ##[group]Run python -m pip install --upgrade pip
-2026-06-08T02:21:54.3284197Z [36;1mpython -m pip install --upgrade pip[0m
-2026-06-08T02:21:54.3284750Z [36;1mpython -m pip install -r sample_app/requirements.txt[0m
-2026-06-08T02:21:54.3310617Z shell: /usr/bin/bash -e {0}
-2026-06-08T02:21:54.3310985Z env:
-2026-06-08T02:21:54.3311653Z   pythonLocation: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:54.3312780Z   PKG_CONFIG_PATH: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/pkgconfig
-2026-06-08T02:21:54.3313599Z   Python_ROOT_DIR: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:54.3314356Z   Python2_ROOT_DIR: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:54.3315110Z   Python3_ROOT_DIR: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:54.3315907Z   LD_LIBRARY_PATH: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib
-2026-06-08T02:21:54.3316542Z ##[endgroup]
-2026-06-08T02:21:54.7346293Z Requirement already satisfied: pip in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (26.1.2)
-2026-06-08T02:21:55.7151646Z Requirement already satisfied: Flask==2.3.3 in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from -r sample_app/requirements.txt (line 1)) (2.3.3)
-2026-06-08T02:21:55.7157606Z Requirement already satisfied: pytest==7.4.0 in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from -r sample_app/requirements.txt (line 2)) (7.4.0)
-2026-06-08T02:21:55.7168743Z Requirement already satisfied: Werkzeug>=2.3.7 in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (3.1.8)
-2026-06-08T02:21:55.7176687Z Requirement already satisfied: Jinja2>=3.1.2 in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (3.1.6)
-2026-06-08T02:21:55.7182407Z Requirement already satisfied: itsdangerous>=2.1.2 in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (2.2.0)
-2026-06-08T02:21:55.7187119Z Requirement already satisfied: click>=8.1.3 in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (8.4.1)
-2026-06-08T02:21:55.7195281Z Requirement already satisfied: blinker>=1.6.2 in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (1.9.0)
-2026-06-08T02:21:55.7210919Z Requirement already satisfied: iniconfig in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from pytest==7.4.0->-r sample_app/requirements.txt (line 2)) (2.3.0)
-2026-06-08T02:21:55.7218339Z Requirement already satisfied: packaging in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from pytest==7.4.0->-r sample_app/requirements.txt (line 2)) (26.2)
-2026-06-08T02:21:55.7227565Z Requirement already satisfied: pluggy<2.0,>=0.12 in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from pytest==7.4.0->-r sample_app/requirements.txt (line 2)) (1.6.0)
-2026-06-08T02:21:55.7269547Z Requirement already satisfied: MarkupSafe>=2.0 in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Jinja2>=3.1.2->Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (3.0.3)
-2026-06-08T02:21:55.8098474Z ##[group]Run python -m pytest sample_app/test_app.py
-2026-06-08T02:21:55.8099377Z [36;1mpython -m pytest sample_app/test_app.py[0m
-2026-06-08T02:21:55.8131040Z shell: /usr/bin/bash -e {0}
-2026-06-08T02:21:55.8132011Z env:
-2026-06-08T02:21:55.8132787Z   pythonLocation: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:55.8134179Z   PKG_CONFIG_PATH: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/pkgconfig
-2026-06-08T02:21:55.8135530Z   Python_ROOT_DIR: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:55.8136759Z   Python2_ROOT_DIR: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:55.8138279Z   Python3_ROOT_DIR: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:55.8139541Z   LD_LIBRARY_PATH: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib
-2026-06-08T02:21:55.8140502Z ##[endgroup]
-2026-06-08T02:21:56.1789305Z ============================= test session starts ==============================
-2026-06-08T02:21:56.1791791Z platform linux -- Python 3.12.13, pytest-7.4.0, pluggy-1.6.0
-2026-06-08T02:21:56.1794046Z rootdir: /home/ubuntu/actions-runner-2/_work2/AI-based-debugger/AI-based-debugger
-2026-06-08T02:21:56.1795914Z collected 1 item
-2026-06-08T02:21:56.1796514Z 
-2026-06-08T02:21:56.1851022Z sample_app/test_app.py .                                                 [100%]
-2026-06-08T02:21:56.1853066Z 
-2026-06-08T02:21:56.1853719Z ============================== 1 passed in 0.13s ===============================
-2026-06-08T02:21:56.2369737Z ##[group]Run chmod +x sample_app/deploy_local.sh
-2026-06-08T02:21:56.2370798Z [36;1mchmod +x sample_app/deploy_local.sh[0m
-2026-06-08T02:21:56.2372061Z [36;1mbash sample_app/deploy_local.sh[0m
-2026-06-08T02:21:56.2411691Z shell: /usr/bin/bash -e {0}
-2026-06-08T02:21:56.2412381Z env:
-2026-06-08T02:21:56.2413329Z   pythonLocation: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:56.2415076Z   PKG_CONFIG_PATH: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/pkgconfig
-2026-06-08T02:21:56.2416770Z   Python_ROOT_DIR: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:56.2418324Z   Python2_ROOT_DIR: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:56.2419874Z   Python3_ROOT_DIR: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:56.2421783Z   LD_LIBRARY_PATH: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib
-2026-06-08T02:21:56.2423056Z ##[endgroup]
-2026-06-08T02:21:56.2575580Z Building sample application Docker image...
-2026-06-08T02:21:56.2792081Z DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
-2026-06-08T02:21:56.2797055Z             Install the buildx component to build images with BuildKit:
-2026-06-08T02:21:56.2798411Z             https://docs.docker.com/go/buildx/
-2026-06-08T02:21:56.2799199Z 
-2026-06-08T02:21:56.2843460Z Sending build context to Docker daemon  12.29kB
-2026-06-08T02:21:56.2844595Z 
-2026-06-08T02:21:56.2849878Z Step 1/7 : FROM python:3.2-slim
-2026-06-08T02:21:57.7759494Z not implemented: media type "application/vnd.docker.distribution.manifest.v1+prettyjws" is no longer supported since containerd v2.1, please rebuild the image as "application/vnd.docker.distribution.manifest.v2+json" or "application/vnd.oci.image.manifest.v1+json"
-2026-06-08T02:21:57.7840373Z ##[error]Process completed with exit code 1.
-2026-06-08T02:21:57.8131116Z Post job cleanup.
-2026-06-08T02:21:57.9731739Z [command]/usr/bin/git version
-2026-06-08T02:21:57.9812126Z git version 2.43.0
-2026-06-08T02:21:57.9874766Z Temporarily overriding HOME='/home/ubuntu/actions-runner-2/_work2/_temp/5d574b3f-5cf2-44bc-ac40-3f71c85b86c5' before making global git config changes
-2026-06-08T02:21:57.9878939Z Adding repository directory to the temporary git global config as a safe directory
-2026-06-08T02:21:57.9883763Z [command]/usr/bin/git config --global --add safe.directory /home/ubuntu/actions-runner-2/_work2/AI-based-debugger/AI-based-debugger
-2026-06-08T02:21:57.9933903Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
-2026-06-08T02:21:57.9975892Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
-2026-06-08T02:21:58.0250784Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
-2026-06-08T02:21:58.0275475Z http.https://github.com/.extraheader
-2026-06-08T02:21:58.0292754Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
-2026-06-08T02:21:58.0330867Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
-2026-06-08T02:21:58.0596899Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
-2026-06-08T02:21:58.0637972Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
-2026-06-08T02:21:58.1057410Z Cleaning up orphan processes
-2026-06-08T02:21:58.1379159Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: actions/checkout@v4, actions/setup-python@v5. Actions will be forced to run with Node.js 24 by default starting June 16th, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+﻿2026-06-08T02:31:46.8305662Z Current runner version: '2.334.0'
+2026-06-08T02:31:46.8313896Z Runner name: 'vm-runner'
+2026-06-08T02:31:46.8314814Z Runner group name: 'Default'
+2026-06-08T02:31:46.8316063Z Machine name: 'ubuntu'
+2026-06-08T02:31:46.8319850Z ##[group]GITHUB_TOKEN Permissions
+2026-06-08T02:31:46.8322971Z Contents: read
+2026-06-08T02:31:46.8323686Z Metadata: read
+2026-06-08T02:31:46.8324500Z Packages: read
+2026-06-08T02:31:46.8325219Z ##[endgroup]
+2026-06-08T02:31:46.8328683Z Secret source: Actions
+2026-06-08T02:31:46.8329637Z Prepare workflow directory
+2026-06-08T02:31:46.8941996Z Prepare all required actions
+2026-06-08T02:31:46.8992831Z Getting action download info
+2026-06-08T02:31:48.0534431Z Download action repository 'actions/checkout@v4' (SHA:34e114876b0b11c390a56381ad16ebd13914f8d5)
+2026-06-08T02:31:49.4454660Z Download action repository 'actions/setup-python@v5' (SHA:a26af69be951a213d495a4c3e4e4022e16d87065)
+2026-06-08T02:31:51.4810556Z Complete job name: Build, Test, and Deploy Local App
+2026-06-08T02:31:51.5918885Z ##[group]Run actions/checkout@v4
+2026-06-08T02:31:51.5919872Z with:
+2026-06-08T02:31:51.5920249Z   persist-credentials: true
+2026-06-08T02:31:51.5920673Z   fetch-depth: 0
+2026-06-08T02:31:51.5921096Z   repository: Mazhar10pearls/AI-based-debugger
+2026-06-08T02:31:51.5926855Z   token: ***
+2026-06-08T02:31:51.5927287Z   ssh-strict: true
+2026-06-08T02:31:51.5927705Z   ssh-user: git
+2026-06-08T02:31:51.5928112Z   clean: true
+2026-06-08T02:31:51.5928539Z   sparse-checkout-cone-mode: true
+2026-06-08T02:31:51.5929047Z   fetch-tags: false
+2026-06-08T02:31:51.5929475Z   show-progress: true
+2026-06-08T02:31:51.5929912Z   lfs: false
+2026-06-08T02:31:51.5930306Z   submodules: false
+2026-06-08T02:31:51.5930747Z   set-safe-directory: true
+2026-06-08T02:31:51.5931872Z ##[endgroup]
+2026-06-08T02:31:51.7629696Z Syncing repository: Mazhar10pearls/AI-based-debugger
+2026-06-08T02:31:51.7631893Z ##[group]Getting Git version info
+2026-06-08T02:31:51.7632822Z Working directory is '/home/ubuntu/actions-runner/_work/AI-based-debugger/AI-based-debugger'
+2026-06-08T02:31:51.7634212Z [command]/usr/bin/git version
+2026-06-08T02:31:51.7634713Z git version 2.43.0
+2026-06-08T02:31:51.7636613Z ##[endgroup]
+2026-06-08T02:31:51.7641964Z Temporarily overriding HOME='/home/ubuntu/actions-runner/_work/_temp/2fe0efff-9148-4c4b-97ab-6524a1fbbf57' before making global git config changes
+2026-06-08T02:31:51.7643287Z Adding repository directory to the temporary git global config as a safe directory
+2026-06-08T02:31:51.7644452Z [command]/usr/bin/git config --global --add safe.directory /home/ubuntu/actions-runner/_work/AI-based-debugger/AI-based-debugger
+2026-06-08T02:31:51.7647698Z [command]/usr/bin/git config --local --get remote.origin.url
+2026-06-08T02:31:51.7672644Z https://github.com/Mazhar10pearls/AI-based-debugger
+2026-06-08T02:31:51.7692464Z ##[group]Removing previously created refs, to avoid conflicts
+2026-06-08T02:31:51.7697979Z [command]/usr/bin/git rev-parse --symbolic-full-name --verify --quiet HEAD
+2026-06-08T02:31:51.7722306Z refs/heads/main
+2026-06-08T02:31:51.7732815Z [command]/usr/bin/git checkout --detach
+2026-06-08T02:31:51.7788047Z HEAD is now at 6200c89 multi support logic
+2026-06-08T02:31:51.7792285Z M	sample_app/deploy_local.sh
+2026-06-08T02:31:51.7833778Z [command]/usr/bin/git branch --delete --force main
+2026-06-08T02:31:51.7864512Z Deleted branch main (was 6200c89).
+2026-06-08T02:31:51.7907784Z ##[endgroup]
+2026-06-08T02:31:51.7911754Z [command]/usr/bin/git submodule status
+2026-06-08T02:31:51.8168415Z ##[group]Cleaning the repository
+2026-06-08T02:31:51.8174517Z [command]/usr/bin/git clean -ffdx
+2026-06-08T02:31:51.8206655Z Removing .pytest_cache/
+2026-06-08T02:31:51.8207244Z Removing sample_app/__pycache__/
+2026-06-08T02:31:51.8218741Z [command]/usr/bin/git reset --hard HEAD
+2026-06-08T02:31:51.8269292Z HEAD is now at 6200c89 multi support logic
+2026-06-08T02:31:51.8276220Z ##[endgroup]
+2026-06-08T02:31:51.8277951Z ##[group]Disabling automatic garbage collection
+2026-06-08T02:31:51.8284350Z [command]/usr/bin/git config --local gc.auto 0
+2026-06-08T02:31:51.8318880Z ##[endgroup]
+2026-06-08T02:31:51.8319514Z ##[group]Setting up auth
+2026-06-08T02:31:51.8325701Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-06-08T02:31:51.8358150Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-06-08T02:31:51.8614173Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-06-08T02:31:51.8645611Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-06-08T02:31:51.8894628Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-06-08T02:31:51.8933982Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-06-08T02:31:51.9183754Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2026-06-08T02:31:51.9222633Z ##[endgroup]
+2026-06-08T02:31:51.9224338Z ##[group]Fetching the repository
+2026-06-08T02:31:51.9232256Z [command]/usr/bin/git -c protocol.version=2 fetch --prune --no-recurse-submodules origin +refs/heads/*:refs/remotes/origin/* +refs/tags/*:refs/tags/*
+2026-06-08T02:31:53.5881762Z From https://github.com/Mazhar10pearls/AI-based-debugger
+2026-06-08T02:31:53.5883691Z  * [new branch]      auto-fix/1780885689 -> origin/auto-fix/1780885689
+2026-06-08T02:31:53.5887044Z    6200c89..263dead  main                -> origin/main
+2026-06-08T02:31:53.5931847Z [command]/usr/bin/git branch --list --remote origin/main
+2026-06-08T02:31:53.5968816Z   origin/main
+2026-06-08T02:31:53.5984139Z [command]/usr/bin/git rev-parse refs/remotes/origin/main
+2026-06-08T02:31:53.6017520Z 263deadb4e5618c8ed6a5637e6e03b565d429447
+2026-06-08T02:31:53.6024608Z ##[endgroup]
+2026-06-08T02:31:53.6026304Z ##[group]Determining the checkout info
+2026-06-08T02:31:53.6027425Z ##[endgroup]
+2026-06-08T02:31:53.6034423Z [command]/usr/bin/git sparse-checkout disable
+2026-06-08T02:31:53.6096092Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-06-08T02:31:53.6130155Z ##[group]Checking out the ref
+2026-06-08T02:31:53.6135709Z [command]/usr/bin/git checkout --progress --force -B main refs/remotes/origin/main
+2026-06-08T02:31:53.6190650Z Previous HEAD position was 6200c89 multi support logic
+2026-06-08T02:31:53.6221425Z Switched to a new branch 'main'
+2026-06-08T02:31:53.6224131Z branch 'main' set up to track 'origin/main'.
+2026-06-08T02:31:53.6230148Z ##[endgroup]
+2026-06-08T02:31:53.6282916Z [command]/usr/bin/git log -1 --format=%H
+2026-06-08T02:31:53.6314202Z 263deadb4e5618c8ed6a5637e6e03b565d429447
+2026-06-08T02:31:53.6662606Z ##[group]Run actions/setup-python@v5
+2026-06-08T02:31:53.6663036Z with:
+2026-06-08T02:31:53.6663343Z   python-version: 3.12
+2026-06-08T02:31:53.6663672Z   check-latest: false
+2026-06-08T02:31:53.6667746Z   token: ***
+2026-06-08T02:31:53.6668057Z   update-environment: true
+2026-06-08T02:31:53.6668409Z   allow-prereleases: false
+2026-06-08T02:31:53.6668751Z   freethreaded: false
+2026-06-08T02:31:53.6669066Z ##[endgroup]
+2026-06-08T02:31:53.9066672Z ##[group]Installed versions
+2026-06-08T02:31:53.9137363Z Successfully set up CPython (3.12.13)
+2026-06-08T02:31:53.9138456Z ##[endgroup]
+2026-06-08T02:31:53.9279871Z ##[group]Run python -m pip install --upgrade pip
+2026-06-08T02:31:53.9280452Z [36;1mpython -m pip install --upgrade pip[0m
+2026-06-08T02:31:53.9280998Z [36;1mpython -m pip install -r sample_app/requirements.txt[0m
+2026-06-08T02:31:53.9308006Z shell: /usr/bin/bash -e {0}
+2026-06-08T02:31:53.9308380Z env:
+2026-06-08T02:31:53.9308839Z   pythonLocation: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:53.9309665Z   PKG_CONFIG_PATH: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/pkgconfig
+2026-06-08T02:31:53.9310744Z   Python_ROOT_DIR: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:53.9311981Z   Python2_ROOT_DIR: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:53.9312723Z   Python3_ROOT_DIR: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:53.9313467Z   LD_LIBRARY_PATH: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib
+2026-06-08T02:31:53.9314093Z ##[endgroup]
+2026-06-08T02:31:54.3664088Z Requirement already satisfied: pip in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (26.1.2)
+2026-06-08T02:31:55.4083327Z Requirement already satisfied: Flask==2.3.3 in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from -r sample_app/requirements.txt (line 1)) (2.3.3)
+2026-06-08T02:31:55.4091436Z Requirement already satisfied: pytest==7.4.0 in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from -r sample_app/requirements.txt (line 2)) (7.4.0)
+2026-06-08T02:31:55.4104833Z Requirement already satisfied: Werkzeug>=2.3.7 in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (3.1.8)
+2026-06-08T02:31:55.4113071Z Requirement already satisfied: Jinja2>=3.1.2 in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (3.1.6)
+2026-06-08T02:31:55.4121684Z Requirement already satisfied: itsdangerous>=2.1.2 in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (2.2.0)
+2026-06-08T02:31:55.4129615Z Requirement already satisfied: click>=8.1.3 in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (8.4.1)
+2026-06-08T02:31:55.4137996Z Requirement already satisfied: blinker>=1.6.2 in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (1.9.0)
+2026-06-08T02:31:55.4156560Z Requirement already satisfied: iniconfig in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from pytest==7.4.0->-r sample_app/requirements.txt (line 2)) (2.3.0)
+2026-06-08T02:31:55.4163326Z Requirement already satisfied: packaging in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from pytest==7.4.0->-r sample_app/requirements.txt (line 2)) (26.2)
+2026-06-08T02:31:55.4173489Z Requirement already satisfied: pluggy<2.0,>=0.12 in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from pytest==7.4.0->-r sample_app/requirements.txt (line 2)) (1.6.0)
+2026-06-08T02:31:55.4219891Z Requirement already satisfied: MarkupSafe>=2.0 in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Jinja2>=3.1.2->Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (3.0.3)
+2026-06-08T02:31:55.4913318Z ##[group]Run python -m pytest sample_app/test_app.py
+2026-06-08T02:31:55.4915063Z [36;1mpython -m pytest sample_app/test_app.py[0m
+2026-06-08T02:31:55.5003521Z shell: /usr/bin/bash -e {0}
+2026-06-08T02:31:55.5004575Z env:
+2026-06-08T02:31:55.5005964Z   pythonLocation: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:55.5008514Z   PKG_CONFIG_PATH: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/pkgconfig
+2026-06-08T02:31:55.5011011Z   Python_ROOT_DIR: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:55.5013549Z   Python2_ROOT_DIR: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:55.5015832Z   Python3_ROOT_DIR: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:55.5018154Z   LD_LIBRARY_PATH: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib
+2026-06-08T02:31:55.5020415Z ##[endgroup]
+2026-06-08T02:31:55.8162455Z ============================= test session starts ==============================
+2026-06-08T02:31:55.8163620Z platform linux -- Python 3.12.13, pytest-7.4.0, pluggy-1.6.0
+2026-06-08T02:31:55.8164944Z rootdir: /home/ubuntu/actions-runner/_work/AI-based-debugger/AI-based-debugger
+2026-06-08T02:31:55.8166031Z collected 1 item
+2026-06-08T02:31:55.8166373Z 
+2026-06-08T02:31:55.8225118Z sample_app/test_app.py .                                                 [100%]
+2026-06-08T02:31:55.8226070Z 
+2026-06-08T02:31:55.8226492Z ============================== 1 passed in 0.12s ===============================
+2026-06-08T02:31:55.8729913Z ##[group]Run chmod +x sample_app/deploy_local.sh
+2026-06-08T02:31:55.8731114Z [36;1mchmod +x sample_app/deploy_local.sh[0m
+2026-06-08T02:31:55.8732513Z [36;1mbash sample_app/deploy_local.sh[0m
+2026-06-08T02:31:55.8762313Z shell: /usr/bin/bash -e {0}
+2026-06-08T02:31:55.8762848Z env:
+2026-06-08T02:31:55.8763522Z   pythonLocation: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:55.8764736Z   PKG_CONFIG_PATH: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/pkgconfig
+2026-06-08T02:31:55.8765934Z   Python_ROOT_DIR: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:55.8767026Z   Python2_ROOT_DIR: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:55.8768124Z   Python3_ROOT_DIR: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:55.8769237Z   LD_LIBRARY_PATH: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib
+2026-06-08T02:31:55.8770094Z ##[endgroup]
+2026-06-08T02:31:55.8881556Z Building sample application Docker image...
+2026-06-08T02:31:55.9080130Z DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+2026-06-08T02:31:55.9082799Z             Install the buildx component to build images with BuildKit:
+2026-06-08T02:31:55.9084798Z             https://docs.docker.com/go/buildx/
+2026-06-08T02:31:55.9085506Z 
+2026-06-08T02:31:55.9117628Z Sending build context to Docker daemon  12.29kB
+2026-06-08T02:31:55.9118354Z 
+2026-06-08T02:31:55.9129228Z Step 1/3 : FROM python:3.2-slim
+2026-06-08T02:31:57.1811112Z not implemented: media type "application/vnd.docker.distribution.manifest.v1+prettyjws" is no longer supported since containerd v2.1, please rebuild the image as "application/vnd.docker.distribution.manifest.v2+json" or "application/vnd.oci.image.manifest.v1+json"
+2026-06-08T02:31:57.1882466Z ##[error]Process completed with exit code 1.
+2026-06-08T02:31:57.2177388Z Post job cleanup.
+2026-06-08T02:31:57.3607447Z [command]/usr/bin/git version
+2026-06-08T02:31:57.3706336Z git version 2.43.0
+2026-06-08T02:31:57.3780929Z Temporarily overriding HOME='/home/ubuntu/actions-runner/_work/_temp/9da7f9e9-ed1e-40f6-b38d-19834c103816' before making global git config changes
+2026-06-08T02:31:57.3783118Z Adding repository directory to the temporary git global config as a safe directory
+2026-06-08T02:31:57.3784854Z [command]/usr/bin/git config --global --add safe.directory /home/ubuntu/actions-runner/_work/AI-based-debugger/AI-based-debugger
+2026-06-08T02:31:57.3828736Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-06-08T02:31:57.3870468Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-06-08T02:31:57.4252699Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-06-08T02:31:57.4321517Z http.https://github.com/.extraheader
+2026-06-08T02:31:57.4340265Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+2026-06-08T02:31:57.4382597Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-06-08T02:31:57.4650053Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-06-08T02:31:57.4686372Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-06-08T02:31:57.5121681Z Cleaning up orphan processes
+2026-06-08T02:31:57.5472662Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: actions/checkout@v4, actions/setup-python@v5. Actions will be forced to run with Node.js 24 by default starting June 16th, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
 
 
 === Build, Test, and Deploy Local App/16_Post Checkout repository.txt ===
-﻿2026-06-08T02:21:57.8131100Z Post job cleanup.
-2026-06-08T02:21:57.9731654Z [command]/usr/bin/git version
-2026-06-08T02:21:57.9812087Z git version 2.43.0
-2026-06-08T02:21:57.9874724Z Temporarily overriding HOME='/home/ubuntu/actions-runner-2/_work2/_temp/5d574b3f-5cf2-44bc-ac40-3f71c85b86c5' before making global git config changes
-2026-06-08T02:21:57.9878916Z Adding repository directory to the temporary git global config as a safe directory
-2026-06-08T02:21:57.9883728Z [command]/usr/bin/git config --global --add safe.directory /home/ubuntu/actions-runner-2/_work2/AI-based-debugger/AI-based-debugger
-2026-06-08T02:21:57.9933877Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
-2026-06-08T02:21:57.9975864Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
-2026-06-08T02:21:58.0250683Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
-2026-06-08T02:21:58.0275454Z http.https://github.com/.extraheader
-2026-06-08T02:21:58.0292735Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
-2026-06-08T02:21:58.0330848Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
-2026-06-08T02:21:58.0596869Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
-2026-06-08T02:21:58.0637956Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+﻿2026-06-08T02:31:57.2177377Z Post job cleanup.
+2026-06-08T02:31:57.3607367Z [command]/usr/bin/git version
+2026-06-08T02:31:57.3706263Z git version 2.43.0
+2026-06-08T02:31:57.3780878Z Temporarily overriding HOME='/home/ubuntu/actions-runner/_work/_temp/9da7f9e9-ed1e-40f6-b38d-19834c103816' before making global git config changes
+2026-06-08T02:31:57.3783112Z Adding repository directory to the temporary git global config as a safe directory
+2026-06-08T02:31:57.3784847Z [command]/usr/bin/git config --global --add safe.directory /home/ubuntu/actions-runner/_work/AI-based-debugger/AI-based-debugger
+2026-06-08T02:31:57.3828704Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-06-08T02:31:57.3870449Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-06-08T02:31:57.4252455Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-06-08T02:31:57.4321475Z http.https://github.com/.extraheader
+2026-06-08T02:31:57.4340238Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+2026-06-08T02:31:57.4382577Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-06-08T02:31:57.4650017Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-06-08T02:31:57.4686341Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
 
 
 === Build, Test, and Deploy Local App/17_Complete job.txt ===
-﻿2026-06-08T02:21:58.1057394Z Cleaning up orphan processes
-2026-06-08T02:21:58.1379119Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: actions/checkout@v4, actions/setup-python@v5. Actions will be forced to run with Node.js 24 by default starting June 16th, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+﻿2026-06-08T02:31:57.5121665Z Cleaning up orphan processes
+2026-06-08T02:31:57.5472623Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: actions/checkout@v4, actions/setup-python@v5. Actions will be forced to run with Node.js 24 by default starting June 16th, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
 
 
 === Build, Test, and Deploy Local App/1_Set up job.txt ===
-﻿2026-06-08T02:21:47.4599179Z Current runner version: '2.334.0'
-2026-06-08T02:21:47.4607991Z Runner name: 'auto-fixer-runner'
-2026-06-08T02:21:47.4609008Z Runner group name: 'Default'
-2026-06-08T02:21:47.4610143Z Machine name: 'ubuntu'
-2026-06-08T02:21:47.4613806Z ##[group]GITHUB_TOKEN Permissions
-2026-06-08T02:21:47.4616503Z Contents: read
-2026-06-08T02:21:47.4617331Z Metadata: read
-2026-06-08T02:21:47.4618056Z Packages: read
-2026-06-08T02:21:47.4618805Z ##[endgroup]
-2026-06-08T02:21:47.4622049Z Secret source: Actions
-2026-06-08T02:21:47.4623060Z Prepare workflow directory
-2026-06-08T02:21:47.5301077Z Prepare all required actions
-2026-06-08T02:21:47.5349151Z Getting action download info
-2026-06-08T02:21:48.7163001Z Download action repository 'actions/checkout@v4' (SHA:34e114876b0b11c390a56381ad16ebd13914f8d5)
-2026-06-08T02:21:49.9136082Z Download action repository 'actions/setup-python@v5' (SHA:a26af69be951a213d495a4c3e4e4022e16d87065)
-2026-06-08T02:21:52.0525602Z Complete job name: Build, Test, and Deploy Local App
+﻿2026-06-08T02:31:46.8304909Z Current runner version: '2.334.0'
+2026-06-08T02:31:46.8313874Z Runner name: 'vm-runner'
+2026-06-08T02:31:46.8314809Z Runner group name: 'Default'
+2026-06-08T02:31:46.8316058Z Machine name: 'ubuntu'
+2026-06-08T02:31:46.8319843Z ##[group]GITHUB_TOKEN Permissions
+2026-06-08T02:31:46.8322941Z Contents: read
+2026-06-08T02:31:46.8323682Z Metadata: read
+2026-06-08T02:31:46.8324495Z Packages: read
+2026-06-08T02:31:46.8325215Z ##[endgroup]
+2026-06-08T02:31:46.8328652Z Secret source: Actions
+2026-06-08T02:31:46.8329632Z Prepare workflow directory
+2026-06-08T02:31:46.8941953Z Prepare all required actions
+2026-06-08T02:31:46.8992793Z Getting action download info
+2026-06-08T02:31:48.0534377Z Download action repository 'actions/checkout@v4' (SHA:34e114876b0b11c390a56381ad16ebd13914f8d5)
+2026-06-08T02:31:49.4454595Z Download action repository 'actions/setup-python@v5' (SHA:a26af69be951a213d495a4c3e4e4022e16d87065)
+2026-06-08T02:31:51.4810513Z Complete job name: Build, Test, and Deploy Local App
 
 
 === Build, Test, and Deploy Local App/2_Checkout repository.txt ===
-﻿2026-06-08T02:21:52.1589639Z ##[group]Run actions/checkout@v4
-2026-06-08T02:21:52.1590552Z with:
-2026-06-08T02:21:52.1590931Z   persist-credentials: true
-2026-06-08T02:21:52.1591505Z   fetch-depth: 0
-2026-06-08T02:21:52.1591919Z   repository: Mazhar10pearls/AI-based-debugger
-2026-06-08T02:21:52.1596717Z   token: ***
-2026-06-08T02:21:52.1597063Z   ssh-strict: true
-2026-06-08T02:21:52.1597410Z   ssh-user: git
-2026-06-08T02:21:52.1597739Z   clean: true
-2026-06-08T02:21:52.1598090Z   sparse-checkout-cone-mode: true
-2026-06-08T02:21:52.1598520Z   fetch-tags: false
-2026-06-08T02:21:52.1598882Z   show-progress: true
-2026-06-08T02:21:52.1599252Z   lfs: false
-2026-06-08T02:21:52.1599585Z   submodules: false
-2026-06-08T02:21:52.1599952Z   set-safe-directory: true
-2026-06-08T02:21:52.1600678Z ##[endgroup]
-2026-06-08T02:21:52.3130553Z Syncing repository: Mazhar10pearls/AI-based-debugger
-2026-06-08T02:21:52.3133770Z ##[group]Getting Git version info
-2026-06-08T02:21:52.3135220Z Working directory is '/home/ubuntu/actions-runner-2/_work2/AI-based-debugger/AI-based-debugger'
-2026-06-08T02:21:52.3137425Z [command]/usr/bin/git version
-2026-06-08T02:21:52.3138184Z git version 2.43.0
-2026-06-08T02:21:52.3168743Z ##[endgroup]
-2026-06-08T02:21:52.3187335Z Temporarily overriding HOME='/home/ubuntu/actions-runner-2/_work2/_temp/2749d30c-cb09-4664-bbdb-4d32f030bf21' before making global git config changes
-2026-06-08T02:21:52.3193150Z Adding repository directory to the temporary git global config as a safe directory
-2026-06-08T02:21:52.3197011Z [command]/usr/bin/git config --global --add safe.directory /home/ubuntu/actions-runner-2/_work2/AI-based-debugger/AI-based-debugger
-2026-06-08T02:21:52.3243529Z [command]/usr/bin/git config --local --get remote.origin.url
-2026-06-08T02:21:52.3280473Z ***github.com/Mazhar10pearls/AI-based-debugger.git
-2026-06-08T02:21:52.3290384Z Deleting the contents of '/home/ubuntu/actions-runner-2/_work2/AI-based-debugger/AI-based-debugger'
-2026-06-08T02:21:52.3408088Z ##[group]Initializing the repository
-2026-06-08T02:21:52.3412374Z [command]/usr/bin/git init /home/ubuntu/actions-runner-2/_work2/AI-based-debugger/AI-based-debugger
-2026-06-08T02:21:52.3452675Z hint: Using 'master' as the name for the initial branch. This default branch name
-2026-06-08T02:21:52.3453861Z hint: is subject to change. To configure the initial branch name to use in all
-2026-06-08T02:21:52.3454669Z hint: of your new repositories, which will suppress this warning, call:
-2026-06-08T02:21:52.3455256Z hint: 
-2026-06-08T02:21:52.3455689Z hint: 	git config --global init.defaultBranch <name>
-2026-06-08T02:21:52.3456192Z hint: 
-2026-06-08T02:21:52.3456683Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
-2026-06-08T02:21:52.3457509Z hint: 'development'. The just-created branch can be renamed via this command:
-2026-06-08T02:21:52.3458155Z hint: 
-2026-06-08T02:21:52.3458496Z hint: 	git branch -m <name>
-2026-06-08T02:21:52.3464336Z Initialized empty Git repository in /home/ubuntu/actions-runner-2/_work2/AI-based-debugger/AI-based-debugger/.git/
-2026-06-08T02:21:52.3478479Z [command]/usr/bin/git remote add origin https://github.com/Mazhar10pearls/AI-based-debugger
-2026-06-08T02:21:52.3514767Z ##[endgroup]
-2026-06-08T02:21:52.3515470Z ##[group]Disabling automatic garbage collection
-2026-06-08T02:21:52.3517752Z [command]/usr/bin/git config --local gc.auto 0
-2026-06-08T02:21:52.3548414Z ##[endgroup]
-2026-06-08T02:21:52.3549057Z ##[group]Setting up auth
-2026-06-08T02:21:52.3554996Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
-2026-06-08T02:21:52.3587286Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
-2026-06-08T02:21:52.3843048Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
-2026-06-08T02:21:52.3899225Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
-2026-06-08T02:21:52.4169338Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
-2026-06-08T02:21:52.4206381Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
-2026-06-08T02:21:52.4458263Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
-2026-06-08T02:21:52.4504495Z ##[endgroup]
-2026-06-08T02:21:52.4515202Z ##[group]Fetching the repository
-2026-06-08T02:21:52.4516328Z [command]/usr/bin/git -c protocol.version=2 fetch --prune --no-recurse-submodules origin +refs/heads/*:refs/remotes/origin/* +refs/tags/*:refs/tags/*
-2026-06-08T02:21:53.9998396Z From https://github.com/Mazhar10pearls/AI-based-debugger
-2026-06-08T02:21:54.0000595Z  * [new branch]      main       -> origin/main
-2026-06-08T02:21:54.0033311Z [command]/usr/bin/git branch --list --remote origin/main
-2026-06-08T02:21:54.0061422Z   origin/main
-2026-06-08T02:21:54.0069649Z [command]/usr/bin/git rev-parse refs/remotes/origin/main
-2026-06-08T02:21:54.0095848Z 6114e1315113d2057770e24f65fc16d2289c82e6
-2026-06-08T02:21:54.0101691Z ##[endgroup]
-2026-06-08T02:21:54.0102733Z ##[group]Determining the checkout info
-2026-06-08T02:21:54.0103899Z ##[endgroup]
-2026-06-08T02:21:54.0107659Z [command]/usr/bin/git sparse-checkout disable
-2026-06-08T02:21:54.0151956Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
-2026-06-08T02:21:54.0188510Z ##[group]Checking out the ref
-2026-06-08T02:21:54.0189600Z [command]/usr/bin/git checkout --progress --force -B main refs/remotes/origin/main
-2026-06-08T02:21:54.0246696Z Switched to a new branch 'main'
-2026-06-08T02:21:54.0247722Z branch 'main' set up to track 'origin/main'.
-2026-06-08T02:21:54.0254641Z ##[endgroup]
-2026-06-08T02:21:54.0291489Z [command]/usr/bin/git log -1 --format=%H
-2026-06-08T02:21:54.0319597Z 6114e1315113d2057770e24f65fc16d2289c82e6
+﻿2026-06-08T02:31:51.5918850Z ##[group]Run actions/checkout@v4
+2026-06-08T02:31:51.5919859Z with:
+2026-06-08T02:31:51.5920245Z   persist-credentials: true
+2026-06-08T02:31:51.5920669Z   fetch-depth: 0
+2026-06-08T02:31:51.5921091Z   repository: Mazhar10pearls/AI-based-debugger
+2026-06-08T02:31:51.5926837Z   token: ***
+2026-06-08T02:31:51.5927282Z   ssh-strict: true
+2026-06-08T02:31:51.5927700Z   ssh-user: git
+2026-06-08T02:31:51.5928108Z   clean: true
+2026-06-08T02:31:51.5928534Z   sparse-checkout-cone-mode: true
+2026-06-08T02:31:51.5929042Z   fetch-tags: false
+2026-06-08T02:31:51.5929464Z   show-progress: true
+2026-06-08T02:31:51.5929907Z   lfs: false
+2026-06-08T02:31:51.5930301Z   submodules: false
+2026-06-08T02:31:51.5930742Z   set-safe-directory: true
+2026-06-08T02:31:51.5931858Z ##[endgroup]
+2026-06-08T02:31:51.7629633Z Syncing repository: Mazhar10pearls/AI-based-debugger
+2026-06-08T02:31:51.7631863Z ##[group]Getting Git version info
+2026-06-08T02:31:51.7632728Z Working directory is '/home/ubuntu/actions-runner/_work/AI-based-debugger/AI-based-debugger'
+2026-06-08T02:31:51.7634204Z [command]/usr/bin/git version
+2026-06-08T02:31:51.7634709Z git version 2.43.0
+2026-06-08T02:31:51.7636600Z ##[endgroup]
+2026-06-08T02:31:51.7641938Z Temporarily overriding HOME='/home/ubuntu/actions-runner/_work/_temp/2fe0efff-9148-4c4b-97ab-6524a1fbbf57' before making global git config changes
+2026-06-08T02:31:51.7643282Z Adding repository directory to the temporary git global config as a safe directory
+2026-06-08T02:31:51.7644447Z [command]/usr/bin/git config --global --add safe.directory /home/ubuntu/actions-runner/_work/AI-based-debugger/AI-based-debugger
+2026-06-08T02:31:51.7647671Z [command]/usr/bin/git config --local --get remote.origin.url
+2026-06-08T02:31:51.7672597Z https://github.com/Mazhar10pearls/AI-based-debugger
+2026-06-08T02:31:51.7692425Z ##[group]Removing previously created refs, to avoid conflicts
+2026-06-08T02:31:51.7697941Z [command]/usr/bin/git rev-parse --symbolic-full-name --verify --quiet HEAD
+2026-06-08T02:31:51.7722223Z refs/heads/main
+2026-06-08T02:31:51.7732782Z [command]/usr/bin/git checkout --detach
+2026-06-08T02:31:51.7788008Z HEAD is now at 6200c89 multi support logic
+2026-06-08T02:31:51.7792262Z M	sample_app/deploy_local.sh
+2026-06-08T02:31:51.7833746Z [command]/usr/bin/git branch --delete --force main
+2026-06-08T02:31:51.7864478Z Deleted branch main (was 6200c89).
+2026-06-08T02:31:51.7907747Z ##[endgroup]
+2026-06-08T02:31:51.7911725Z [command]/usr/bin/git submodule status
+2026-06-08T02:31:51.8168374Z ##[group]Cleaning the repository
+2026-06-08T02:31:51.8174479Z [command]/usr/bin/git clean -ffdx
+2026-06-08T02:31:51.8206614Z Removing .pytest_cache/
+2026-06-08T02:31:51.8207237Z Removing sample_app/__pycache__/
+2026-06-08T02:31:51.8218702Z [command]/usr/bin/git reset --hard HEAD
+2026-06-08T02:31:51.8269252Z HEAD is now at 6200c89 multi support logic
+2026-06-08T02:31:51.8276184Z ##[endgroup]
+2026-06-08T02:31:51.8277914Z ##[group]Disabling automatic garbage collection
+2026-06-08T02:31:51.8284251Z [command]/usr/bin/git config --local gc.auto 0
+2026-06-08T02:31:51.8318852Z ##[endgroup]
+2026-06-08T02:31:51.8319509Z ##[group]Setting up auth
+2026-06-08T02:31:51.8325672Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-06-08T02:31:51.8358118Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-06-08T02:31:51.8614140Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-06-08T02:31:51.8645579Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-06-08T02:31:51.8894584Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-06-08T02:31:51.8933652Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-06-08T02:31:51.9183716Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2026-06-08T02:31:51.9222588Z ##[endgroup]
+2026-06-08T02:31:51.9224321Z ##[group]Fetching the repository
+2026-06-08T02:31:51.9232230Z [command]/usr/bin/git -c protocol.version=2 fetch --prune --no-recurse-submodules origin +refs/heads/*:refs/remotes/origin/* +refs/tags/*:refs/tags/*
+2026-06-08T02:31:53.5881692Z From https://github.com/Mazhar10pearls/AI-based-debugger
+2026-06-08T02:31:53.5883655Z  * [new branch]      auto-fix/1780885689 -> origin/auto-fix/1780885689
+2026-06-08T02:31:53.5887014Z    6200c89..263dead  main                -> origin/main
+2026-06-08T02:31:53.5931805Z [command]/usr/bin/git branch --list --remote origin/main
+2026-06-08T02:31:53.5968776Z   origin/main
+2026-06-08T02:31:53.5984101Z [command]/usr/bin/git rev-parse refs/remotes/origin/main
+2026-06-08T02:31:53.6017407Z 263deadb4e5618c8ed6a5637e6e03b565d429447
+2026-06-08T02:31:53.6024581Z ##[endgroup]
+2026-06-08T02:31:53.6026284Z ##[group]Determining the checkout info
+2026-06-08T02:31:53.6027418Z ##[endgroup]
+2026-06-08T02:31:53.6034391Z [command]/usr/bin/git sparse-checkout disable
+2026-06-08T02:31:53.6096057Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-06-08T02:31:53.6130127Z ##[group]Checking out the ref
+2026-06-08T02:31:53.6135660Z [command]/usr/bin/git checkout --progress --force -B main refs/remotes/origin/main
+2026-06-08T02:31:53.6190595Z Previous HEAD position was 6200c89 multi support logic
+2026-06-08T02:31:53.6221390Z Switched to a new branch 'main'
+2026-06-08T02:31:53.6224088Z branch 'main' set up to track 'origin/main'.
+2026-06-08T02:31:53.6230119Z ##[endgroup]
+2026-06-08T02:31:53.6282873Z [command]/usr/bin/git log -1 --format=%H
+2026-06-08T02:31:53.6314171Z 263deadb4e5618c8ed6a5637e6e03b565d429447
 
 
 === Build, Test, and Deploy Local App/3_Set up Python.txt ===
-﻿2026-06-08T02:21:54.0568107Z ##[group]Run actions/setup-python@v5
-2026-06-08T02:21:54.0568551Z with:
-2026-06-08T02:21:54.0568841Z   python-version: 3.12
-2026-06-08T02:21:54.0569188Z   check-latest: false
-2026-06-08T02:21:54.0574158Z   token: ***
-2026-06-08T02:21:54.0574458Z   update-environment: true
-2026-06-08T02:21:54.0574982Z   allow-prereleases: false
-2026-06-08T02:21:54.0575339Z   freethreaded: false
-2026-06-08T02:21:54.0575758Z ##[endgroup]
-2026-06-08T02:21:54.3045743Z ##[group]Installed versions
-2026-06-08T02:21:54.3104002Z Successfully set up CPython (3.12.13)
-2026-06-08T02:21:54.3108101Z ##[endgroup]
+﻿2026-06-08T02:31:53.6662584Z ##[group]Run actions/setup-python@v5
+2026-06-08T02:31:53.6663030Z with:
+2026-06-08T02:31:53.6663337Z   python-version: 3.12
+2026-06-08T02:31:53.6663667Z   check-latest: false
+2026-06-08T02:31:53.6667726Z   token: ***
+2026-06-08T02:31:53.6668052Z   update-environment: true
+2026-06-08T02:31:53.6668405Z   allow-prereleases: false
+2026-06-08T02:31:53.6668747Z   freethreaded: false
+2026-06-08T02:31:53.6669061Z ##[endgroup]
+2026-06-08T02:31:53.9066639Z ##[group]Installed versions
+2026-06-08T02:31:53.9137336Z Successfully set up CPython (3.12.13)
+2026-06-08T02:31:53.9138447Z ##[endgroup]
 
 
 === Build, Test, and Deploy Local App/4_Install dependencies.txt ===
-﻿2026-06-08T02:21:54.3283568Z ##[group]Run python -m pip install --upgrade pip
-2026-06-08T02:21:54.3284191Z [36;1mpython -m pip install --upgrade pip[0m
-2026-06-08T02:21:54.3284745Z [36;1mpython -m pip install -r sample_app/requirements.txt[0m
-2026-06-08T02:21:54.3310598Z shell: /usr/bin/bash -e {0}
-2026-06-08T02:21:54.3310980Z env:
-2026-06-08T02:21:54.3311647Z   pythonLocation: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:54.3312775Z   PKG_CONFIG_PATH: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/pkgconfig
-2026-06-08T02:21:54.3313595Z   Python_ROOT_DIR: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:54.3314352Z   Python2_ROOT_DIR: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:54.3315106Z   Python3_ROOT_DIR: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:54.3315902Z   LD_LIBRARY_PATH: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib
-2026-06-08T02:21:54.3316498Z ##[endgroup]
-2026-06-08T02:21:54.7346249Z Requirement already satisfied: pip in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (26.1.2)
-2026-06-08T02:21:55.7151601Z Requirement already satisfied: Flask==2.3.3 in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from -r sample_app/requirements.txt (line 1)) (2.3.3)
-2026-06-08T02:21:55.7157592Z Requirement already satisfied: pytest==7.4.0 in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from -r sample_app/requirements.txt (line 2)) (7.4.0)
-2026-06-08T02:21:55.7168732Z Requirement already satisfied: Werkzeug>=2.3.7 in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (3.1.8)
-2026-06-08T02:21:55.7176641Z Requirement already satisfied: Jinja2>=3.1.2 in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (3.1.6)
-2026-06-08T02:21:55.7182393Z Requirement already satisfied: itsdangerous>=2.1.2 in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (2.2.0)
-2026-06-08T02:21:55.7187108Z Requirement already satisfied: click>=8.1.3 in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (8.4.1)
-2026-06-08T02:21:55.7195265Z Requirement already satisfied: blinker>=1.6.2 in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (1.9.0)
-2026-06-08T02:21:55.7210884Z Requirement already satisfied: iniconfig in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from pytest==7.4.0->-r sample_app/requirements.txt (line 2)) (2.3.0)
-2026-06-08T02:21:55.7218323Z Requirement already satisfied: packaging in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from pytest==7.4.0->-r sample_app/requirements.txt (line 2)) (26.2)
-2026-06-08T02:21:55.7227534Z Requirement already satisfied: pluggy<2.0,>=0.12 in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from pytest==7.4.0->-r sample_app/requirements.txt (line 2)) (1.6.0)
-2026-06-08T02:21:55.7269508Z Requirement already satisfied: MarkupSafe>=2.0 in /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Jinja2>=3.1.2->Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (3.0.3)
+﻿2026-06-08T02:31:53.9279856Z ##[group]Run python -m pip install --upgrade pip
+2026-06-08T02:31:53.9280449Z [36;1mpython -m pip install --upgrade pip[0m
+2026-06-08T02:31:53.9280995Z [36;1mpython -m pip install -r sample_app/requirements.txt[0m
+2026-06-08T02:31:53.9307989Z shell: /usr/bin/bash -e {0}
+2026-06-08T02:31:53.9308373Z env:
+2026-06-08T02:31:53.9308835Z   pythonLocation: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:53.9309662Z   PKG_CONFIG_PATH: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/pkgconfig
+2026-06-08T02:31:53.9310741Z   Python_ROOT_DIR: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:53.9311975Z   Python2_ROOT_DIR: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:53.9312719Z   Python3_ROOT_DIR: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:53.9313464Z   LD_LIBRARY_PATH: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib
+2026-06-08T02:31:53.9314032Z ##[endgroup]
+2026-06-08T02:31:54.3664041Z Requirement already satisfied: pip in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (26.1.2)
+2026-06-08T02:31:55.4083268Z Requirement already satisfied: Flask==2.3.3 in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from -r sample_app/requirements.txt (line 1)) (2.3.3)
+2026-06-08T02:31:55.4091398Z Requirement already satisfied: pytest==7.4.0 in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from -r sample_app/requirements.txt (line 2)) (7.4.0)
+2026-06-08T02:31:55.4104810Z Requirement already satisfied: Werkzeug>=2.3.7 in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (3.1.8)
+2026-06-08T02:31:55.4113019Z Requirement already satisfied: Jinja2>=3.1.2 in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (3.1.6)
+2026-06-08T02:31:55.4121662Z Requirement already satisfied: itsdangerous>=2.1.2 in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (2.2.0)
+2026-06-08T02:31:55.4129594Z Requirement already satisfied: click>=8.1.3 in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (8.4.1)
+2026-06-08T02:31:55.4137975Z Requirement already satisfied: blinker>=1.6.2 in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (1.9.0)
+2026-06-08T02:31:55.4156535Z Requirement already satisfied: iniconfig in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from pytest==7.4.0->-r sample_app/requirements.txt (line 2)) (2.3.0)
+2026-06-08T02:31:55.4163267Z Requirement already satisfied: packaging in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from pytest==7.4.0->-r sample_app/requirements.txt (line 2)) (26.2)
+2026-06-08T02:31:55.4173466Z Requirement already satisfied: pluggy<2.0,>=0.12 in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from pytest==7.4.0->-r sample_app/requirements.txt (line 2)) (1.6.0)
+2026-06-08T02:31:55.4219868Z Requirement already satisfied: MarkupSafe>=2.0 in /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/python3.12/site-packages (from Jinja2>=3.1.2->Flask==2.3.3->-r sample_app/requirements.txt (line 1)) (3.0.3)
 
 
 === Build, Test, and Deploy Local App/5_Run unit tests.txt ===
-﻿2026-06-08T02:21:55.8098450Z ##[group]Run python -m pytest sample_app/test_app.py
-2026-06-08T02:21:55.8099371Z [36;1mpython -m pytest sample_app/test_app.py[0m
-2026-06-08T02:21:55.8131027Z shell: /usr/bin/bash -e {0}
-2026-06-08T02:21:55.8132002Z env:
-2026-06-08T02:21:55.8132781Z   pythonLocation: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:55.8134173Z   PKG_CONFIG_PATH: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/pkgconfig
-2026-06-08T02:21:55.8135526Z   Python_ROOT_DIR: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:55.8136754Z   Python2_ROOT_DIR: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:55.8138274Z   Python3_ROOT_DIR: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:55.8139536Z   LD_LIBRARY_PATH: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib
-2026-06-08T02:21:55.8140481Z ##[endgroup]
-2026-06-08T02:21:56.1789103Z ============================= test session starts ==============================
-2026-06-08T02:21:56.1791768Z platform linux -- Python 3.12.13, pytest-7.4.0, pluggy-1.6.0
-2026-06-08T02:21:56.1794034Z rootdir: /home/ubuntu/actions-runner-2/_work2/AI-based-debugger/AI-based-debugger
-2026-06-08T02:21:56.1795903Z collected 1 item
-2026-06-08T02:21:56.1796503Z 
-2026-06-08T02:21:56.1850975Z sample_app/test_app.py .                                                 [100%]
-2026-06-08T02:21:56.1853047Z 
-2026-06-08T02:21:56.1853708Z ============================== 1 passed in 0.13s ===============================
+﻿2026-06-08T02:31:55.4913275Z ##[group]Run python -m pytest sample_app/test_app.py
+2026-06-08T02:31:55.4915053Z [36;1mpython -m pytest sample_app/test_app.py[0m
+2026-06-08T02:31:55.5003486Z shell: /usr/bin/bash -e {0}
+2026-06-08T02:31:55.5004565Z env:
+2026-06-08T02:31:55.5005952Z   pythonLocation: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:55.5008503Z   PKG_CONFIG_PATH: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/pkgconfig
+2026-06-08T02:31:55.5011003Z   Python_ROOT_DIR: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:55.5013537Z   Python2_ROOT_DIR: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:55.5015825Z   Python3_ROOT_DIR: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:55.5018145Z   LD_LIBRARY_PATH: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib
+2026-06-08T02:31:55.5020406Z ##[endgroup]
+2026-06-08T02:31:55.8162347Z ============================= test session starts ==============================
+2026-06-08T02:31:55.8163612Z platform linux -- Python 3.12.13, pytest-7.4.0, pluggy-1.6.0
+2026-06-08T02:31:55.8164935Z rootdir: /home/ubuntu/actions-runner/_work/AI-based-debugger/AI-based-debugger
+2026-06-08T02:31:55.8166025Z collected 1 item
+2026-06-08T02:31:55.8166367Z 
+2026-06-08T02:31:55.8225090Z sample_app/test_app.py .                                                 [100%]
+2026-06-08T02:31:55.8226062Z 
+2026-06-08T02:31:55.8226484Z ============================== 1 passed in 0.12s ===============================
 
 
 === Build, Test, and Deploy Local App/6_Build & Run Local Docker App.txt ===
-﻿2026-06-08T02:21:56.2369712Z ##[group]Run chmod +x sample_app/deploy_local.sh
-2026-06-08T02:21:56.2370792Z [36;1mchmod +x sample_app/deploy_local.sh[0m
-2026-06-08T02:21:56.2372051Z [36;1mbash sample_app/deploy_local.sh[0m
-2026-06-08T02:21:56.2411669Z shell: /usr/bin/bash -e {0}
-2026-06-08T02:21:56.2412374Z env:
-2026-06-08T02:21:56.2413322Z   pythonLocation: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:56.2415069Z   PKG_CONFIG_PATH: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib/pkgconfig
-2026-06-08T02:21:56.2416764Z   Python_ROOT_DIR: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:56.2418317Z   Python2_ROOT_DIR: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:56.2419868Z   Python3_ROOT_DIR: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64
-2026-06-08T02:21:56.2421761Z   LD_LIBRARY_PATH: /home/ubuntu/actions-runner-2/_work2/_tool/Python/3.12.13/x64/lib
-2026-06-08T02:21:56.2422974Z ##[endgroup]
-2026-06-08T02:21:56.2575544Z Building sample application Docker image...
-2026-06-08T02:21:56.2792055Z DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
-2026-06-08T02:21:56.2797033Z             Install the buildx component to build images with BuildKit:
-2026-06-08T02:21:56.2798401Z             https://docs.docker.com/go/buildx/
-2026-06-08T02:21:56.2799191Z 
-2026-06-08T02:21:56.2843434Z Sending build context to Docker daemon  12.29kB
-2026-06-08T02:21:56.2844556Z 
-2026-06-08T02:21:56.2849853Z Step 1/7 : FROM python:3.2-slim
-2026-06-08T02:21:57.7759422Z not implemented: media type "application/vnd.docker.distribution.manifest.v1+prettyjws" is no longer supported since containerd v2.1, please rebuild the image as "application/vnd.docker.distribution.manifest.v2+json" or "application/vnd.oci.image.manifest.v1+json"
-2026-06-08T02:21:57.7840334Z ##[error]Process completed with exit code 1.
+﻿2026-06-08T02:31:55.8729883Z ##[group]Run chmod +x sample_app/deploy_local.sh
+2026-06-08T02:31:55.8731105Z [36;1mchmod +x sample_app/deploy_local.sh[0m
+2026-06-08T02:31:55.8732503Z [36;1mbash sample_app/deploy_local.sh[0m
+2026-06-08T02:31:55.8762298Z shell: /usr/bin/bash -e {0}
+2026-06-08T02:31:55.8762844Z env:
+2026-06-08T02:31:55.8763515Z   pythonLocation: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:55.8764731Z   PKG_CONFIG_PATH: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib/pkgconfig
+2026-06-08T02:31:55.8765930Z   Python_ROOT_DIR: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:55.8767022Z   Python2_ROOT_DIR: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:55.8768120Z   Python3_ROOT_DIR: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64
+2026-06-08T02:31:55.8769232Z   LD_LIBRARY_PATH: /home/ubuntu/actions-runner/_work/_tool/Python/3.12.13/x64/lib
+2026-06-08T02:31:55.8770090Z ##[endgroup]
+2026-06-08T02:31:55.8881417Z Building sample application Docker image...
+2026-06-08T02:31:55.9080098Z DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+2026-06-08T02:31:55.9082784Z             Install the buildx component to build images with BuildKit:
+2026-06-08T02:31:55.9084791Z             https://docs.docker.com/go/buildx/
+2026-06-08T02:31:55.9085498Z 
+2026-06-08T02:31:55.9117600Z Sending build context to Docker daemon  12.29kB
+2026-06-08T02:31:55.9118346Z 
+2026-06-08T02:31:55.9129201Z Step 1/3 : FROM python:3.2-slim
+2026-06-08T02:31:57.1811037Z not implemented: media type "application/vnd.docker.distribution.manifest.v1+prettyjws" is no longer supported since containerd v2.1, please rebuild the image as "application/vnd.docker.distribution.manifest.v2+json" or "application/vnd.oci.image.manifest.v1+json"
+2026-06-08T02:31:57.1882426Z ##[error]Process completed with exit code 1.
 
 
 === Build, Test, and Deploy Local App/system.txt ===
-2026-06-08T02:21:43.2310000Z Requested labels: self-hosted
-2026-06-08T02:21:43.2310000Z Job defined at: Mazhar10pearls/AI-based-debugger/.github/workflows/ci-local-deploy.yml@refs/heads/main
-2026-06-08T02:21:43.2310000Z Waiting for a runner to pick up this job...
-2026-06-08T02:21:43.2320000Z Job is about to start running on the runner: auto-fixer-runner
-2026-06-08T02:21:43.2310000Z Evaluating build-and-deploy.if
-2026-06-08T02:21:43.2310000Z Evaluating: success()
-2026-06-08T02:21:43.2310000Z Result: true
+2026-06-08T02:31:42.3320000Z Requested labels: self-hosted
+2026-06-08T02:31:42.3320000Z Job defined at: Mazhar10pearls/AI-based-debugger/.github/workflows/ci-local-deploy.yml@refs/heads/main
+2026-06-08T02:31:42.3320000Z Waiting for a runner to pick up this job...
+2026-06-08T02:31:42.3330000Z Job is about to start running on the runner: vm-runner
+2026-06-08T02:31:42.3320000Z Evaluating build-and-deploy.if
+2026-06-08T02:31:42.3320000Z Evaluating: success()
+2026-06-08T02:31:42.3320000Z Result: true
 
