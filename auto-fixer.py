@@ -47,7 +47,7 @@ import yaml
 
 # ── Ollama config ──────────────────────────────────────────────────────────────
 OLLAMA_API_URL   = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/v1/completions")
-OLLAMA_MODEL     = os.environ.get("OLLAMA_MODEL",   "llama3.2")
+OLLAMA_MODEL     = os.environ.get("OLLAMA_MODEL",   "phi3.5")
 AI_TIMEOUT       = 120
 MAX_RETRIES      = 3
 RETRY_BACKOFF    = [10, 30, 60]

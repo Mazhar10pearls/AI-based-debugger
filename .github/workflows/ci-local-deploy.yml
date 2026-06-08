@@ -6,10 +6,15 @@ on:
       - main
   workflow_dispatch:
 
+concurrency:
+  group: local-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-deploy:
     name: Build, Test, and Deploy Local App
     runs-on: self-hosted
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
