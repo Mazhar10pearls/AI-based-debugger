@@ -53,9 +53,9 @@ MAX_RETRIES      = 3
 RETRY_BACKOFF    = [10, 30, 60]
 
 # ── Prompt budget ──────────────────────────────────────────────────────────────
-MAX_ERROR_LINES   = 40      # error lines to extract from CI log
-MAX_FILE_CHARS    = 2000    # chars per file sent to AI
-MAX_TOTAL_CONTEXT = 8000    # total context chars sent to AI
+MAX_ERROR_LINES   = 25      # error lines to extract from CI log
+MAX_FILE_CHARS    = 1200    # chars per file sent to AI
+MAX_TOTAL_CONTEXT = 4000    # total context chars sent to AI (~1000 tokens)
 MAX_FILES_FIXED   = 8       # AI cannot claim to fix more than this many files
 
 # ── Safety ────────────────────────────────────────────────────────────────────
@@ -367,43 +367,17 @@ def discover_context(error_signal: str,
 # ══════════════════════════════════════════════════════════════════════════════
 
 SYSTEM_PROMPT = """\
-You are a CI/CD auto-repair agent. A pipeline has failed.
+You are a CI/CD auto-repair agent. Output ONLY a JSON object. No markdown. No explanation. No extra keys.
 
-You will receive:
-  1. The pipeline type (build / release / test / lint / infra)
-  2. The tech stack detected (Python / Docker / Node / Java / etc.)
-  3. The CI error log (filtered to relevant lines only)
-  4. The current content of relevant repository files
+REQUIRED OUTPUT FORMAT — copy this exactly, fill in the values:
+{"pipeline_type":"build","root_cause":"one sentence","confidence":0.9,"commit_message":"fix: description","fixes":[{"file":"exact/path/from/header","reason":"what changed","fixed_content":"complete file content here"}]}
 
-YOUR JOB:
-  - Identify every file that needs to change to fix the failure
-  - There may be ONE bug in ONE file, or MULTIPLE bugs across MULTIPLE files
-  - Return the COMPLETE corrected content for every file that needs changing
-  - Fix ALL bugs you can see — do not fix only one if multiple exist
-
-RULES — follow exactly:
-  - Return ONLY valid JSON. No markdown, no explanation, no preamble.
-  - "file" must be copied EXACTLY from the ### header (e.g. "sample_app/Dockerfile")
-  - "fixed_content" must be the COMPLETE corrected file — not a snippet, not a diff
-  - Only include files that actually need changes
-  - Do not remove or rewrite logic that is not related to the bug
-  - Do not change file paths, imports, or structure unless they are the bug
-
-JSON schema (return this and nothing else).
-CRITICAL: use EXACTLY these key names — "file" not "file_path", "fixed_content" not "content":
-{
-  "pipeline_type": "build|release|test|lint|infra|composite",
-  "root_cause": "one sentence listing every bug found across all files",
-  "confidence": 0.0,
-  "commit_message": "fix: short description under 72 chars",
-  "fixes": [
-    {
-      "file": "exact/path/as/in/### header",
-      "reason": "what was wrong in this file and what you changed",
-      "fixed_content": "complete corrected file content"
-    }
-  ]
-}"""
+RULES:
+- "fixes" is a list of files to change. Each fix has exactly three keys: "file", "reason", "fixed_content".
+- "file" must match the ### path header exactly (e.g. sample_app/Dockerfile).
+- "fixed_content" is the COMPLETE corrected file — not a diff, not a snippet.
+- Only include files that actually need changes.
+- Output valid JSON only. Start your response with { and end with }."""
 
 USER_PROMPT = """\
 ## Pipeline type detected
