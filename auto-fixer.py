@@ -48,7 +48,7 @@ import yaml
 # ── Ollama config ──────────────────────────────────────────────────────────────
 OLLAMA_API_URL   = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/v1/completions")
 OLLAMA_MODEL     = os.environ.get("OLLAMA_MODEL",   "qwen2.5-coder:3b")
-AI_TIMEOUT       = 400
+AI_TIMEOUT       = 300
 MAX_RETRIES      = 3
 RETRY_BACKOFF    = [10, 30, 60]
 
@@ -389,7 +389,8 @@ RULES — follow exactly:
   - Do not remove or rewrite logic that is not related to the bug
   - Do not change file paths, imports, or structure unless they are the bug
 
-JSON schema (return this and nothing else):
+JSON schema (return this and nothing else).
+CRITICAL: use EXACTLY these key names — "file" not "file_path", "fixed_content" not "content":
 {
   "pipeline_type": "build|release|test|lint|infra|composite",
   "root_cause": "one sentence listing every bug found across all files",
@@ -477,39 +478,87 @@ def call_ai(error_signal: str, repo_context: str,
     raise RuntimeError(f"Ollama timed out after {MAX_RETRIES} attempts: {last_exc}")
 
 
+def _normalize_fix_keys(fixes: list) -> list:
+    """
+    Defensive key normalizer — models often return different field names
+    than the schema specifies. Map all known variants to canonical keys.
+    'file' and 'fixed_content' are the only keys validate_fix checks.
+    """
+    KEY_MAP_FILE = ("file_path", "path", "filename", "filepath", "name")
+    KEY_MAP_CONTENT = ("content", "new_content", "fixed", "updated_content",
+                       "corrected_content", "file_content", "code")
+
+    normalized = []
+    for fix in fixes:
+        fix = dict(fix)  # copy so we don't mutate original
+
+        # Normalize → "file"
+        if "file" not in fix:
+            for alt in KEY_MAP_FILE:
+                if alt in fix:
+                    fix["file"] = fix.pop(alt)
+                    break
+
+        # Normalize → "fixed_content"
+        if "fixed_content" not in fix:
+            for alt in KEY_MAP_CONTENT:
+                if alt in fix:
+                    fix["fixed_content"] = fix.pop(alt)
+                    break
+
+        normalized.append(fix)
+    return normalized
+
+
 def parse_ai_response(raw: str) -> dict:
     cleaned = re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
 
+    data = None
+
     try:
-        return json.loads(cleaned)
+        data = json.loads(cleaned)
     except json.JSONDecodeError:
         pass
 
-    best = None
-    for start in [i for i, c in enumerate(cleaned) if c == "{"]:
-        depth = 0
-        for i in range(start, len(cleaned)):
-            if cleaned[i] == "{":
-                depth += 1
-            elif cleaned[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = cleaned[start:i+1]
-                    if best is None or len(candidate) > len(best):
-                        best = candidate
-                    break
+    if data is None:
+        best = None
+        for start in [i for i, c in enumerate(cleaned) if c == "{"]:
+            depth = 0
+            for i in range(start, len(cleaned)):
+                if cleaned[i] == "{":
+                    depth += 1
+                elif cleaned[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = cleaned[start:i+1]
+                        if best is None or len(candidate) > len(best):
+                            best = candidate
+                        break
 
-    if best:
-        try:
-            return json.loads(best)
-        except json.JSONDecodeError:
-            repaired = best + "}" * (best.count("{") - best.count("}"))
+        if best:
             try:
-                return json.loads(repaired)
+                data = json.loads(best)
             except json.JSONDecodeError:
-                pass
+                repaired = best + "}" * (best.count("{") - best.count("}"))
+                try:
+                    data = json.loads(repaired)
+                except json.JSONDecodeError:
+                    pass
 
-    raise ValueError(f"No valid JSON found in AI response:\n{raw[:600]}")
+    if data is None:
+        raise ValueError(f"No valid JSON found in AI response:\n{raw[:600]}")
+
+    # ── Normalize fix keys regardless of what the model returned ──────────────
+    if "fixes" in data and isinstance(data["fixes"], list):
+        data["fixes"] = _normalize_fix_keys(data["fixes"])
+        unmapped = [
+            f.get("file", "?") for f in data["fixes"]
+            if "file" not in f or "fixed_content" not in f
+        ]
+        if unmapped:
+            print(f"[AI] Warning: could not normalize keys for: {unmapped}")
+
+    return data
 
 
 # ══════════════════════════════════════════════════════════════════════════════
