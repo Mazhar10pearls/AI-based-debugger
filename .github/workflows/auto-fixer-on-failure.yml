@@ -12,12 +12,9 @@ on:
     types:
       - completed
 
-concurrency:
-  group: auto-fix-${{ github.event.workflow_run.head_branch }}
-  cancel-in-progress: true
-
 jobs:
   auto-fix:
+    # Only run if CI failed AND the commit was NOT made by the bot
     if: |
       github.event.workflow_run.conclusion == 'failure' &&
       github.event.workflow_run.head_commit.author.name != 'github-actions[bot]'
@@ -28,25 +25,12 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Prevent loop trigger
-        if: contains(github.event.workflow_run.head_commit.message, 'fix:')
-        run: |
-          echo "Bot commit detected, skipping..."
-          exit 1
-
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: ${{ github.event.workflow_run.head_branch }}
           token: ${{ secrets.GH_PAT }}
-
-      - name: Install GitHub CLI
-        run: |
-          if ! command -v gh &> /dev/null; then
-            sudo apt-get update
-            sudo apt-get install gh -y
-          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -83,10 +67,8 @@ jobs:
               'Authorization': f"Bearer {os.environ['GH_PAT']}",
               'Accept': 'application/vnd.github+json'
           }
-
           url = f'https://api.github.com/repos/{repo_full}/actions/runs/{run_id}/logs'
           resp = requests.get(url, headers=headers, timeout=120)
-
           if resp.status_code != 200:
               print(f'Failed to download logs: HTTP {resp.status_code}', file=sys.stderr)
               sys.exit(1)
@@ -96,7 +78,6 @@ jobs:
 
           extract_dir = pathlib.Path('logs')
           extract_dir.mkdir(parents=True, exist_ok=True)
-
           with zipfile.ZipFile('workflow_logs.zip', 'r') as zf:
               zf.extractall(extract_dir)
 
@@ -109,12 +90,6 @@ jobs:
 
           print(f'Generated failure.log ({out_path.stat().st_size} bytes)')
           PY
-
-      - name: Upload failure log artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: failure-log
-          path: failure.log
 
       - name: Check failure log is non-empty
         run: |
@@ -138,19 +113,7 @@ jobs:
           GITHUB_REPOSITORY:  ${{ github.repository }}
         run: python3 auto-fixer.py --input failure.log --skip-tests
 
-      - name: Commit fallback (if script failed mid-way)
-        if: always()
-        run: |
-          if ! git diff --quiet; then
-            echo "Detected uncommitted changes, committing fallback..."
-            git checkout -b auto-fix-fallback-${{ github.run_id }}
-            git add .
-            git commit -m "fix: fallback commit from pipeline"
-            git push origin HEAD
-          else
-            echo "No changes to commit"
-          fi
-
+      # ── If auto-fixer could not fix it → open a GitHub Issue so a human knows ──
       - name: Open issue if fixer failed
         if: failure()
         env:
@@ -158,5 +121,7 @@ jobs:
         run: |
           gh issue create \
             --title "🚨 Auto-fixer could not fix CI failure — manual review needed" \
-            --body "Auto-fixer failed. Review run: ${{ github.event.workflow_run.html_url }}" \
+            --body "The auto-fixer ran but could not produce a valid patch.
+            Please review the failed Actions run and fix manually.
+            Run: ${{ github.event.workflow_run.html_url }}" \
             --label "bug" || true
