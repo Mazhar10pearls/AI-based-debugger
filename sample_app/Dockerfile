@@ -1,1 +1,1 @@
-FROM python:3.9-s
+FROM python:3.10-s
