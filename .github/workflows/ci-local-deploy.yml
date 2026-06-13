@@ -16,33 +16,93 @@ jobs:
     runs-on: self-hosted
 
     steps:
+      # -------------------------
+      # Checkout Code
+      # -------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          persist-credentials: true
           fetch-depth: 0
 
+      # -------------------------
+      # Python Setup
+      # -------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r sample_app/requirements.txt
+          pip install -r sample_app/requirements.txt
 
+      # -------------------------
+      # Run Tests
+      # -------------------------
       - name: Run unit tests
         run: |
-          python -m pytest sample_app/test_app.py
+          pytest sample_app/test_app.py
 
-      - name: Build & Run Local Docker App
+      # -------------------------
+      # Docker Setup
+      # -------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # -------------------------
+      # Build Docker Image (Production-safe)
+      # -------------------------
+      - name: Build Docker image
         run: |
-          chmod +x sample_app/deploy_local.sh
-          bash sample_app/deploy_local.sh
+          docker buildx build \
+            --platform linux/amd64 \
+            -t ai-devops-sample-app \
+            --load \
+            .
 
-      - name: Wait for app startup
-        run: sleep 5
+      # -------------------------
+      # Stop Old Container (safe cleanup)
+      # -------------------------
+      - name: Stop existing container
+        run: |
+          docker rm -f ai-devops-sample-app || true
 
+      # -------------------------
+      # Run New Container
+      # -------------------------
+      - name: Start container
+        run: |
+          docker run -d \
+            --name ai-devops-sample-app \
+            -p 5000:5000 \
+            --restart unless-stopped \
+            ai-devops-sample-app
+
+      # -------------------------
+      # Health Check (Production-grade)
+      # -------------------------
+      - name: Wait for app to be healthy
+        run: |
+          echo "Waiting for application to start..."
+
+          for i in {1..20}; do
+            if curl -fs http://127.0.0.1:5000 > /dev/null; then
+              echo "Application is healthy!"
+              exit 0
+            fi
+
+            echo "Not ready yet... retrying ($i/20)"
+            sleep 3
+          done
+
+          echo "Application failed health check"
+          docker logs ai-devops-sample-app
+          exit 1
+
+      # -------------------------
+      # Final Verification
+      # -------------------------
       - name: Verify deployment
-        run: curl -f http://127.0.0.1:5000
+        run: |
+          curl -f http://127.0.0.1:5000
