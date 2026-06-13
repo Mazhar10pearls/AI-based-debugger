@@ -8,26 +8,12 @@ ANY tech stack (Python, Node, Docker, Java, Go, Ruby, etc.)
 No hardcoded file paths. The system:
   1. DETECT    — Parse the CI log, identify pipeline type and tech stack
   2. DISCOVER  — Walk the repo dynamically to find files relevant to the failure
-  3. ANALYSE   — Ask Llama: what is broken and what should each file look like?
+  3. ANALYSE   — Ask Ollama: what is broken and what should each file look like?
   4. VALIDATE  — Syntax-check every rewritten file before touching disk
-  5. WRITE     — Atomically overwrite only the files Llama fixed
+  5. WRITE     — Atomically overwrite only the files the AI fixed
   6. TEST      — Run pipeline-appropriate tests; revert on failure
   7. COMMIT    — Push to fix/<timestamp> branch off develop (Git flow)
   8. PR        — Open Pull Request targeting develop; human reviews before merge
-
-Git flow enforced:
-  - Fixes always branch from develop (not main)
-  - PR targets develop → code review → develop
-  - Release manager cuts release/* from develop → main when ready
-  - Hotfixes branch from main tag, merge to main AND develop
-
-Pipeline types handled:
-  - Build pipelines     (Docker build, compile, package)
-  - Release pipelines   (publish, deploy, tag, push to registry)
-  - Test pipelines      (pytest, jest, go test, maven test, etc.)
-  - Lint/check pipelines (flake8, eslint, mypy, etc.)
-  - Infrastructure      (terraform, ansible, helm, k8s)
-  - Composite           (build + test + release in one workflow)
 
 Exit codes:
   0 — success or loop guard
@@ -52,17 +38,26 @@ import requests
 import yaml
 
 # ── Ollama config ──────────────────────────────────────────────────────────────
-OLLAMA_API_URL   = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/v1/completions")
-OLLAMA_MODEL     = os.environ.get("OLLAMA_MODEL",   "qwen2.5-coder:3b")
-AI_TIMEOUT       = 300
-MAX_RETRIES      = 3
-RETRY_BACKOFF    = [10, 30, 60]
+OLLAMA_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/v1/completions")
+OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL",   "qwen2.5-coder:3b")
 
-# ── Prompt budget ──────────────────────────────────────────────────────────────
-MAX_ERROR_LINES   = 25      # error lines to extract from CI log
-MAX_FILE_CHARS    = 4000    # chars per file sent to AI — INCREASED for real context
-MAX_TOTAL_CONTEXT = 12000   # total context chars sent to AI — INCREASED
-MAX_FILES_FIXED   = 8       # AI cannot claim to fix more than this many files
+# ── Timeout strategy ──────────────────────────────────────────────────────────
+# Workflow timeout-minutes should be 30 in the YAML.
+# AI_TIMEOUT must be well under (workflow_timeout - overhead).
+# For CPU-only 3B model: a 6000-char prompt produces ~500 tokens output
+# in roughly 2-4 minutes on typical hardware. 240s gives headroom.
+AI_TIMEOUT    = 240   # seconds per Ollama attempt (was 300)
+MAX_RETRIES   = 2     # fewer retries — fail fast, open issue (was 3)
+RETRY_BACKOFF = [15, 30]  # seconds between retries (was [10,30,60])
+
+# ── Prompt budget ─────────────────────────────────────────────────────────────
+# KEY INSIGHT: smaller prompts = faster inference on CPU.
+# 3B models reliably follow instructions up to ~6000 chars total prompt.
+# Beyond that, instruction-following degrades AND inference slows linearly.
+MAX_ERROR_LINES   = 20    # error lines extracted from CI log (was 25)
+MAX_FILE_CHARS    = 2500  # chars per file sent to AI (was 4000)
+MAX_TOTAL_CONTEXT = 6000  # total repo context chars (was 12000) — critical for speed
+MAX_FILES_FIXED   = 5     # max files AI can claim to fix (was 8)
 
 # ── Safety ────────────────────────────────────────────────────────────────────
 CONFIDENCE_MIN   = 0.4
@@ -73,17 +68,11 @@ BOT_EMAIL  = "github-actions[bot]@users.noreply.github.com"
 BOT_PREFIX = "fix:"
 
 # ── Git flow config ───────────────────────────────────────────────────────────
-# Fixes always branch from develop and PR targets develop.
-# main is never touched directly by the bot.
-GIT_BASE_BRANCH   = os.environ.get("GIT_BASE_BRANCH", "develop")   # branch fixes come from
-GIT_TARGET_BRANCH = os.environ.get("GIT_TARGET_BRANCH", "develop")  # PR targets this
+GIT_BASE_BRANCH   = os.environ.get("GIT_BASE_BRANCH",   "develop")
+GIT_TARGET_BRANCH = os.environ.get("GIT_TARGET_BRANCH", "develop")
 
 # ── Paths the AI must never touch ─────────────────────────────────────────────
-ALWAYS_BLOCKED = {
-    ".git",
-    "auto-fixer.py",
-    "self-healer.py",
-}
+ALWAYS_BLOCKED = {".git", "auto-fixer.py", "self-healer.py"}
 BLOCKED_PATTERNS = [
     r"\.github/workflows/auto-fix.*\.ya?ml$",
     r"\.github/workflows/self-heal.*\.ya?ml$",
@@ -183,20 +172,16 @@ WORKFLOW_DIRS       = {".github/workflows", ".gitlab-ci.d", "ci", ".circleci"}
 
 def fingerprint_pipeline(log_text: str) -> tuple[set[str], set[str]]:
     log_low = log_text.lower()
-
-    pipeline_types = set()
-    for ptype, signals in PIPELINE_TYPE_SIGNALS.items():
-        if any(s in log_low for s in signals):
-            pipeline_types.add(ptype)
-
-    tech_stacks = set()
-    for stack, signals in TECH_STACK_SIGNALS.items():
-        if any(s in log_low for s in signals):
-            tech_stacks.add(stack)
-
+    pipeline_types = {
+        ptype for ptype, signals in PIPELINE_TYPE_SIGNALS.items()
+        if any(s in log_low for s in signals)
+    }
+    tech_stacks = {
+        stack for stack, signals in TECH_STACK_SIGNALS.items()
+        if any(s in log_low for s in signals)
+    }
     if not pipeline_types:
         pipeline_types.add("build")
-
     print(f"[DETECT] Pipeline types : {pipeline_types}")
     print(f"[DETECT] Tech stacks    : {tech_stacks or {'unknown'}}")
     return pipeline_types, tech_stacks
@@ -257,7 +242,7 @@ def extract_error_signal(log_text: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 2 — DISCOVER: dynamically find relevant files
+# STAGE 2 — DISCOVER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _is_text_file(path: Path) -> bool:
@@ -269,21 +254,23 @@ def _is_text_file(path: Path) -> bool:
         return False
 
 
-def _read_full(path: Path) -> str:
+def _read_smart(path: Path) -> str:
     """
-    Read the COMPLETE file content — no comment stripping, no trimming.
-    The AI needs full context to understand what is actually in the file
-    and produce a correct, complete rewrite rather than a hallucinated snippet.
-    Content is capped at MAX_FILE_CHARS but preserves the file structure.
+    Read file content intelligently:
+    - For small files: full content
+    - For large files: head + tail to preserve structure
+    Capped at MAX_FILE_CHARS for prompt budget control.
     """
     try:
         raw = path.read_text(encoding="utf-8", errors="replace")
-        if len(raw) > MAX_FILE_CHARS:
-            # Keep head + tail so the AI sees both the FROM line and the CMD
-            head = raw[: MAX_FILE_CHARS // 2]
-            tail = raw[-(MAX_FILE_CHARS // 2):]
-            return head + f"\n... ({len(raw) - MAX_FILE_CHARS} chars omitted) ...\n" + tail
-        return raw
+        if len(raw) <= MAX_FILE_CHARS:
+            return raw
+        # Keep head + tail so AI sees both top-level declarations and bottom content
+        half = MAX_FILE_CHARS // 2
+        head = raw[:half]
+        tail = raw[-half:]
+        omitted = len(raw) - MAX_FILE_CHARS
+        return head + f"\n... ({omitted} chars omitted) ...\n" + tail
     except Exception as exc:
         return f"(unreadable: {exc})"
 
@@ -295,16 +282,13 @@ def _score_file(path: Path, error_signal: str,
     err_low = error_signal.lower()
     score   = 0
 
-    # Workflow files that triggered the pipeline
     if any(str(path).startswith(d) for d in WORKFLOW_DIRS) \
             and path.suffix in WORKFLOW_EXTENSIONS:
         score += 30
 
-    # File explicitly mentioned in the error log
     if path.name.lower() in err_low or str(path).lower() in err_low:
         score += 50
 
-    # Tech-stack file patterns
     for stack in tech_stacks:
         for pattern in STACK_FILE_SIGNALS.get(stack, []):
             if pattern.startswith(".") and name.endswith(pattern):
@@ -316,7 +300,6 @@ def _score_file(path: Path, error_signal: str,
                 if name.startswith(prefix) and name.endswith(suffix):
                     score += 20
 
-    # High-value config files always worth including
     HIGH_VALUE = {
         "dockerfile", "docker-compose.yml", "docker-compose.yaml",
         "requirements.txt", "package.json", "pom.xml", "build.gradle",
@@ -326,7 +309,6 @@ def _score_file(path: Path, error_signal: str,
     if name in HIGH_VALUE:
         score += 15
 
-    # File content mentions error keywords (only for small files)
     if score > 0 and path.stat().st_size < 5000:
         try:
             content = path.read_text(encoding="utf-8", errors="replace").lower()
@@ -359,14 +341,13 @@ def discover_context(error_signal: str,
     candidates.sort(key=lambda x: (-x[0], len(str(x[1]))))
 
     parts, included, total = [], [], 0
-    budget = MAX_TOTAL_CONTEXT
 
     for score, path in candidates:
         rel     = str(path)
-        content = _read_full(path)  # full content, not stripped
+        content = _read_smart(path)
         block   = f"### {rel}\n```\n{content}\n```"
 
-        if total + len(block) > budget:
+        if total + len(block) > MAX_TOTAL_CONTEXT:
             print(f"[DISCOVER] Budget reached — skipping {rel} (score={score})")
             continue
 
@@ -384,53 +365,32 @@ def discover_context(error_signal: str,
 # STAGE 3 — ANALYSE
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Concise system prompt — 3B models follow short, direct instructions better
+# than long elaborate ones. Every extra sentence costs inference time AND
+# reduces compliance accuracy.
 SYSTEM_PROMPT = """\
-You are a CI/CD auto-repair agent. Output ONLY a JSON object. No markdown. No explanation. No extra keys.
+You are a CI/CD repair agent. Output ONLY valid JSON. No markdown fences. No explanation. Start with { end with }.
 
-CRITICAL RULES FOR DOCKERFILE FIXES:
-- When fixing a Dockerfile, you MUST read the existing Dockerfile shown in the repo context.
-- You MUST preserve ALL existing RUN, COPY, EXPOSE, CMD, HEALTHCHECK, WORKDIR instructions.
-- Only change the FROM line (or whatever the actual error is). Do NOT rewrite or delete working instructions.
-- A Dockerfile fix that is just "FROM something:latest" with nothing else is ALWAYS WRONG.
-- The fixed_content must be the COMPLETE corrected Dockerfile, not a one-liner.
-
-CRITICAL RULES FOR ALL FIXES:
-- "fixed_content" must be the COMPLETE corrected file — not a diff, not a snippet, not a one-liner.
-- Read the full file content shown under the ### header. Preserve everything that is not broken.
-- Only change the lines that are causing the error shown in the CI log.
-- If you cannot identify the correct fix with confidence, lower your confidence score below 0.4.
-
-REQUIRED OUTPUT FORMAT — copy this exactly, fill in the values:
-{"pipeline_type":"build","root_cause":"one sentence","confidence":0.9,"commit_message":"fix: description","fixes":[{"file":"exact/path/from/header","reason":"what changed and why","fixed_content":"COMPLETE file content here — every line"}]}
+JSON schema:
+{"pipeline_type":"string","root_cause":"one sentence","confidence":0.0-1.0,"commit_message":"fix: short description","fixes":[{"file":"exact/path","reason":"what changed","fixed_content":"COMPLETE file — every line preserved except the broken one"}]}
 
 RULES:
-- "fixes" is a list of files to change. Each fix has exactly three keys: "file", "reason", "fixed_content".
-- "file" must match the ### path header exactly (e.g. sample_app/Dockerfile).
+- fixed_content = the COMPLETE corrected file. Never a snippet or diff.
+- file = exact path from the ### header.
+- For Dockerfiles: keep ALL existing RUN/COPY/EXPOSE/CMD/WORKDIR/HEALTHCHECK lines. Only fix the broken instruction.
 - Only include files that actually need changes.
-- Output valid JSON only. Start your response with { and end with }."""
+- confidence < 0.4 means you are unsure — set it low rather than guess."""
 
 USER_PROMPT = """\
-## Pipeline type detected
-{pipeline_types}
+## Pipeline: {pipeline_types} | Stack: {tech_stacks}
 
-## Tech stack detected
-{tech_stacks}
-
-## CI failure log (relevant lines only)
+## CI failure (key lines):
 ```
 {error_signal}
 ```
 
-## Repository files — READ THESE CAREFULLY before producing fixes
-These are the ACTUAL current contents of the repository files.
-Your fixed_content must be based on these, not invented from scratch.
-
-{repo_context}
-
-## REMINDER
-- For each fix, your fixed_content must include the COMPLETE file.
-- Preserve all lines that are not related to the error.
-- If the Dockerfile fails on FROM, only change the FROM line. Keep all other instructions."""
+## Repo files (read carefully — your fixed_content must be based on these):
+{repo_context}"""
 
 
 def build_prompt(error_signal: str, repo_context: str,
@@ -441,113 +401,148 @@ def build_prompt(error_signal: str, repo_context: str,
         error_signal=error_signal,
         repo_context=repo_context,
     )
-    total = len(SYSTEM_PROMPT) + len(user)
-    if total > MAX_TOTAL_CONTEXT + 4000:
+    # Hard cap: if still over budget after context trimming, trim repo_context further
+    full = SYSTEM_PROMPT + "\n\n" + user
+    if len(full) > 9000:
         overhead = len(USER_PROMPT.format(
-            pipeline_types="", tech_stacks="",
-            error_signal=error_signal, repo_context=""))
-        allowed  = (MAX_TOTAL_CONTEXT + 4000) - len(SYSTEM_PROMPT) - overhead - 100
-        trimmed  = repo_context[:max(allowed, 2000)] + "\n...(trimmed)"
+            pipeline_types="", tech_stacks="", error_signal=error_signal, repo_context=""))
+        allowed  = 9000 - len(SYSTEM_PROMPT) - overhead - 50
+        trimmed  = repo_context[:max(allowed, 1500)] + "\n...(trimmed for token budget)"
         user = USER_PROMPT.format(
             pipeline_types=", ".join(sorted(pipeline_types)) or "unknown",
             tech_stacks=", ".join(sorted(tech_stacks)) or "unknown",
             error_signal=error_signal,
             repo_context=trimmed,
         )
-        print(f"[AI] Prompt trimmed to: {len(SYSTEM_PROMPT)+len(user)} chars")
+        print(f"[AI] Prompt hard-trimmed to {len(SYSTEM_PROMPT + user)} chars")
     return user
 
 
 def call_ai(error_signal: str, repo_context: str,
             pipeline_types: set, tech_stacks: set) -> str:
+    """
+    Call Ollama with streaming to get incremental output.
+    This prevents the runner sitting idle waiting for a full batch response —
+    streaming lets us detect hangs early and gives GitHub Actions visible activity
+    (prevents the runner from thinking the job is stuck).
+    """
     user_prompt = build_prompt(error_signal, repo_context, pipeline_types, tech_stacks)
     full_prompt = f"{SYSTEM_PROMPT}\n\n{user_prompt}"
+
     payload = {
         "model":       OLLAMA_MODEL,
         "prompt":      full_prompt,
-        "temperature": 0.1,
-        "max_tokens":  4000,  # increased — full file rewrites need more tokens
+        "temperature": 0.05,   # near-zero = more deterministic = faster convergence
+        "max_tokens":  2000,   # was 4000 — 2000 is enough for 5 file fixes with small files
+        "stream":      True,   # STREAMING: get tokens as they arrive, not all at once
     }
+
     print(f"[AI] Prompt: {len(full_prompt)} chars (~{len(full_prompt)//4} tokens)")
+    print(f"[AI] Model: {OLLAMA_MODEL} | timeout: {AI_TIMEOUT}s | max_tokens: 2000")
 
     last_exc = None
     for attempt in range(MAX_RETRIES):
         try:
-            print(f"[AI] Calling Ollama — attempt {attempt+1}/{MAX_RETRIES}...")
-            resp = requests.post(OLLAMA_API_URL, json=payload, timeout=AI_TIMEOUT)
+            print(f"[AI] Attempt {attempt+1}/{MAX_RETRIES} — streaming...")
+            t_start = time.time()
+
+            resp = requests.post(
+                OLLAMA_API_URL,
+                json=payload,
+                timeout=AI_TIMEOUT,
+                stream=True,
+            )
             resp.raise_for_status()
-            raw = resp.json().get("choices", [{}])[0].get("text", "").strip()
-            print(f"[AI] Response: {len(raw)} chars")
-            print(f"[AI] Preview : {raw[:500]}{'...' if len(raw)>500 else ''}")
+
+            # Collect streamed chunks — each chunk is a JSON line
+            collected = []
+            last_print = t_start
+            for raw_line in resp.iter_lines(chunk_size=64):
+                if not raw_line:
+                    continue
+                try:
+                    chunk = json.loads(raw_line)
+                    token = chunk.get("choices", [{}])[0].get("text", "")
+                    collected.append(token)
+                    # Print a heartbeat dot every 10s so GitHub Actions
+                    # knows the runner is alive
+                    now = time.time()
+                    if now - last_print > 10:
+                        elapsed = int(now - t_start)
+                        print(f"[AI] ...generating ({elapsed}s elapsed, "
+                              f"{sum(len(t) for t in collected)} chars so far)")
+                        last_print = now
+                except json.JSONDecodeError:
+                    continue
+
+            raw = "".join(collected).strip()
+            elapsed = time.time() - t_start
+            print(f"[AI] Done in {elapsed:.1f}s — {len(raw)} chars received")
+            print(f"[AI] Preview: {raw[:400]}{'...' if len(raw) > 400 else ''}")
             return raw
+
         except requests.exceptions.Timeout as exc:
             last_exc = exc
-            wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF)-1)]
-            print(f"[AI] Timeout on attempt {attempt+1}. Waiting {wait}s...")
+            elapsed = time.time() - t_start
+            wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+            print(f"[AI] Timeout after {elapsed:.0f}s on attempt {attempt+1}. "
+                  f"Waiting {wait}s before retry...")
             if attempt < MAX_RETRIES - 1:
                 time.sleep(wait)
+
         except requests.exceptions.RequestException as exc:
             raise RuntimeError(f"Cannot reach Ollama at {OLLAMA_API_URL}: {exc}")
 
-    raise RuntimeError(f"Ollama timed out after {MAX_RETRIES} attempts: {last_exc}")
+    raise RuntimeError(
+        f"Ollama timed out after {MAX_RETRIES} attempts ({AI_TIMEOUT}s each). "
+        f"Last error: {last_exc}. "
+        f"Consider: 1) increase timeout-minutes in workflow YAML to 30, "
+        f"2) reduce MAX_TOTAL_CONTEXT, 3) use a faster model."
+    )
 
 
 def _normalize_fix_keys(fixes: list) -> list:
-    """
-    Defensive key normalizer — models often return different field names
-    than the schema specifies. Map all known variants to canonical keys.
-    """
-    KEY_MAP_FILE = ("file_path", "path", "filename", "filepath", "name")
+    """Normalize field names from non-compliant model responses."""
+    KEY_MAP_FILE    = ("file_path", "path", "filename", "filepath", "name")
     KEY_MAP_CONTENT = ("content", "new_content", "fixed", "updated_content",
                        "corrected_content", "file_content", "code")
-
     normalized = []
     for fix in fixes:
         fix = dict(fix)
-
         if "file" not in fix:
             for alt in KEY_MAP_FILE:
                 if alt in fix:
                     fix["file"] = fix.pop(alt)
                     break
-
         if "fixed_content" not in fix:
             for alt in KEY_MAP_CONTENT:
                 if alt in fix:
                     fix["fixed_content"] = fix.pop(alt)
                     break
-
         normalized.append(fix)
     return normalized
 
 
 def _validate_fix_completeness(fix: dict, original_path: Path) -> tuple[bool, str]:
-    """
-    Extra guard: reject fixes that look like truncated rewrites.
-    For Dockerfiles, the fix must contain at least as many meaningful
-    instructions as the original, minus the broken FROM line.
-    """
+    """Reject truncated AI rewrites — especially single-line Dockerfiles."""
     content = fix.get("fixed_content", "")
     file    = fix.get("file", "")
 
-    # Dockerfile-specific: must have more than just FROM
     if Path(file).name.lower().startswith("dockerfile"):
         non_empty = [l for l in content.splitlines()
                      if l.strip() and not l.strip().startswith("#")]
         if len(non_empty) < 3:
             return False, (
-                f"Dockerfile fix looks truncated: only {len(non_empty)} instruction(s). "
-                f"The AI must output the COMPLETE Dockerfile."
+                f"Dockerfile fix truncated: only {len(non_empty)} instruction(s). "
+                f"Must output the COMPLETE Dockerfile."
             )
-
-        # Must contain key Docker instructions if the original had them
         try:
             original = original_path.read_text(encoding="utf-8", errors="replace")
             for keyword in ["WORKDIR", "COPY", "RUN", "CMD", "EXPOSE"]:
                 if keyword in original and keyword not in content:
                     return False, (
-                        f"Dockerfile fix is missing '{keyword}' which exists in the "
-                        f"original. The AI dropped instructions — fix rejected."
+                        f"Dockerfile fix dropped '{keyword}' — instruction missing. "
+                        f"Must preserve all existing instructions."
                     )
         except Exception:
             pass
@@ -557,7 +552,6 @@ def _validate_fix_completeness(fix: dict, original_path: Path) -> tuple[bool, st
 
 def parse_ai_response(raw: str) -> dict:
     cleaned = re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
-
     data = None
 
     try:
@@ -566,6 +560,7 @@ def parse_ai_response(raw: str) -> dict:
         pass
 
     if data is None:
+        # Find the largest valid JSON object in the response
         best = None
         for start in [i for i, c in enumerate(cleaned) if c == "{"]:
             depth = 0
@@ -579,7 +574,6 @@ def parse_ai_response(raw: str) -> dict:
                         if best is None or len(candidate) > len(best):
                             best = candidate
                         break
-
         if best:
             try:
                 data = json.loads(best)
@@ -591,7 +585,7 @@ def parse_ai_response(raw: str) -> dict:
                     pass
 
     if data is None:
-        raise ValueError(f"No valid JSON found in AI response:\n{raw[:600]}")
+        raise ValueError(f"No valid JSON in AI response:\n{raw[:600]}")
 
     if "fixes" in data and isinstance(data["fixes"], list):
         data["fixes"] = _normalize_fix_keys(data["fixes"])
@@ -633,7 +627,6 @@ def validate_fix(fix: dict) -> tuple[bool, str]:
     if len(content) > 500_000:
         return False, f"fixed_content too large ({len(content)} chars)"
 
-    # Completeness check — guards against truncated AI rewrites
     ok, reason = _validate_fix_completeness(fix, Path(file))
     if not ok:
         return False, reason
@@ -673,30 +666,23 @@ def validate_fix(fix: dict) -> tuple[bool, str]:
 
 def write_fixes(fixes: list[dict]) -> tuple[list[str], dict[str, str]]:
     written, originals = [], {}
-
     for fix in fixes[:MAX_FILES_FIXED]:
         ok, reason = validate_fix(fix)
         file = fix.get("file", "").strip()
-
         if not ok:
             print(f"  ✗ {file or '?'} — {reason}", file=sys.stderr)
             continue
-
         originals[file] = Path(file).read_text(encoding="utf-8", errors="replace")
-
         p       = Path(file)
         tmp     = p.with_suffix(p.suffix + ".tmp")
         content = fix["fixed_content"]
         if not content.endswith("\n"):
             content += "\n"
-
         tmp.write_text(content, encoding="utf-8")
         tmp.replace(p)
-
         print(f"  ✓ {file}")
         print(f"    reason : {fix.get('reason','')[:120]}")
         written.append(file)
-
     return written, originals
 
 
@@ -753,9 +739,7 @@ def run_tests(tech_stacks: set[str], written: list[str]) -> bool:
     all_passed = True
     for cmd in commands:
         try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=180
-            )
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
             for line in (result.stdout + result.stderr).splitlines()[-20:]:
                 print(f"  {line}")
             ok = result.returncode == 0
@@ -771,12 +755,11 @@ def run_tests(tech_stacks: set[str], written: list[str]) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 7 — COMMIT  (Git flow aware)
+# STAGE 7 — COMMIT (Git flow)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _git(*args, check=True) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *args], check=check,
-                          capture_output=True, text=True)
+    return subprocess.run(["git", *args], check=check, capture_output=True, text=True)
 
 
 def last_commit_was_bot() -> bool:
@@ -794,41 +777,29 @@ def last_commit_was_bot() -> bool:
 def count_recent_bot_commits(n: int = 10) -> int:
     try:
         r = _git("log", f"-{n}", "--pretty=%an")
-        return sum(1 for l in r.stdout.strip().splitlines()
-                   if l.strip() == BOT_NAME)
+        return sum(1 for l in r.stdout.strip().splitlines() if l.strip() == BOT_NAME)
     except Exception:
         return 0
 
 
 def _ensure_base_branch_exists() -> bool:
-    """
-    Ensure GIT_BASE_BRANCH (develop) exists locally.
-    If only main exists (fresh repo), create develop from main.
-    Returns True if base branch is ready.
-    """
     _git("fetch", "origin", check=False)
-
-    # Check if base branch exists on remote
     result = _git("ls-remote", "--heads", "origin", GIT_BASE_BRANCH, check=False)
     if result.stdout.strip():
-        # Exists on remote — check out or create local tracking branch
         local_check = _git("rev-parse", "--verify", GIT_BASE_BRANCH, check=False)
         if local_check.returncode != 0:
             _git("checkout", "-b", GIT_BASE_BRANCH, f"origin/{GIT_BASE_BRANCH}")
         print(f"[GIT FLOW] Base branch '{GIT_BASE_BRANCH}' found on remote ✓")
         return True
 
-    # develop doesn't exist yet — create it from main
     print(f"[GIT FLOW] '{GIT_BASE_BRANCH}' not found. Creating from main...")
     try:
         main_ref = _git("rev-parse", "--verify", "main", check=False)
         if main_ref.returncode != 0:
-            # Try master
             _git("rev-parse", "--verify", "master")
             _git("checkout", "-b", GIT_BASE_BRANCH, "master")
         else:
             _git("checkout", "-b", GIT_BASE_BRANCH, "main")
-
         _git("push", "-u", "origin", GIT_BASE_BRANCH)
         print(f"[GIT FLOW] Created and pushed '{GIT_BASE_BRANCH}' branch ✓")
         return True
@@ -839,37 +810,23 @@ def _ensure_base_branch_exists() -> bool:
 
 
 def commit_to_branch(commit_msg: str) -> str:
-    """
-    Git flow commit strategy:
-      1. Ensure develop branch exists (create from main if needed)
-      2. Checkout develop and pull latest
-      3. Create fix/<timestamp> branch FROM develop (not main)
-      4. Apply changes, commit, push
-      5. PR targets develop — never main
-    """
     try:
         _git("config", "user.name",  BOT_NAME)
         _git("config", "user.email", BOT_EMAIL)
 
-        # ── Ensure develop exists ─────────────────────────────────────────────
         if not _ensure_base_branch_exists():
-            print(f"[ERROR] Cannot set up base branch '{GIT_BASE_BRANCH}'",
-                  file=sys.stderr)
+            print(f"[ERROR] Cannot set up base branch '{GIT_BASE_BRANCH}'", file=sys.stderr)
             return ""
 
-        # ── Get latest develop ────────────────────────────────────────────────
         print(f"[GIT FLOW] Checking out '{GIT_BASE_BRANCH}'...")
         _git("checkout", GIT_BASE_BRANCH)
         _git("pull", "origin", GIT_BASE_BRANCH, check=False)
 
-        # ── Create fix branch from develop ────────────────────────────────────
         branch = f"fix/{int(time.time())}"
         print(f"[GIT FLOW] Creating '{branch}' from '{GIT_BASE_BRANCH}'...")
         _git("checkout", "-b", branch)
-
         _git("add", "-A")
 
-        # Check if there is anything to commit
         if _git("diff", "--cached", "--quiet", check=False).returncode == 0:
             print("[COMMIT] Nothing to commit.")
             _git("checkout", GIT_BASE_BRANCH, check=False)
@@ -877,10 +834,7 @@ def commit_to_branch(commit_msg: str) -> str:
 
         _git("commit", "-m", commit_msg)
         _git("push", "-u", "origin", branch)
-        print(f"[GIT FLOW] ✓ Pushed branch: {branch}")
-        print(f"[GIT FLOW]   branch: {branch}  →  PR targets: {GIT_TARGET_BRANCH}")
-
-        # Return to develop (not main)
+        print(f"[GIT FLOW] ✓ Pushed: {branch} → PR targets: {GIT_TARGET_BRANCH}")
         _git("checkout", GIT_BASE_BRANCH, check=False)
         return branch
 
@@ -892,7 +846,7 @@ def commit_to_branch(commit_msg: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 8 — GitHub API (PR / Issue)
+# STAGE 8 — GitHub PR / Issue
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _gh(token: str) -> dict:
@@ -907,14 +861,10 @@ def open_pr(token: str, repo: str, branch: str,
             commit_msg: str, root_cause: str,
             pipeline_type: str, tech_stacks: set,
             written: list[str], fixes: list[dict]) -> str:
-
-    fix_details = ""
-    for fix in fixes:
-        fix_details += (
-            f"\n**`{fix.get('file','?')}`**\n"
-            f"> {fix.get('reason','')}\n"
-        )
-
+    fix_details = "".join(
+        f"\n**`{fix.get('file','?')}`**\n> {fix.get('reason','')}\n"
+        for fix in fixes
+    )
     body = f"""## 🤖 AI Auto-Fix — Review Required
 
 | Field | Value |
@@ -923,55 +873,41 @@ def open_pr(token: str, repo: str, branch: str,
 | **Tech stack** | `{', '.join(sorted(tech_stacks)) or 'unknown'}` |
 | **Root cause** | {root_cause} |
 | **Files changed** | {', '.join(f'`{f}`' for f in written)} |
-| **Target branch** | `{GIT_TARGET_BRANCH}` (Git flow: fix → develop → release → main) |
-
----
+| **Target branch** | `{GIT_TARGET_BRANCH}` |
 
 ## What the AI changed
-
 {fix_details}
 
----
-
-## Git flow — what happens after merge
-
+## Git flow
 ```
-fix/{'{timestamp}'} (this PR)
+{branch} (this PR)
     └─► {GIT_TARGET_BRANCH}   ← merge here after review
-            └─► release/*   ← release manager cuts when sprint is ready
-                    └─► main  ← only after QA sign-off + tag
+            └─► release/*   ← cut when sprint is ready
+                    └─► main  ← after QA sign-off + tag
 ```
 
 ## Review checklist
-1. Open **Files changed** tab and read every diff carefully
-2. Does the fix address the root cause shown above?
-3. Are all original instructions preserved (e.g. Dockerfile COPY/RUN/CMD)?
-4. Is any unrelated logic accidentally modified?
-5. ✅ Correct → **Merge into `{GIT_TARGET_BRANCH}`** — CI re-runs automatically
-6. ❌ Wrong → **Close** — fix manually and push to `{GIT_TARGET_BRANCH}`
+1. Read **Files changed** tab — every diff line
+2. Does the fix address the root cause above?
+3. Are all original instructions preserved (COPY/RUN/CMD etc)?
+4. Is anything unrelated accidentally modified?
+5. ✅ Correct → **Merge into `{GIT_TARGET_BRANCH}`**
+6. ❌ Wrong → **Close** — fix manually on `{GIT_TARGET_BRANCH}`
 
-> Auto-generated by self-healing CI. No AI changes reach main without:
-> human review → develop merge → release branch → QA sign-off → main.
+> Auto-generated. No AI changes reach main without: human review → develop → release → QA → main.
 """
     resp = requests.post(
         f"https://api.github.com/repos/{repo}/pulls",
         json={"title": f"🤖 {commit_msg}", "head": branch,
               "base": GIT_TARGET_BRANCH, "body": body},
-        headers=_gh(token),
-        timeout=30,
+        headers=_gh(token), timeout=30,
     )
     if resp.status_code in (200, 201):
         url = resp.json().get("html_url", "")
         print(f"[PR] ✓ Opened: {url}")
-        print(f"[PR]   {branch} → {GIT_TARGET_BRANCH}  (Git flow)")
         return url
-    # 422 often means the target branch doesn't exist on GitHub yet
     if resp.status_code == 422:
-        err = resp.json()
-        print(f"[PR] 422 error: {err}", file=sys.stderr)
-        print(f"[PR] Hint: Does '{GIT_TARGET_BRANCH}' exist on GitHub? "
-              f"Push it first or set GIT_TARGET_BRANCH=main as fallback.",
-              file=sys.stderr)
+        print(f"[PR] 422 — does '{GIT_TARGET_BRANCH}' exist on GitHub?", file=sys.stderr)
     else:
         print(f"[PR] Failed {resp.status_code}: {resp.text[:300]}", file=sys.stderr)
     return ""
@@ -989,13 +925,11 @@ def open_issue(token: str, repo: str, reason: str,
                 f"**Reason:** {reason}\n\n"
                 f"**Failed run:** {run_url}\n\n"
                 f"**Git flow reminder:** fix manually on `develop`, "
-                f"then follow release/* → main process.\n\n"
-                f"Please investigate, fix manually, and close this issue."
+                f"then follow release/* → main process."
             ),
             "labels": ["bug", "needs-manual-fix"],
         },
-        headers=_gh(token),
-        timeout=30,
+        headers=_gh(token), timeout=30,
     )
     if resp.status_code in (200, 201):
         print(f"[ISSUE] ✓ Opened: {resp.json().get('html_url','')}")
@@ -1009,10 +943,9 @@ def open_issue(token: str, repo: str, reason: str,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generic self-healing CI/CD auto-fixer — any pipeline, any stack"
+        description="Generic self-healing CI/CD auto-fixer"
     )
-    parser.add_argument("--input",      required=True,
-                        help="Path to CI failure log file")
+    parser.add_argument("--input",      required=True, help="Path to CI failure log")
     parser.add_argument("--dry-run",    action="store_true",
                         help="Validate but do not write files or open PR")
     parser.add_argument("--skip-tests", action="store_true",
@@ -1027,11 +960,10 @@ def main():
         print(f"[ERROR] Log not found: {args.input}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"[GIT FLOW] Base branch  : {GIT_BASE_BRANCH}")
-    print(f"[GIT FLOW] Target branch: {GIT_TARGET_BRANCH}")
-    print(f"[GIT FLOW] Flow: fix/* → {GIT_TARGET_BRANCH} → release/* → main")
+    print(f"[GIT FLOW] Base: {GIT_BASE_BRANCH} | Target: {GIT_TARGET_BRANCH}")
+    print(f"[TIMING]   AI timeout: {AI_TIMEOUT}s × {MAX_RETRIES} retries | "
+          f"Context budget: {MAX_TOTAL_CONTEXT} chars")
 
-    # ── Loop guards ───────────────────────────────────────────────────────────
     if last_commit_was_bot():
         sys.exit(0)
 
@@ -1041,14 +973,14 @@ def main():
         if token and repo:
             open_issue(token, repo,
                        f"Auto-fixer attempted {attempts} fixes without success.",
-                       run_url=os.environ.get("GITHUB_SERVER_URL","")
+                       run_url=os.environ.get("GITHUB_SERVER_URL", "")
                                 + "/" + repo + "/actions")
         sys.exit(0)
 
     # ══ STAGE 1: DETECT ══════════════════════════════════════════════════════
     print("\n━━━ STAGE 1: DETECT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    log_text       = log_path.read_text(encoding="utf-8", errors="replace")
-    error_signal   = extract_error_signal(log_text)
+    log_text     = log_path.read_text(encoding="utf-8", errors="replace")
+    error_signal = extract_error_signal(log_text)
     pipeline_types, tech_stacks = fingerprint_pipeline(log_text)
 
     if not error_signal.strip():
@@ -1057,9 +989,7 @@ def main():
 
     # ══ STAGE 2: DISCOVER ════════════════════════════════════════════════════
     print("\n━━━ STAGE 2: DISCOVER ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    repo_context, included = discover_context(
-        error_signal, tech_stacks, pipeline_types
-    )
+    repo_context, included = discover_context(error_signal, tech_stacks, pipeline_types)
 
     # ══ STAGE 3: ANALYSE ═════════════════════════════════════════════════════
     print("\n━━━ STAGE 3: ANALYSE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -1088,8 +1018,8 @@ def main():
         print(f"    → {fix.get('file','?')}  ({content_len} chars)")
         print(f"      {fix.get('reason','')[:120]}")
         if content_len < 50:
-            print(f"      ⚠ WARNING: fixed_content is very short ({content_len} chars) "
-                  f"— likely a truncated rewrite")
+            print(f"      ⚠ WARNING: fixed_content very short ({content_len} chars) "
+                  f"— likely truncated")
 
     if confidence < CONFIDENCE_MIN:
         print(f"[SKIP] Confidence {confidence:.0%} below threshold.")
@@ -1133,9 +1063,7 @@ def main():
         for fix in valid_fixes:
             content = fix["fixed_content"]
             print(f"  would write {fix['file']} ({len(content)} chars)")
-            # Show a preview of what would be written
-            preview_lines = content.splitlines()[:5]
-            for line in preview_lines:
+            for line in content.splitlines()[:5]:
                 print(f"    {line}")
             if len(content.splitlines()) > 5:
                 print(f"    ... ({len(content.splitlines()) - 5} more lines)")
@@ -1149,7 +1077,7 @@ def main():
         print("[ERROR] No files were written.", file=sys.stderr)
         sys.exit(3)
 
-    print(f"[WRITE] {len(written)} file(s) written: {written}")
+    print(f"[WRITE] {len(written)} file(s): {written}")
 
     # ══ STAGE 6: TEST ════════════════════════════════════════════════════════
     print("\n━━━ STAGE 6: TEST ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -1164,36 +1092,27 @@ def main():
     else:
         print("[TEST] Skipped (--skip-tests)")
 
-    # ══ STAGE 7: COMMIT (Git flow) ═══════════════════════════════════════════
-    print(f"\n━━━ STAGE 7: COMMIT (Git flow: fix/* → {GIT_TARGET_BRANCH}) ━━━━━")
+    # ══ STAGE 7: COMMIT ══════════════════════════════════════════════════════
+    print(f"\n━━━ STAGE 7: COMMIT (fix/* → {GIT_TARGET_BRANCH}) ━━━━━━━━━━━")
     branch = commit_to_branch(commit_msg)
     if not branch:
         sys.exit(4)
 
     # ══ STAGE 8: PR ══════════════════════════════════════════════════════════
-    print(f"\n━━━ STAGE 8: PR (→ {GIT_TARGET_BRANCH}) ━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"\n━━━ STAGE 8: PR (→ {GIT_TARGET_BRANCH}) ━━━━━━━━━━━━━━━━━━━━━")
     pr_url = ""
     if token and repo:
         pr_url = open_pr(token, repo, branch, commit_msg, root_cause,
                          detected_type, tech_stacks, written, valid_fixes)
     else:
-        print("[PR] No GITHUB_TOKEN — skipping.")
-        print(f"[PR] Merge manually: git checkout {GIT_TARGET_BRANCH} && "
-              f"git merge {branch} && git push")
+        print(f"[PR] No token — merge manually: git merge {branch} into {GIT_TARGET_BRANCH}")
 
-    # ══ DONE ═════════════════════════════════════════════════════════════════
     print("\n━━━ ✅ DONE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print(f"  pipeline   : {detected_type}")
     print(f"  root cause : {root_cause}")
     print(f"  fixed      : {', '.join(written)}")
     print(f"  branch     : {branch} → {GIT_TARGET_BRANCH}")
     print(f"  PR         : {pr_url or 'not created'}")
-    print()
-    print(f"  Git flow next steps:")
-    print(f"    1. Review PR diff carefully (especially Dockerfile instructions)")
-    print(f"    2. Merge into '{GIT_TARGET_BRANCH}' if fix is correct")
-    print(f"    3. Release manager cuts release/* from '{GIT_TARGET_BRANCH}' when ready")
-    print(f"    4. release/* → main after QA sign-off + version tag")
 
 
 if __name__ == "__main__":
