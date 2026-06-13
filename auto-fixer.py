@@ -12,8 +12,14 @@ No hardcoded file paths. The system:
   4. VALIDATE  — Syntax-check every rewritten file before touching disk
   5. WRITE     — Atomically overwrite only the files Llama fixed
   6. TEST      — Run pipeline-appropriate tests; revert on failure
-  7. COMMIT    — Push to auto-fix/<timestamp> branch
-  8. PR        — Open Pull Request; human reviews before merge
+  7. COMMIT    — Push to fix/<timestamp> branch off develop (Git flow)
+  8. PR        — Open Pull Request targeting develop; human reviews before merge
+
+Git flow enforced:
+  - Fixes always branch from develop (not main)
+  - PR targets develop → code review → develop
+  - Release manager cuts release/* from develop → main when ready
+  - Hotfixes branch from main tag, merge to main AND develop
 
 Pipeline types handled:
   - Build pipelines     (Docker build, compile, package)
@@ -54,8 +60,8 @@ RETRY_BACKOFF    = [10, 30, 60]
 
 # ── Prompt budget ──────────────────────────────────────────────────────────────
 MAX_ERROR_LINES   = 25      # error lines to extract from CI log
-MAX_FILE_CHARS    = 1200    # chars per file sent to AI
-MAX_TOTAL_CONTEXT = 4000    # total context chars sent to AI (~1000 tokens)
+MAX_FILE_CHARS    = 4000    # chars per file sent to AI — INCREASED for real context
+MAX_TOTAL_CONTEXT = 12000   # total context chars sent to AI — INCREASED
 MAX_FILES_FIXED   = 8       # AI cannot claim to fix more than this many files
 
 # ── Safety ────────────────────────────────────────────────────────────────────
@@ -65,6 +71,12 @@ MAX_BOT_ATTEMPTS = 3
 BOT_NAME   = "github-actions[bot]"
 BOT_EMAIL  = "github-actions[bot]@users.noreply.github.com"
 BOT_PREFIX = "fix:"
+
+# ── Git flow config ───────────────────────────────────────────────────────────
+# Fixes always branch from develop and PR targets develop.
+# main is never touched directly by the bot.
+GIT_BASE_BRANCH   = os.environ.get("GIT_BASE_BRANCH", "develop")   # branch fixes come from
+GIT_TARGET_BRANCH = os.environ.get("GIT_TARGET_BRANCH", "develop")  # PR targets this
 
 # ── Paths the AI must never touch ─────────────────────────────────────────────
 ALWAYS_BLOCKED = {
@@ -257,15 +269,21 @@ def _is_text_file(path: Path) -> bool:
         return False
 
 
-def _read_trimmed(path: Path) -> str:
+def _read_full(path: Path) -> str:
+    """
+    Read the COMPLETE file content — no comment stripping, no trimming.
+    The AI needs full context to understand what is actually in the file
+    and produce a correct, complete rewrite rather than a hallucinated snippet.
+    Content is capped at MAX_FILE_CHARS but preserves the file structure.
+    """
     try:
-        raw   = path.read_text(encoding="utf-8", errors="replace")
-        lines = [l for l in raw.splitlines()
-                 if l.strip() and not l.strip().startswith("#")]
-        text  = "\n".join(lines)
-        if len(text) > MAX_FILE_CHARS:
-            text = text[:MAX_FILE_CHARS] + "\n...(truncated)"
-        return text
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        if len(raw) > MAX_FILE_CHARS:
+            # Keep head + tail so the AI sees both the FROM line and the CMD
+            head = raw[: MAX_FILE_CHARS // 2]
+            tail = raw[-(MAX_FILE_CHARS // 2):]
+            return head + f"\n... ({len(raw) - MAX_FILE_CHARS} chars omitted) ...\n" + tail
+        return raw
     except Exception as exc:
         return f"(unreadable: {exc})"
 
@@ -345,7 +363,7 @@ def discover_context(error_signal: str,
 
     for score, path in candidates:
         rel     = str(path)
-        content = _read_trimmed(path)
+        content = _read_full(path)  # full content, not stripped
         block   = f"### {rel}\n```\n{content}\n```"
 
         if total + len(block) > budget:
@@ -355,7 +373,7 @@ def discover_context(error_signal: str,
         parts.append(block)
         included.append(rel)
         total += len(block)
-        print(f"[DISCOVER] Included {rel} (score={score})")
+        print(f"[DISCOVER] Included {rel} (score={score}, {len(content)} chars)")
 
     context = "\n\n".join(parts)
     print(f"[DISCOVER] {len(included)} files, {len(context)} chars total")
@@ -369,13 +387,25 @@ def discover_context(error_signal: str,
 SYSTEM_PROMPT = """\
 You are a CI/CD auto-repair agent. Output ONLY a JSON object. No markdown. No explanation. No extra keys.
 
+CRITICAL RULES FOR DOCKERFILE FIXES:
+- When fixing a Dockerfile, you MUST read the existing Dockerfile shown in the repo context.
+- You MUST preserve ALL existing RUN, COPY, EXPOSE, CMD, HEALTHCHECK, WORKDIR instructions.
+- Only change the FROM line (or whatever the actual error is). Do NOT rewrite or delete working instructions.
+- A Dockerfile fix that is just "FROM something:latest" with nothing else is ALWAYS WRONG.
+- The fixed_content must be the COMPLETE corrected Dockerfile, not a one-liner.
+
+CRITICAL RULES FOR ALL FIXES:
+- "fixed_content" must be the COMPLETE corrected file — not a diff, not a snippet, not a one-liner.
+- Read the full file content shown under the ### header. Preserve everything that is not broken.
+- Only change the lines that are causing the error shown in the CI log.
+- If you cannot identify the correct fix with confidence, lower your confidence score below 0.4.
+
 REQUIRED OUTPUT FORMAT — copy this exactly, fill in the values:
-{"pipeline_type":"build","root_cause":"one sentence","confidence":0.9,"commit_message":"fix: description","fixes":[{"file":"exact/path/from/header","reason":"what changed","fixed_content":"complete file content here"}]}
+{"pipeline_type":"build","root_cause":"one sentence","confidence":0.9,"commit_message":"fix: description","fixes":[{"file":"exact/path/from/header","reason":"what changed and why","fixed_content":"COMPLETE file content here — every line"}]}
 
 RULES:
 - "fixes" is a list of files to change. Each fix has exactly three keys: "file", "reason", "fixed_content".
 - "file" must match the ### path header exactly (e.g. sample_app/Dockerfile).
-- "fixed_content" is the COMPLETE corrected file — not a diff, not a snippet.
 - Only include files that actually need changes.
 - Output valid JSON only. Start your response with { and end with }."""
 
@@ -387,10 +417,20 @@ USER_PROMPT = """\
 {tech_stacks}
 
 ## CI failure log (relevant lines only)
+```
 {error_signal}
+```
 
-## Repository files (fix only what is broken)
-{repo_context}"""
+## Repository files — READ THESE CAREFULLY before producing fixes
+These are the ACTUAL current contents of the repository files.
+Your fixed_content must be based on these, not invented from scratch.
+
+{repo_context}
+
+## REMINDER
+- For each fix, your fixed_content must include the COMPLETE file.
+- Preserve all lines that are not related to the error.
+- If the Dockerfile fails on FROM, only change the FROM line. Keep all other instructions."""
 
 
 def build_prompt(error_signal: str, repo_context: str,
@@ -402,19 +442,19 @@ def build_prompt(error_signal: str, repo_context: str,
         repo_context=repo_context,
     )
     total = len(SYSTEM_PROMPT) + len(user)
-    if total > MAX_TOTAL_CONTEXT + 2000:
+    if total > MAX_TOTAL_CONTEXT + 4000:
         overhead = len(USER_PROMPT.format(
             pipeline_types="", tech_stacks="",
             error_signal=error_signal, repo_context=""))
-        allowed  = (MAX_TOTAL_CONTEXT + 2000) - len(SYSTEM_PROMPT) - overhead - 100
-        trimmed  = repo_context[:max(allowed, 500)] + "\n...(trimmed)"
+        allowed  = (MAX_TOTAL_CONTEXT + 4000) - len(SYSTEM_PROMPT) - overhead - 100
+        trimmed  = repo_context[:max(allowed, 2000)] + "\n...(trimmed)"
         user = USER_PROMPT.format(
             pipeline_types=", ".join(sorted(pipeline_types)) or "unknown",
             tech_stacks=", ".join(sorted(tech_stacks)) or "unknown",
             error_signal=error_signal,
             repo_context=trimmed,
         )
-        print(f"[AI] Prompt trimmed: {len(SYSTEM_PROMPT)+len(user)} chars")
+        print(f"[AI] Prompt trimmed to: {len(SYSTEM_PROMPT)+len(user)} chars")
     return user
 
 
@@ -426,7 +466,7 @@ def call_ai(error_signal: str, repo_context: str,
         "model":       OLLAMA_MODEL,
         "prompt":      full_prompt,
         "temperature": 0.1,
-        "max_tokens":  2500,
+        "max_tokens":  4000,  # increased — full file rewrites need more tokens
     }
     print(f"[AI] Prompt: {len(full_prompt)} chars (~{len(full_prompt)//4} tokens)")
 
@@ -456,7 +496,6 @@ def _normalize_fix_keys(fixes: list) -> list:
     """
     Defensive key normalizer — models often return different field names
     than the schema specifies. Map all known variants to canonical keys.
-    'file' and 'fixed_content' are the only keys validate_fix checks.
     """
     KEY_MAP_FILE = ("file_path", "path", "filename", "filepath", "name")
     KEY_MAP_CONTENT = ("content", "new_content", "fixed", "updated_content",
@@ -464,16 +503,14 @@ def _normalize_fix_keys(fixes: list) -> list:
 
     normalized = []
     for fix in fixes:
-        fix = dict(fix)  # copy so we don't mutate original
+        fix = dict(fix)
 
-        # Normalize → "file"
         if "file" not in fix:
             for alt in KEY_MAP_FILE:
                 if alt in fix:
                     fix["file"] = fix.pop(alt)
                     break
 
-        # Normalize → "fixed_content"
         if "fixed_content" not in fix:
             for alt in KEY_MAP_CONTENT:
                 if alt in fix:
@@ -482,6 +519,40 @@ def _normalize_fix_keys(fixes: list) -> list:
 
         normalized.append(fix)
     return normalized
+
+
+def _validate_fix_completeness(fix: dict, original_path: Path) -> tuple[bool, str]:
+    """
+    Extra guard: reject fixes that look like truncated rewrites.
+    For Dockerfiles, the fix must contain at least as many meaningful
+    instructions as the original, minus the broken FROM line.
+    """
+    content = fix.get("fixed_content", "")
+    file    = fix.get("file", "")
+
+    # Dockerfile-specific: must have more than just FROM
+    if Path(file).name.lower().startswith("dockerfile"):
+        non_empty = [l for l in content.splitlines()
+                     if l.strip() and not l.strip().startswith("#")]
+        if len(non_empty) < 3:
+            return False, (
+                f"Dockerfile fix looks truncated: only {len(non_empty)} instruction(s). "
+                f"The AI must output the COMPLETE Dockerfile."
+            )
+
+        # Must contain key Docker instructions if the original had them
+        try:
+            original = original_path.read_text(encoding="utf-8", errors="replace")
+            for keyword in ["WORKDIR", "COPY", "RUN", "CMD", "EXPOSE"]:
+                if keyword in original and keyword not in content:
+                    return False, (
+                        f"Dockerfile fix is missing '{keyword}' which exists in the "
+                        f"original. The AI dropped instructions — fix rejected."
+                    )
+        except Exception:
+            pass
+
+    return True, "ok"
 
 
 def parse_ai_response(raw: str) -> dict:
@@ -522,7 +593,6 @@ def parse_ai_response(raw: str) -> dict:
     if data is None:
         raise ValueError(f"No valid JSON found in AI response:\n{raw[:600]}")
 
-    # ── Normalize fix keys regardless of what the model returned ──────────────
     if "fixes" in data and isinstance(data["fixes"], list):
         data["fixes"] = _normalize_fix_keys(data["fixes"])
         unmapped = [
@@ -562,6 +632,11 @@ def validate_fix(fix: dict) -> tuple[bool, str]:
         return False, f"file does not exist in repo: {file}"
     if len(content) > 500_000:
         return False, f"fixed_content too large ({len(content)} chars)"
+
+    # Completeness check — guards against truncated AI rewrites
+    ok, reason = _validate_fix_completeness(fix, Path(file))
+    if not ok:
+        return False, reason
 
     if file.endswith(".py"):
         try:
@@ -660,7 +735,6 @@ def detect_test_commands(tech_stacks: set[str]) -> list[list[str]]:
 
 
 def run_tests(tech_stacks: set[str], written: list[str]) -> bool:
-    # Lint any changed Dockerfiles with hadolint if available
     for f in written:
         if Path(f).name.lower().startswith("dockerfile"):
             lint = subprocess.run(
@@ -697,7 +771,7 @@ def run_tests(tech_stacks: set[str], written: list[str]) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 7 — COMMIT
+# STAGE 7 — COMMIT  (Git flow aware)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _git(*args, check=True) -> subprocess.CompletedProcess:
@@ -726,41 +800,93 @@ def count_recent_bot_commits(n: int = 10) -> int:
         return 0
 
 
+def _ensure_base_branch_exists() -> bool:
+    """
+    Ensure GIT_BASE_BRANCH (develop) exists locally.
+    If only main exists (fresh repo), create develop from main.
+    Returns True if base branch is ready.
+    """
+    _git("fetch", "origin", check=False)
+
+    # Check if base branch exists on remote
+    result = _git("ls-remote", "--heads", "origin", GIT_BASE_BRANCH, check=False)
+    if result.stdout.strip():
+        # Exists on remote — check out or create local tracking branch
+        local_check = _git("rev-parse", "--verify", GIT_BASE_BRANCH, check=False)
+        if local_check.returncode != 0:
+            _git("checkout", "-b", GIT_BASE_BRANCH, f"origin/{GIT_BASE_BRANCH}")
+        print(f"[GIT FLOW] Base branch '{GIT_BASE_BRANCH}' found on remote ✓")
+        return True
+
+    # develop doesn't exist yet — create it from main
+    print(f"[GIT FLOW] '{GIT_BASE_BRANCH}' not found. Creating from main...")
+    try:
+        main_ref = _git("rev-parse", "--verify", "main", check=False)
+        if main_ref.returncode != 0:
+            # Try master
+            _git("rev-parse", "--verify", "master")
+            _git("checkout", "-b", GIT_BASE_BRANCH, "master")
+        else:
+            _git("checkout", "-b", GIT_BASE_BRANCH, "main")
+
+        _git("push", "-u", "origin", GIT_BASE_BRANCH)
+        print(f"[GIT FLOW] Created and pushed '{GIT_BASE_BRANCH}' branch ✓")
+        return True
+    except subprocess.CalledProcessError as exc:
+        print(f"[GIT FLOW] Could not create '{GIT_BASE_BRANCH}': {exc.stderr.strip()}",
+              file=sys.stderr)
+        return False
+
+
 def commit_to_branch(commit_msg: str) -> str:
+    """
+    Git flow commit strategy:
+      1. Ensure develop branch exists (create from main if needed)
+      2. Checkout develop and pull latest
+      3. Create fix/<timestamp> branch FROM develop (not main)
+      4. Apply changes, commit, push
+      5. PR targets develop — never main
+    """
     try:
         _git("config", "user.name",  BOT_NAME)
         _git("config", "user.email", BOT_EMAIL)
 
-        print("[COMMIT] Fetching remote...")
-        _git("fetch", "origin")
+        # ── Ensure develop exists ─────────────────────────────────────────────
+        if not _ensure_base_branch_exists():
+            print(f"[ERROR] Cannot set up base branch '{GIT_BASE_BRANCH}'",
+                  file=sys.stderr)
+            return ""
 
-        merge = subprocess.run(
-            ["git", "merge", "-X", "ours", "origin/main",
-             "--no-edit", "-m", "merge: sync before fix"],
-            capture_output=True, text=True
-        )
-        if merge.returncode != 0:
-            print(f"[WARN] Merge issue: {merge.stderr.strip()}")
-            _git("merge", "--abort", check=False)
+        # ── Get latest develop ────────────────────────────────────────────────
+        print(f"[GIT FLOW] Checking out '{GIT_BASE_BRANCH}'...")
+        _git("checkout", GIT_BASE_BRANCH)
+        _git("pull", "origin", GIT_BASE_BRANCH, check=False)
 
-        branch = f"auto-fix/{int(time.time())}"
+        # ── Create fix branch from develop ────────────────────────────────────
+        branch = f"fix/{int(time.time())}"
+        print(f"[GIT FLOW] Creating '{branch}' from '{GIT_BASE_BRANCH}'...")
         _git("checkout", "-b", branch)
+
         _git("add", "-A")
 
+        # Check if there is anything to commit
         if _git("diff", "--cached", "--quiet", check=False).returncode == 0:
             print("[COMMIT] Nothing to commit.")
-            _git("checkout", "main", check=False)
+            _git("checkout", GIT_BASE_BRANCH, check=False)
             return ""
 
         _git("commit", "-m", commit_msg)
         _git("push", "-u", "origin", branch)
-        print(f"[COMMIT] ✓ Pushed branch: {branch}")
-        _git("checkout", "main", check=False)
+        print(f"[GIT FLOW] ✓ Pushed branch: {branch}")
+        print(f"[GIT FLOW]   branch: {branch}  →  PR targets: {GIT_TARGET_BRANCH}")
+
+        # Return to develop (not main)
+        _git("checkout", GIT_BASE_BRANCH, check=False)
         return branch
 
     except subprocess.CalledProcessError as exc:
         print(f"[ERROR] Git: {exc.stderr.strip()}", file=sys.stderr)
-        _git("checkout", "main", check=False)
+        _git("checkout", GIT_BASE_BRANCH, check=False)
         _git("merge", "--abort", check=False)
         return ""
 
@@ -797,6 +923,7 @@ def open_pr(token: str, repo: str, branch: str,
 | **Tech stack** | `{', '.join(sorted(tech_stacks)) or 'unknown'}` |
 | **Root cause** | {root_cause} |
 | **Files changed** | {', '.join(f'`{f}`' for f in written)} |
+| **Target branch** | `{GIT_TARGET_BRANCH}` (Git flow: fix → develop → release → main) |
 
 ---
 
@@ -806,27 +933,47 @@ def open_pr(token: str, repo: str, branch: str,
 
 ---
 
-## Review checklist
-1. Open **Files changed** tab and read every diff
-2. Does the fix address the root cause shown above?
-3. Is any unrelated logic accidentally modified?
-4. ✅ Correct → **Merge** — CI re-runs automatically
-5. ❌ Wrong → **Close** — fix manually and push to main
+## Git flow — what happens after merge
 
-> Auto-generated by self-healing CI. No AI changes reach main without human review.
+```
+fix/{'{timestamp}'} (this PR)
+    └─► {GIT_TARGET_BRANCH}   ← merge here after review
+            └─► release/*   ← release manager cuts when sprint is ready
+                    └─► main  ← only after QA sign-off + tag
+```
+
+## Review checklist
+1. Open **Files changed** tab and read every diff carefully
+2. Does the fix address the root cause shown above?
+3. Are all original instructions preserved (e.g. Dockerfile COPY/RUN/CMD)?
+4. Is any unrelated logic accidentally modified?
+5. ✅ Correct → **Merge into `{GIT_TARGET_BRANCH}`** — CI re-runs automatically
+6. ❌ Wrong → **Close** — fix manually and push to `{GIT_TARGET_BRANCH}`
+
+> Auto-generated by self-healing CI. No AI changes reach main without:
+> human review → develop merge → release branch → QA sign-off → main.
 """
     resp = requests.post(
         f"https://api.github.com/repos/{repo}/pulls",
         json={"title": f"🤖 {commit_msg}", "head": branch,
-              "base": "main", "body": body},
+              "base": GIT_TARGET_BRANCH, "body": body},
         headers=_gh(token),
         timeout=30,
     )
     if resp.status_code in (200, 201):
         url = resp.json().get("html_url", "")
         print(f"[PR] ✓ Opened: {url}")
+        print(f"[PR]   {branch} → {GIT_TARGET_BRANCH}  (Git flow)")
         return url
-    print(f"[PR] Failed {resp.status_code}: {resp.text[:300]}", file=sys.stderr)
+    # 422 often means the target branch doesn't exist on GitHub yet
+    if resp.status_code == 422:
+        err = resp.json()
+        print(f"[PR] 422 error: {err}", file=sys.stderr)
+        print(f"[PR] Hint: Does '{GIT_TARGET_BRANCH}' exist on GitHub? "
+              f"Push it first or set GIT_TARGET_BRANCH=main as fallback.",
+              file=sys.stderr)
+    else:
+        print(f"[PR] Failed {resp.status_code}: {resp.text[:300]}", file=sys.stderr)
     return ""
 
 
@@ -841,6 +988,8 @@ def open_issue(token: str, repo: str, reason: str,
                 f"**Pipeline type:** `{pipeline_type or 'unknown'}`\n\n"
                 f"**Reason:** {reason}\n\n"
                 f"**Failed run:** {run_url}\n\n"
+                f"**Git flow reminder:** fix manually on `develop`, "
+                f"then follow release/* → main process.\n\n"
                 f"Please investigate, fix manually, and close this issue."
             ),
             "labels": ["bug", "needs-manual-fix"],
@@ -877,6 +1026,10 @@ def main():
     if not log_path.is_file():
         print(f"[ERROR] Log not found: {args.input}", file=sys.stderr)
         sys.exit(1)
+
+    print(f"[GIT FLOW] Base branch  : {GIT_BASE_BRANCH}")
+    print(f"[GIT FLOW] Target branch: {GIT_TARGET_BRANCH}")
+    print(f"[GIT FLOW] Flow: fix/* → {GIT_TARGET_BRANCH} → release/* → main")
 
     # ── Loop guards ───────────────────────────────────────────────────────────
     if last_commit_was_bot():
@@ -931,8 +1084,12 @@ def main():
     print(f"  confidence : {confidence:.0%}")
     print(f"  fixes      : {len(fixes)} file(s)")
     for fix in fixes:
-        print(f"    → {fix.get('file','?')}  ({len(fix.get('fixed_content',''))} chars)")
+        content_len = len(fix.get("fixed_content", ""))
+        print(f"    → {fix.get('file','?')}  ({content_len} chars)")
         print(f"      {fix.get('reason','')[:120]}")
+        if content_len < 50:
+            print(f"      ⚠ WARNING: fixed_content is very short ({content_len} chars) "
+                  f"— likely a truncated rewrite")
 
     if confidence < CONFIDENCE_MIN:
         print(f"[SKIP] Confidence {confidence:.0%} below threshold.")
@@ -974,7 +1131,14 @@ def main():
     if args.dry_run:
         print("\n━━━ DRY-RUN (no files written) ━━━━━━━━━━━━━━━━━━━━━━━━━")
         for fix in valid_fixes:
-            print(f"  would write {fix['file']} ({len(fix['fixed_content'])} chars)")
+            content = fix["fixed_content"]
+            print(f"  would write {fix['file']} ({len(content)} chars)")
+            # Show a preview of what would be written
+            preview_lines = content.splitlines()[:5]
+            for line in preview_lines:
+                print(f"    {line}")
+            if len(content.splitlines()) > 5:
+                print(f"    ... ({len(content.splitlines()) - 5} more lines)")
         sys.exit(0)
 
     # ══ STAGE 5: WRITE ═══════════════════════════════════════════════════════
@@ -1000,30 +1164,36 @@ def main():
     else:
         print("[TEST] Skipped (--skip-tests)")
 
-    # ══ STAGE 7: COMMIT ══════════════════════════════════════════════════════
-    print("\n━━━ STAGE 7: COMMIT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    # ══ STAGE 7: COMMIT (Git flow) ═══════════════════════════════════════════
+    print(f"\n━━━ STAGE 7: COMMIT (Git flow: fix/* → {GIT_TARGET_BRANCH}) ━━━━━")
     branch = commit_to_branch(commit_msg)
     if not branch:
         sys.exit(4)
 
     # ══ STAGE 8: PR ══════════════════════════════════════════════════════════
-    print("\n━━━ STAGE 8: PR ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"\n━━━ STAGE 8: PR (→ {GIT_TARGET_BRANCH}) ━━━━━━━━━━━━━━━━━━━━━━━━")
     pr_url = ""
     if token and repo:
         pr_url = open_pr(token, repo, branch, commit_msg, root_cause,
                          detected_type, tech_stacks, written, valid_fixes)
     else:
         print("[PR] No GITHUB_TOKEN — skipping.")
-        print(f"[PR] Merge manually: git checkout main && git merge {branch} && git push")
+        print(f"[PR] Merge manually: git checkout {GIT_TARGET_BRANCH} && "
+              f"git merge {branch} && git push")
 
     # ══ DONE ═════════════════════════════════════════════════════════════════
     print("\n━━━ ✅ DONE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print(f"  pipeline   : {detected_type}")
     print(f"  root cause : {root_cause}")
     print(f"  fixed      : {', '.join(written)}")
+    print(f"  branch     : {branch} → {GIT_TARGET_BRANCH}")
     print(f"  PR         : {pr_url or 'not created'}")
     print()
-    print("  Next: open PR → review diff → approve → CI re-runs automatically")
+    print(f"  Git flow next steps:")
+    print(f"    1. Review PR diff carefully (especially Dockerfile instructions)")
+    print(f"    2. Merge into '{GIT_TARGET_BRANCH}' if fix is correct")
+    print(f"    3. Release manager cuts release/* from '{GIT_TARGET_BRANCH}' when ready")
+    print(f"    4. release/* → main after QA sign-off + version tag")
 
 
 if __name__ == "__main__":
