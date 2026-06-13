@@ -1,4 +1,4 @@
-FROM invalid-image:latest
+FROM invalid-ime:latest
 
 
 
