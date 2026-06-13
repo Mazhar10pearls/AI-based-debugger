@@ -42,22 +42,25 @@ OLLAMA_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/v1/com
 OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL",   "qwen2.5-coder:3b")
 
 # ── Timeout strategy ──────────────────────────────────────────────────────────
-# Workflow timeout-minutes should be 30 in the YAML.
-# AI_TIMEOUT must be well under (workflow_timeout - overhead).
-# For CPU-only 3B model: a 6000-char prompt produces ~500 tokens output
-# in roughly 2-4 minutes on typical hardware. 240s gives headroom.
-AI_TIMEOUT    = 240   # seconds per Ollama attempt (was 300)
-MAX_RETRIES   = 2     # fewer retries — fail fast, open issue (was 3)
-RETRY_BACKOFF = [15, 30]  # seconds between retries (was [10,30,60])
+# Workflow timeout-minutes = 30. Budget breakdown:
+#   ~2 min  setup/checkout/logs
+#   ~8 min  Ollama (2 attempts × 210s + 20s backoff)
+#   ~2 min  git + PR
+#   ──────────────────────────────
+#   ~12 min expected | 30 min ceiling
+AI_TIMEOUT    = 210   # seconds per attempt — fits 2 retries in 30-min workflow
+MAX_RETRIES   = 2     # fail fast, open issue rather than burning budget
+RETRY_BACKOFF = [20, 20]
 
 # ── Prompt budget ─────────────────────────────────────────────────────────────
-# KEY INSIGHT: smaller prompts = faster inference on CPU.
-# 3B models reliably follow instructions up to ~6000 chars total prompt.
-# Beyond that, instruction-following degrades AND inference slows linearly.
-MAX_ERROR_LINES   = 20    # error lines extracted from CI log (was 25)
-MAX_FILE_CHARS    = 2500  # chars per file sent to AI (was 4000)
-MAX_TOTAL_CONTEXT = 6000  # total repo context chars (was 12000) — critical for speed
-MAX_FILES_FIXED   = 5     # max files AI can claim to fix (was 8)
+# qwen2.5-coder:3b on CPU: inference time ≈ 1s per 10 output tokens.
+# 2000 max_tokens output = ~200s at that rate — fits in 210s timeout.
+# Prompt size drives prefill time: each 1000 chars ≈ 5-10s prefill on CPU.
+# Hard ceiling: total prompt <= 7000 chars (~1750 tokens prefill).
+MAX_ERROR_LINES   = 15    # keep signal tight
+MAX_FILE_CHARS    = 1800  # per file — enough for Dockerfiles and small configs
+MAX_TOTAL_CONTEXT = 4500  # total repo context — primary speed knob
+MAX_FILES_FIXED   = 3     # 3B model handles 1-3 file fixes reliably
 
 # ── Safety ────────────────────────────────────────────────────────────────────
 CONFIDENCE_MIN   = 0.4
@@ -76,6 +79,16 @@ ALWAYS_BLOCKED = {".git", "auto-fixer.py", "self-healer.py"}
 BLOCKED_PATTERNS = [
     r"\.github/workflows/auto-fix.*\.ya?ml$",
     r"\.github/workflows/self-heal.*\.ya?ml$",
+]
+
+# ── Files to exclude from context discovery (not blocked from editing, just noisy) ──
+CONTEXT_EXCLUDE_PATTERNS = [
+    r"\.github/workflows/auto-fix.*\.ya?ml$",   # this workflow itself — not relevant
+    r"\.github/workflows/self-heal.*\.ya?ml$",
+    r"workflow-watcher\.py$",                    # monitoring scripts, not pipeline code
+    r"github-monitor\.py$",
+    r"ci-platform-poller\.py$",
+    r"quickstart\.py$",
 ]
 
 # ── Skip these directories when walking the repo ──────────────────────────────
@@ -334,6 +347,11 @@ def discover_context(error_signal: str,
             continue
         if not _is_text_file(path):
             continue
+        # Skip files that are never useful context (monitoring scripts, this workflow)
+        rel_str = str(path)
+        if any(re.search(p, rel_str) for p in CONTEXT_EXCLUDE_PATTERNS):
+            print(f"[DISCOVER] Excluded (noise filter): {rel_str}")
+            continue
         score = _score_file(path, error_signal, tech_stacks, pipeline_types)
         if score > 0:
             candidates.append((score, path))
@@ -401,13 +419,15 @@ def build_prompt(error_signal: str, repo_context: str,
         error_signal=error_signal,
         repo_context=repo_context,
     )
-    # Hard cap: if still over budget after context trimming, trim repo_context further
+    # Hard cap: total prompt <= 7000 chars (~1750 tokens).
+    # Beyond this, prefill time on CPU exceeds 30s and instruction-following degrades.
+    PROMPT_HARD_CAP = 7000
     full = SYSTEM_PROMPT + "\n\n" + user
-    if len(full) > 9000:
+    if len(full) > PROMPT_HARD_CAP:
         overhead = len(USER_PROMPT.format(
             pipeline_types="", tech_stacks="", error_signal=error_signal, repo_context=""))
-        allowed  = 9000 - len(SYSTEM_PROMPT) - overhead - 50
-        trimmed  = repo_context[:max(allowed, 1500)] + "\n...(trimmed for token budget)"
+        allowed  = PROMPT_HARD_CAP - len(SYSTEM_PROMPT) - overhead - 50
+        trimmed  = repo_context[:max(allowed, 1000)] + "\n...(trimmed for token budget)"
         user = USER_PROMPT.format(
             pipeline_types=", ".join(sorted(pipeline_types)) or "unknown",
             tech_stacks=", ".join(sorted(tech_stacks)) or "unknown",
@@ -418,86 +438,170 @@ def build_prompt(error_signal: str, repo_context: str,
     return user
 
 
+def _detect_ollama_endpoint() -> tuple[str, str]:
+    """
+    Auto-detect which Ollama API format the endpoint uses.
+    Returns (url, format) where format is 'openai' or 'native'.
+
+    Ollama exposes two APIs:
+      /v1/completions  — OpenAI-compatible. Streaming chunks look like:
+                         data: {"choices":[{"text":"..."}]}
+                         (SSE format — lines prefixed with "data: ")
+      /api/generate    — Native Ollama. Streaming chunks look like:
+                         {"response":"...","done":false}
+
+    The previous code used /v1/completions but parsed it as native JSON lines
+    without stripping the "data: " SSE prefix → got 0 chars from stream.
+    """
+    url = OLLAMA_API_URL.rstrip("/")
+    if "/api/generate" in url:
+        return url, "native"
+    if "/v1/completions" in url or "/v1/chat" in url:
+        return url, "openai"
+    # Fallback: probe the base
+    base = re.sub(r"/(v1|api)/.*$", "", url)
+    return f"{base}/api/generate", "native"
+
+
+def _extract_token(line: bytes, fmt: str) -> str:
+    """Extract the text token from one streamed line, handling both API formats."""
+    if not line:
+        return ""
+    try:
+        text = line.decode("utf-8", errors="replace").strip()
+        # OpenAI SSE format: lines start with "data: "
+        if text.startswith("data: "):
+            text = text[6:].strip()
+        if text in ("", "[DONE]"):
+            return ""
+        obj = json.loads(text)
+        if fmt == "openai":
+            # /v1/completions streaming chunk
+            return obj.get("choices", [{}])[0].get("text", "")
+        else:
+            # /api/generate native streaming chunk
+            return obj.get("response", "")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return ""
+
+
 def call_ai(error_signal: str, repo_context: str,
             pipeline_types: set, tech_stacks: set) -> str:
     """
-    Call Ollama with streaming to get incremental output.
-    This prevents the runner sitting idle waiting for a full batch response —
-    streaming lets us detect hangs early and gives GitHub Actions visible activity
-    (prevents the runner from thinking the job is stuck).
+    Call Ollama with auto-detected endpoint format and robust streaming.
+
+    Key fixes vs previous version:
+    1. Auto-detects /v1/completions (OpenAI SSE) vs /api/generate (native)
+       and strips the "data: " prefix that was silently dropping all tokens.
+    2. Falls back to reading full response body if stream yields 0 chars
+       (handles Ollama instances that ignore stream=true).
+    3. Heartbeat prints every 15s keep GitHub Actions from treating the
+       job as hung.
     """
-    user_prompt = build_prompt(error_signal, repo_context, pipeline_types, tech_stacks)
-    full_prompt = f"{SYSTEM_PROMPT}\n\n{user_prompt}"
+    user_prompt  = build_prompt(error_signal, repo_context, pipeline_types, tech_stacks)
+    full_prompt  = f"{SYSTEM_PROMPT}\n\n{user_prompt}"
+    endpoint, fmt = _detect_ollama_endpoint()
 
-    payload = {
-        "model":       OLLAMA_MODEL,
-        "prompt":      full_prompt,
-        "temperature": 0.05,   # near-zero = more deterministic = faster convergence
-        "max_tokens":  2000,   # was 4000 — 2000 is enough for 5 file fixes with small files
-        "stream":      True,   # STREAMING: get tokens as they arrive, not all at once
-    }
+    # Build payload for whichever API format
+    if fmt == "openai":
+        payload = {
+            "model":       OLLAMA_MODEL,
+            "prompt":      full_prompt,
+            "temperature": 0.05,
+            "max_tokens":  2000,
+            "stream":      True,
+        }
+    else:  # native /api/generate
+        payload = {
+            "model":   OLLAMA_MODEL,
+            "prompt":  full_prompt,
+            "options": {"temperature": 0.05, "num_predict": 2000},
+            "stream":  True,
+        }
 
-    print(f"[AI] Prompt: {len(full_prompt)} chars (~{len(full_prompt)//4} tokens)")
-    print(f"[AI] Model: {OLLAMA_MODEL} | timeout: {AI_TIMEOUT}s | max_tokens: 2000")
+    print(f"[AI] Endpoint : {endpoint} (format: {fmt})")
+    print(f"[AI] Prompt   : {len(full_prompt)} chars (~{len(full_prompt)//4} tokens)")
+    print(f"[AI] Model    : {OLLAMA_MODEL} | timeout: {AI_TIMEOUT}s | max_tokens: 2000")
 
     last_exc = None
     for attempt in range(MAX_RETRIES):
         try:
-            print(f"[AI] Attempt {attempt+1}/{MAX_RETRIES} — streaming...")
-            t_start = time.time()
+            print(f"[AI] Attempt {attempt+1}/{MAX_RETRIES} — streaming from {fmt} endpoint...")
+            t_start    = time.time()
+            last_print = t_start
+            collected  = []
 
             resp = requests.post(
-                OLLAMA_API_URL,
+                endpoint,
                 json=payload,
-                timeout=AI_TIMEOUT,
+                timeout=(10, AI_TIMEOUT),  # (connect_timeout, read_timeout)
                 stream=True,
             )
             resp.raise_for_status()
 
-            # Collect streamed chunks — each chunk is a JSON line
-            collected = []
-            last_print = t_start
-            for raw_line in resp.iter_lines(chunk_size=64):
-                if not raw_line:
-                    continue
-                try:
-                    chunk = json.loads(raw_line)
-                    token = chunk.get("choices", [{}])[0].get("text", "")
+            for raw_line in resp.iter_lines():
+                token = _extract_token(raw_line, fmt)
+                if token:
                     collected.append(token)
-                    # Print a heartbeat dot every 10s so GitHub Actions
-                    # knows the runner is alive
-                    now = time.time()
-                    if now - last_print > 10:
-                        elapsed = int(now - t_start)
-                        print(f"[AI] ...generating ({elapsed}s elapsed, "
-                              f"{sum(len(t) for t in collected)} chars so far)")
-                        last_print = now
-                except json.JSONDecodeError:
-                    continue
+
+                now = time.time()
+                if now - last_print > 15:
+                    elapsed = int(now - t_start)
+                    chars_so_far = sum(len(t) for t in collected)
+                    print(f"[AI] ...generating ({elapsed}s | {chars_so_far} chars collected)")
+                    last_print = now
 
             raw = "".join(collected).strip()
             elapsed = time.time() - t_start
             print(f"[AI] Done in {elapsed:.1f}s — {len(raw)} chars received")
+
+            # If streaming yielded nothing, try reading body as a single
+            # non-streamed response (some Ollama builds ignore stream=true)
+            if not raw:
+                print("[AI] Stream yielded 0 chars — attempting batch response parse...")
+                try:
+                    body = resp.json()
+                    if fmt == "openai":
+                        raw = body.get("choices", [{}])[0].get("text", "").strip()
+                    else:
+                        raw = body.get("response", "").strip()
+                    print(f"[AI] Batch fallback: {len(raw)} chars")
+                except Exception:
+                    pass
+
+            if not raw:
+                raise RuntimeError(
+                    "Ollama returned an empty response. "
+                    "Check: model is loaded (`ollama ps`), endpoint URL is correct, "
+                    "and Ollama process is healthy."
+                )
+
             print(f"[AI] Preview: {raw[:400]}{'...' if len(raw) > 400 else ''}")
             return raw
 
         except requests.exceptions.Timeout as exc:
             last_exc = exc
-            elapsed = time.time() - t_start
-            wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+            elapsed  = time.time() - t_start
+            wait     = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
             print(f"[AI] Timeout after {elapsed:.0f}s on attempt {attempt+1}. "
                   f"Waiting {wait}s before retry...")
             if attempt < MAX_RETRIES - 1:
                 time.sleep(wait)
 
+        except requests.exceptions.ConnectionError as exc:
+            raise RuntimeError(
+                f"Cannot connect to Ollama at {endpoint}. "
+                f"Is Ollama running on the self-hosted runner? Error: {exc}"
+            )
+
         except requests.exceptions.RequestException as exc:
-            raise RuntimeError(f"Cannot reach Ollama at {OLLAMA_API_URL}: {exc}")
+            raise RuntimeError(f"Ollama request failed: {exc}")
 
     raise RuntimeError(
-        f"Ollama timed out after {MAX_RETRIES} attempts ({AI_TIMEOUT}s each). "
+        f"Ollama did not respond after {MAX_RETRIES} attempts ({AI_TIMEOUT}s each). "
         f"Last error: {last_exc}. "
-        f"Consider: 1) increase timeout-minutes in workflow YAML to 30, "
-        f"2) reduce MAX_TOTAL_CONTEXT, 3) use a faster model."
+        f"Tips: reduce MAX_TOTAL_CONTEXT further, use qwen2.5-coder:1.5b, "
+        f"or increase workflow timeout-minutes."
     )
 
 
@@ -962,7 +1066,8 @@ def main():
 
     print(f"[GIT FLOW] Base: {GIT_BASE_BRANCH} | Target: {GIT_TARGET_BRANCH}")
     print(f"[TIMING]   AI timeout: {AI_TIMEOUT}s × {MAX_RETRIES} retries | "
-          f"Context budget: {MAX_TOTAL_CONTEXT} chars")
+          f"Context budget: {MAX_TOTAL_CONTEXT} chars | Hard prompt cap: 7000 chars")
+    t0 = time.time()
 
     if last_commit_was_bot():
         sys.exit(0)
@@ -979,9 +1084,11 @@ def main():
 
     # ══ STAGE 1: DETECT ══════════════════════════════════════════════════════
     print("\n━━━ STAGE 1: DETECT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    t1 = time.time()
     log_text     = log_path.read_text(encoding="utf-8", errors="replace")
     error_signal = extract_error_signal(log_text)
     pipeline_types, tech_stacks = fingerprint_pipeline(log_text)
+    print(f"[TIMING] Stage 1 done in {time.time()-t1:.1f}s")
 
     if not error_signal.strip():
         print("[DETECT] No error signal found — nothing to fix.")
@@ -989,10 +1096,13 @@ def main():
 
     # ══ STAGE 2: DISCOVER ════════════════════════════════════════════════════
     print("\n━━━ STAGE 2: DISCOVER ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    t2 = time.time()
     repo_context, included = discover_context(error_signal, tech_stacks, pipeline_types)
+    print(f"[TIMING] Stage 2 done in {time.time()-t2:.1f}s")
 
     # ══ STAGE 3: ANALYSE ═════════════════════════════════════════════════════
     print("\n━━━ STAGE 3: ANALYSE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    t3 = time.time()
     try:
         raw     = call_ai(error_signal, repo_context, pipeline_types, tech_stacks)
         ai_data = parse_ai_response(raw)
@@ -1002,6 +1112,7 @@ def main():
             open_issue(token, repo, f"AI analysis failed: {exc}",
                        pipeline_type=", ".join(pipeline_types))
         sys.exit(2)
+    print(f"[TIMING] Stage 3 done in {time.time()-t3:.1f}s")
 
     root_cause    = ai_data.get("root_cause",    "unknown")
     confidence    = float(ai_data.get("confidence", 1.0))
