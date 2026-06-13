@@ -1,8 +1,6 @@
-FROM python:3.11-slim
+FROM python:3.1-s
 
-LABEL maintainer="Your Name" \
-      version="1.0" \
-      description="AI-based debugger sample Flask application"
+
 
 WORKDIR /app
 
