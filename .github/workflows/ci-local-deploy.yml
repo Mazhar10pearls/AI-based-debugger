@@ -1,32 +1,44 @@
 name: Local CI/CD Deploy
 
+# ── Git flow ────────────────────────────────────────────────────────────────
+# build + test  → runs on every push/PR to main & develop (and feature→develop PRs)
+# deploy        → ONLY on push to main (the box has one app + one port 5000)
+#
+#   feature/* ──PR──► develop ──► release/* ──► main ──► (deploy)
+#                       │            │            └─ deploy + tag
+#                       └ build+test └ build+test (no deploy)
+#
+# Why split: building on every branch catches Dockerfile/test breakage BEFORE
+# merge, but only main may bind :5000 and run a container — otherwise two
+# branches racing on an 8GB single-box runner collide on the port and on RAM.
 on:
   push:
-    branches:
-      - main
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
   workflow_dispatch:
 
+# Cancel an in-flight run of the SAME ref when a newer commit lands.
 concurrency:
   group: local-ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
-  build-and-deploy:
-    name: Build, Test, and Deploy Local App
+  build-test-deploy:
+    name: Build, Test, and (main only) Deploy
     runs-on: self-hosted
 
     steps:
-      # -------------------------
-      # Checkout Code
-      # -------------------------
+      # ── Checkout ─────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # -------------------------
-      # Python Setup
-      # -------------------------
+      # ── Python ───────────────────────────────────────────────────────────
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -37,72 +49,59 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r sample_app/requirements.txt
 
-      # -------------------------
-      # Run Tests
-      # -------------------------
+      # ── Test (always) ────────────────────────────────────────────────────
       - name: Run unit tests
-        run: |
-          pytest sample_app/test_app.py
+        run: pytest sample_app/test_app.py
 
-      # -------------------------
-      # Docker Setup
-      # -------------------------
+      # ── Build (always — validates the Dockerfile on every branch) ─────────
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # -------------------------
-      # Build Docker Image (Production-safe)
-      # -------------------------
       - name: Build Docker image
         run: |
           docker buildx build \
             --platform linux/amd64 \
-            -t ai-devops-sample-app \
+            -t ai-devops-sample-app:${{ github.sha }} \
+            -t ai-devops-sample-app:latest \
             --load \
             .
 
-      # -------------------------
-      # Stop Old Container (safe cleanup)
-      # -------------------------
+      # ── Deploy (main + push only) ─────────────────────────────────────────
+      # Every deploy step is gated so PRs and develop pushes stop after build.
       - name: Stop existing container
-        run: |
-          docker rm -f ai-devops-sample-app || true
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: docker rm -f ai-devops-sample-app || true
 
-      # -------------------------
-      # Run New Container
-      # -------------------------
       - name: Start container
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         run: |
           docker run -d \
             --name ai-devops-sample-app \
             -p 5000:5000 \
             --restart unless-stopped \
-            ai-devops-sample-app
+            ai-devops-sample-app:${{ github.sha }}
 
-      # -------------------------
-      # Health Check (Production-grade)
-      # -------------------------
       - name: Wait for app to be healthy
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         run: |
           echo "Waiting for application to start..."
-
           for i in {1..20}; do
             if curl -fs http://127.0.0.1:5000 > /dev/null; then
               echo "Application is healthy!"
               exit 0
             fi
-
             echo "Not ready yet... retrying ($i/20)"
             sleep 3
           done
-
           echo "Application failed health check"
           docker logs ai-devops-sample-app
           exit 1
 
-      # -------------------------
-      # Final Verification
-      # -------------------------
       - name: Verify deployment
-        run: |
-          curl -f http://127.0.0.1:5000
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: curl -f http://127.0.0.1:5000
+
+      # ── Housekeeping: drop old image tags so the 8GB box doesn't fill up ──
+      - name: Prune dangling images
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: docker image prune -f || true

@@ -13,9 +13,19 @@ on:
     types:
       - completed
 
+# ── Serialize inference on the single 8GB box ───────────────────────────────
+# Only one auto-fix (= one Ollama inference) may run at a time. cancel-in-progress
+# is false so a fix already mid-flight is never killed by a newer failure.
+# NOTE: this box has 2 runners on 8GB. If a main-CI build and an auto-fix ever
+# overlap you risk OOM — either run a single runner here, or set
+# OLLAMA_NUM_PARALLEL=1 / OLLAMA_MAX_LOADED_MODELS=1 on the Ollama systemd unit.
+concurrency:
+  group: ollama-auto-fix
+  cancel-in-progress: false
+
 jobs:
   auto-fix:
-    # Only run if CI failed AND the commit was NOT made by the bot
+    # Run only if CI failed AND the failing commit was NOT the bot (loop guard).
     if: |
       github.event.workflow_run.conclusion == 'failure' &&
       github.event.workflow_run.head_commit.author.name != 'github-actions[bot]'
@@ -23,25 +33,36 @@ jobs:
     name: Auto-Fix Failed Workflow
     runs-on: [self-hosted, linux, ai-runner]
     environment: prod
-    # ── CRITICAL FIX ─────────────────────────────────────────────────────────
-    # Was 15 — killed the job before Ollama could finish.
-    # Breakdown of 30-minute budget:
-    #   ~1 min  : checkout + pip install + git setup
-    #   ~1 min  : download + extract failure logs
-    #   ~2 min  : repo file discovery + scoring
-    #   ~8 min  : Ollama inference (2 attempts × 240s + 15s backoff)
-    #   ~1 min  : validate + write + tests
-    #   ~1 min  : git commit + push + open PR
-    #   ─────────────────────────────────────────────────────────────
-    #   ~14 min : expected | 30 min : hard ceiling with headroom
+    # 30-min budget:
+    #   ~2 min  checkout + pip + git setup + log download
+    #   ~2 min  repo discovery + scoring
+    #   ~7 min  Ollama inference (2 attempts × 210s + 20s backoff)
+    #   ~2 min  validate + write + git + PR
+    #   ─────────────────────────────────────────────
+    #   ~13 min expected | 30 min hard ceiling
     timeout-minutes: 30
 
     steps:
-      - name: Checkout repository
+      # ── Resolve the branch that actually failed (branch-aware git flow) ───
+      # The fix must branch off, and PR back to, the SAME branch the failure
+      # happened on — not a hardcoded 'develop'. A main failure → fix PR to
+      # main; a develop failure → fix PR to develop.
+      - name: Resolve originating branch
+        id: src
+        run: |
+          BRANCH="${{ github.event.workflow_run.head_branch }}"
+          if [ -z "$BRANCH" ]; then
+            echo "No head_branch on the event — cannot proceed."
+            exit 1
+          fi
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Originating (failed) branch: $BRANCH"
+
+      - name: Checkout originating branch
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ vars.GIT_BASE_BRANCH || 'develop' }}
+          ref: ${{ steps.src.outputs.branch }}
           token: ${{ secrets.GH_PAT }}
 
       - name: Set up Python
@@ -69,8 +90,7 @@ jobs:
           python3 - <<'PY'
           import json, os, pathlib, requests, zipfile, sys
 
-          event_path = os.environ['GITHUB_EVENT_PATH']
-          with open(event_path, 'r', encoding='utf-8') as f:
+          with open(os.environ['GITHUB_EVENT_PATH'], 'r', encoding='utf-8') as f:
               event = json.load(f)
 
           run_id    = event['workflow_run']['id']
@@ -79,7 +99,7 @@ jobs:
               'Authorization': f"Bearer {os.environ['GH_PAT']}",
               'Accept': 'application/vnd.github+json'
           }
-          url = f'https://api.github.com/repos/{repo_full}/actions/runs/{run_id}/logs'
+          url  = f'https://api.github.com/repos/{repo_full}/actions/runs/{run_id}/logs'
           resp = requests.get(url, headers=headers, timeout=120)
           if resp.status_code != 200:
               print(f'Failed to download logs: HTTP {resp.status_code}', file=sys.stderr)
@@ -117,44 +137,55 @@ jobs:
           git remote set-url origin \
             "https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ github.repository }}.git"
 
-      # ── Smoke-test: verify Ollama is reachable before spending time on logs ─
+      # ── Smoke-test: Ollama reachable before spending time on logs ─────────
       - name: Verify Ollama is reachable
         env:
           OLLAMA_API_URL: ${{ secrets.OLLAMA_API_URL }}
         run: |
-          # Strip /v1/completions suffix to get base URL for health check
-          BASE_URL=$(echo "$OLLAMA_API_URL" | sed 's|/v1/completions||' | sed 's|/api/generate||')
+          BASE_URL=$(echo "$OLLAMA_API_URL" \
+            | sed 's|/v1/completions||; s|/v1/chat/completions||; s|/api/generate||; s|/*$||')
           echo "Checking Ollama at: $BASE_URL"
           HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$BASE_URL" || echo "000")
           if [ "$HTTP_CODE" = "000" ]; then
-            echo "❌ Ollama unreachable at $BASE_URL — aborting to save timeout budget"
+            echo "❌ Ollama unreachable at $BASE_URL — aborting to save budget"
             exit 1
           fi
           echo "✓ Ollama responded (HTTP $HTTP_CODE)"
 
       - name: Run auto-fixer
         env:
-          OLLAMA_API_URL:     ${{ secrets.OLLAMA_API_URL }}
+          OLLAMA_API_URL_RAW: ${{ secrets.OLLAMA_API_URL }}
           OLLAMA_MODEL:       ${{ secrets.OLLAMA_MODEL }}
           GITHUB_TOKEN:       ${{ secrets.GH_PAT }}
           GITHUB_REPOSITORY:  ${{ github.repository }}
-          GIT_BASE_BRANCH:    ${{ vars.GIT_BASE_BRANCH || 'develop' }}
-          GIT_TARGET_BRANCH:  ${{ vars.GIT_TARGET_BRANCH || 'develop' }}
-        run: python3 auto-fixer.py --input failure.log --skip-tests
+          # Branch-aware: base AND target are the branch that failed.
+          GIT_BASE_BRANCH:    ${{ steps.src.outputs.branch }}
+          GIT_TARGET_BRANCH:  ${{ steps.src.outputs.branch }}
+        run: |
+          # Force the native /api/generate endpoint so the JSON-schema `format`
+          # constraint applies (it is flaky on /v1/completions). Works no matter
+          # how the OLLAMA_API_URL secret is written.
+          BASE=$(echo "$OLLAMA_API_URL_RAW" \
+            | sed 's|/v1/completions||; s|/v1/chat/completions||; s|/api/generate||; s|/*$||')
+          export OLLAMA_API_URL="$BASE/api/generate"
+          echo "Using Ollama endpoint: $OLLAMA_API_URL"
+          echo "Git flow → fix/* off '$GIT_BASE_BRANCH', PR targets '$GIT_TARGET_BRANCH'"
+          python3 auto-fixer.py --input failure.log --skip-tests
 
-      # ── If auto-fixer could not fix it → open a GitHub Issue ─────────────
+      # ── If the fixer could not fix it → open an Issue ─────────────────────
       - name: Open issue if fixer failed
         if: failure()
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           gh issue create \
-            --title "🚨 Auto-fixer could not fix CI failure — manual review needed" \
+            --title "🚨 Auto-fixer could not fix CI failure on '${{ steps.src.outputs.branch }}' — manual review" \
             --body "The auto-fixer ran but could not produce a valid patch.
 
-          **Git flow reminder:**
-          - Fix manually on \`develop\` branch (never directly on \`main\`)
-          - When ready: create \`release/*\` from \`develop\` → QA → merge to \`main\` + tag
+          **Failed branch:** \`${{ steps.src.outputs.branch }}\`
+          **Failed run:** ${{ github.event.workflow_run.html_url }}
 
-          **Failed run:** ${{ github.event.workflow_run.html_url }}" \
+          **Git flow reminder:**
+          - Fix manually on the branch above.
+          - Promote via: develop → release/* → main (+ tag) after QA." \
             --label "bug" || true

@@ -15,6 +15,17 @@ No hardcoded file paths. The system:
   7. COMMIT    — Push to fix/<timestamp> branch off develop (Git flow)
   8. PR        — Open Pull Request targeting develop; human reviews before merge
 
+Tuned for a CPU-only 3B model (qwen2.5-coder:3b) on an 8GB host:
+  - Output is GRAMMAR-CONSTRAINED to a JSON schema (Ollama `format`), so even a
+    3B physically cannot emit malformed JSON or wrong key names.
+  - Context discovery FORCE-INCLUDES files explicitly named in the failure log
+    (tracebacks, path:line errors, Dockerfile steps) before any score-based
+    guess. The #1 cause of a bad fix is the broken file never reaching the
+    prompt — this closes that gap.
+  - Files are included WHOLE (never head+tail truncated), because the model is
+    asked to output the COMPLETE file and would otherwise faithfully reproduce
+    only the half it was shown.
+
 Exit codes:
   0 — success or loop guard
   1 — log file not found
@@ -38,29 +49,24 @@ import requests
 import yaml
 
 # ── Ollama config ──────────────────────────────────────────────────────────────
-OLLAMA_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/v1/completions")
+# NOTE: prefer the native /api/generate endpoint — the JSON-schema `format`
+# constraint below is rock-solid there and flaky on /v1/completions.
+OLLAMA_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/api/generate")
 OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL",   "qwen2.5-coder:3b")
 
 # ── Timeout strategy ──────────────────────────────────────────────────────────
-# Workflow timeout-minutes = 30. Budget breakdown:
-#   ~2 min  setup/checkout/logs
-#   ~8 min  Ollama (2 attempts × 210s + 20s backoff)
-#   ~2 min  git + PR
-#   ──────────────────────────────
-#   ~12 min expected | 30 min ceiling
 AI_TIMEOUT    = 210   # seconds per attempt — fits 2 retries in 30-min workflow
 MAX_RETRIES   = 2     # fail fast, open issue rather than burning budget
 RETRY_BACKOFF = [20, 20]
 
-# ── Prompt budget ─────────────────────────────────────────────────────────────
-# qwen2.5-coder:3b on CPU: inference time ≈ 1s per 10 output tokens.
-# 2000 max_tokens output = ~200s at that rate — fits in 210s timeout.
-# Prompt size drives prefill time: each 1000 chars ≈ 5-10s prefill on CPU.
-# Hard ceiling: total prompt <= 7000 chars (~1750 tokens prefill).
-MAX_ERROR_LINES   = 15    # keep signal tight
-MAX_FILE_CHARS    = 1800  # per file — enough for Dockerfiles and small configs
-MAX_TOTAL_CONTEXT = 4500  # total repo context — primary speed knob
-MAX_FILES_FIXED   = 3     # 3B model handles 1-3 file fixes reliably
+# ── Prompt / context budget (tuned for a CPU 3B) ────────────────────────────────
+# A 3B does BETTER with 2 complete files than 3 partial ones. We never truncate
+# a file mid-body, because the model is asked to reproduce the whole file.
+MAX_ERROR_LINES   = 12    # keep signal tight
+MAX_FILE_CHARS    = 2600  # per file — real Dockerfiles/requirements/package.json fit WHOLE
+MAX_TOTAL_CONTEXT = 5200  # total repo context
+MAX_CONTEXT_FILES = 2     # hard cap on files shown to the model
+MAX_FILES_FIXED   = 3     # ceiling on files the AI may rewrite (rarely binding now)
 
 # ── Safety ────────────────────────────────────────────────────────────────────
 CONFIDENCE_MIN   = 0.4
@@ -74,21 +80,23 @@ BOT_PREFIX = "fix:"
 GIT_BASE_BRANCH   = os.environ.get("GIT_BASE_BRANCH",   "develop")
 GIT_TARGET_BRANCH = os.environ.get("GIT_TARGET_BRANCH", "develop")
 
-# ── Paths the AI must never touch ─────────────────────────────────────────────
+# ── Files the AI must never touch ─────────────────────────────────────────────
 ALWAYS_BLOCKED = {".git", "auto-fixer.py", "self-healer.py"}
 BLOCKED_PATTERNS = [
     r"\.github/workflows/auto-fix.*\.ya?ml$",
     r"\.github/workflows/self-heal.*\.ya?ml$",
 ]
 
-# ── Files to exclude from context discovery (not blocked from editing, just noisy) ──
+# ── Files to exclude from context discovery (noisy, never the culprit) ─────────
 CONTEXT_EXCLUDE_PATTERNS = [
-    r"\.github/workflows/auto-fix.*\.ya?ml$",   # this workflow itself — not relevant
+    r"\.github/workflows/auto-fix.*\.ya?ml$",   # this workflow itself
     r"\.github/workflows/self-heal.*\.ya?ml$",
-    r"workflow-watcher\.py$",                    # monitoring scripts, not pipeline code
+    r"workflow-watcher\.py$",
     r"github-monitor\.py$",
     r"ci-platform-poller\.py$",
     r"quickstart\.py$",
+    r"auto-fixer\.py$",                          # never feed ourselves back in
+    r"self-healer\.py$",
 ]
 
 # ── Skip these directories when walking the repo ──────────────────────────────
@@ -100,6 +108,38 @@ SKIP_DIRS = {
 }
 
 MAX_FILE_SIZE_BYTES = 100_000
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STRUCTURED OUTPUT SCHEMA
+# ══════════════════════════════════════════════════════════════════════════════
+# Ollama constrains generation to this schema via grammar at the sampler level,
+# so even a 3B CANNOT emit malformed JSON or wrong key names. This removes the
+# entire class of failures that _normalize_fix_keys / the brace-repair loop
+# existed to patch.
+FIX_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "pipeline_type":  {"type": "string"},
+        "root_cause":     {"type": "string"},
+        "confidence":     {"type": "number"},
+        "commit_message": {"type": "string"},
+        "fixes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "file":          {"type": "string"},
+                    "reason":        {"type": "string"},
+                    "fixed_content": {"type": "string"},
+                },
+                "required": ["file", "reason", "fixed_content"],
+            },
+        },
+    },
+    "required": ["pipeline_type", "root_cause", "confidence",
+                 "commit_message", "fixes"],
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -211,8 +251,8 @@ ERROR_KEYWORDS = [
     "undefined", "permission denied", "command not found",
     "returned non-zero", "syntaxerror", "importerror",
     "nameerror", "typeerror", "valueerror", "attributeerror",
-    "no module named", "not found", "not implemented",
-    "media type", "containerd", "docker daemon",
+    "modulenotfounderror", "no module named", "not found",
+    "not implemented", "media type", "containerd", "docker daemon",
     "no such image", "pull access denied", "manifest",
     "could not find", "no matching", "requirement",
     "assert", "test failed", "compilation", "linker",
@@ -234,12 +274,21 @@ NOISE_KEYWORDS = [
     "allow-prereleases", "freethreaded", "submodule foreach",
 ]
 
+# Lines that point AT a file are valuable signal even without an error keyword
+# (e.g. a traceback's `File "..."` line carries no keyword but names the culprit).
+FILE_REF_HINTS = [
+    re.compile(r'File "[^"]+"'),
+    re.compile(r'[\w./\-]+\.[A-Za-z0-9]+:\d+'),
+    re.compile(r'\bDockerfile(\.\w+)?\b'),
+]
+
 
 def extract_error_signal(log_text: str) -> str:
-    lines    = log_text.splitlines()
+    lines = log_text.splitlines()
     relevant = [
         l.strip() for l in lines
-        if any(k in l.lower() for k in ERROR_KEYWORDS)
+        if (any(k in l.lower() for k in ERROR_KEYWORDS)
+            or any(h.search(l) for h in FILE_REF_HINTS))
         and not any(n in l.lower() for n in NOISE_KEYWORDS)
         and l.strip()
     ]
@@ -258,6 +307,78 @@ def extract_error_signal(log_text: str) -> str:
 # STAGE 2 — DISCOVER
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Patterns that reliably point at the file responsible for a failure. These are
+# scanned across the WHOLE log (not the truncated signal) and force-included in
+# context first — because the single biggest reason a fix fails is the broken
+# file never reaching the prompt.
+REFERENCED_PATH_PATTERNS = [
+    r'File "([^"]+\.\w+)"',                          # Python traceback
+    r'([\w./\-]+\.[A-Za-z0-9]+):\d+(?::\d+)?',       # path:line[:col] (compilers, linters, go, rust)
+    r'((?:[\w./\-]+/)?Dockerfile(?:\.\w+)?)\b',      # Dockerfile / Dockerfile.prod / sub/dir/Dockerfile
+    r'\(([^()]+\.\w+):\d+:\d+\)',                    # node stack frame: (/path/file.js:10:5)
+    r'([\w./\-]+/requirements[\w.\-]*\.txt)',        # pip requirements
+    r'(?:in|from|at|open|loading)\s+([\w./\-]+\.[A-Za-z0-9]+)',  # "in <path>" / "from <path>"
+]
+
+
+def _basename_blocked(name: str) -> bool:
+    return name in ALWAYS_BLOCKED
+
+
+def extract_referenced_paths(log_text: str, repo_root: Path = Path(".")) -> list[str]:
+    """
+    Pull explicit file references out of the failure log and resolve them to
+    real files in the repo. This is the most reliable 'which file is broken'
+    signal — far better than keyword scoring — so these are force-included in
+    context regardless of score. Returns an ordered, de-duplicated list of
+    repo-relative paths, most-referenced first.
+    """
+    raw_hits: list[str] = []
+    for pat in REFERENCED_PATH_PATTERNS:
+        for m in re.finditer(pat, log_text):
+            cand = m.group(1).strip().strip("'\"")
+            if cand:
+                raw_hits.append(cand)
+
+    # Index repo files by basename once so we can resolve references that show
+    # up with absolute runner paths (e.g. /home/runner/work/repo/repo/app.py).
+    repo_files: dict[str, list[str]] = {}
+    for p in repo_root.rglob("*"):
+        if p.is_file() and not any(part in SKIP_DIRS for part in p.parts):
+            repo_files.setdefault(p.name, []).append(str(p))
+
+    # Count references so the most-mentioned file wins the first slot.
+    order: list[str] = []
+    counts: dict[str, int] = {}
+
+    def _add(rel: str):
+        rel = rel.lstrip("./")
+        if _basename_blocked(Path(rel).name):
+            return
+        if any(re.search(pp, rel) for pp in CONTEXT_EXCLUDE_PATTERNS):
+            return
+        if rel not in counts:
+            order.append(rel)
+        counts[rel] = counts.get(rel, 0) + 1
+
+    for hit in raw_hits:
+        hit_norm = hit.lstrip("./")
+        # 1. exact relative-path match
+        if Path(hit_norm).is_file():
+            _add(hit_norm)
+            continue
+        # 2. basename match (handles absolute/runner paths in the log)
+        for rel in repo_files.get(Path(hit).name, []):
+            _add(rel)
+
+    resolved = sorted(order, key=lambda r: -counts[r])
+    if resolved:
+        print(f"[DISCOVER] Referenced in log → force-include candidates: {resolved}")
+    else:
+        print("[DISCOVER] No explicit file paths found in log — relying on scoring")
+    return resolved
+
+
 def _is_text_file(path: Path) -> bool:
     try:
         if path.stat().st_size > MAX_FILE_SIZE_BYTES:
@@ -267,23 +388,35 @@ def _is_text_file(path: Path) -> bool:
         return False
 
 
-def _read_smart(path: Path) -> str:
+def _read_whole(path: Path):
     """
-    Read file content intelligently:
-    - For small files: full content
-    - For large files: head + tail to preserve structure
-    Capped at MAX_FILE_CHARS for prompt budget control.
+    Return the file's COMPLETE content, or None if it exceeds MAX_FILE_CHARS.
+    We never truncate: the prompt asks for a COMPLETE rewrite, and the model
+    reproduces only what it saw. Files we actually fix (Dockerfile,
+    requirements.txt, package.json, small apps) fit comfortably; oversized
+    source files are skipped rather than shown broken.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        return None if len(raw) > MAX_FILE_CHARS else raw
+    except Exception as exc:
+        return f"(unreadable: {exc})"
+
+
+def _read_clamped(path: Path) -> str:
+    """
+    Head+tail view, used ONLY for a force-included file that is too large to
+    show whole. Better to show a known-broken file partially than not at all,
+    but completeness validation may then reject a truncated rewrite — that's an
+    acceptable, visible failure rather than a silent missing-context one.
     """
     try:
         raw = path.read_text(encoding="utf-8", errors="replace")
         if len(raw) <= MAX_FILE_CHARS:
             return raw
-        # Keep head + tail so AI sees both top-level declarations and bottom content
         half = MAX_FILE_CHARS // 2
-        head = raw[:half]
-        tail = raw[-half:]
         omitted = len(raw) - MAX_FILE_CHARS
-        return head + f"\n... ({omitted} chars omitted) ...\n" + tail
+        return raw[:half] + f"\n... ({omitted} chars omitted) ...\n" + raw[-half:]
     except Exception as exc:
         return f"(unreadable: {exc})"
 
@@ -291,7 +424,6 @@ def _read_smart(path: Path) -> str:
 def _score_file(path: Path, error_signal: str,
                 tech_stacks: set[str], pipeline_types: set[str]) -> int:
     name    = path.name.lower()
-    rel     = str(path).lower()
     err_low = error_signal.lower()
     score   = 0
 
@@ -299,7 +431,7 @@ def _score_file(path: Path, error_signal: str,
             and path.suffix in WORKFLOW_EXTENSIONS:
         score += 30
 
-    if path.name.lower() in err_low or str(path).lower() in err_low:
+    if name in err_low or str(path).lower() in err_low:
         score += 50
 
     for stack in tech_stacks:
@@ -336,43 +468,68 @@ def _score_file(path: Path, error_signal: str,
 
 def discover_context(error_signal: str,
                      tech_stacks: set[str],
-                     pipeline_types: set[str]) -> tuple[str, list[str]]:
-    repo_root  = Path(".")
-    candidates: list[tuple[int, Path]] = []
-
-    for path in repo_root.rglob("*"):
-        if path.is_dir():
-            continue
-        if any(part in SKIP_DIRS for part in path.parts):
-            continue
-        if not _is_text_file(path):
-            continue
-        # Skip files that are never useful context (monitoring scripts, this workflow)
-        rel_str = str(path)
-        if any(re.search(p, rel_str) for p in CONTEXT_EXCLUDE_PATTERNS):
-            print(f"[DISCOVER] Excluded (noise filter): {rel_str}")
-            continue
-        score = _score_file(path, error_signal, tech_stacks, pipeline_types)
-        if score > 0:
-            candidates.append((score, path))
-
-    candidates.sort(key=lambda x: (-x[0], len(str(x[1]))))
-
+                     pipeline_types: set[str],
+                     forced_paths: list[str]) -> tuple[str, list[str]]:
     parts, included, total = [], [], 0
 
-    for score, path in candidates:
-        rel     = str(path)
-        content = _read_smart(path)
-        block   = f"### {rel}\n```\n{content}\n```"
-
-        if total + len(block) > MAX_TOTAL_CONTEXT:
-            print(f"[DISCOVER] Budget reached — skipping {rel} (score={score})")
-            continue
-
+    def _try_add(rel: str, content: str, label: str) -> bool:
+        nonlocal total
+        block = f"### {rel}\n```\n{content}\n```"
+        if total + len(block) > MAX_TOTAL_CONTEXT and included:
+            print(f"[DISCOVER] Budget reached — skipping {rel}")
+            return False
         parts.append(block)
         included.append(rel)
         total += len(block)
-        print(f"[DISCOVER] Included {rel} (score={score}, {len(content)} chars)")
+        print(f"[DISCOVER] {label} {rel} ({len(content)} chars)")
+        return True
+
+    # ── 1. FORCE-INCLUDE files explicitly named in the failure log ────────────
+    #     These take priority over any scored guess. This is the core fix for
+    #     'model forgot the context it needed'.
+    for rel in forced_paths:
+        if len(included) >= MAX_CONTEXT_FILES:
+            break
+        p = Path(rel)
+        if not (p.is_file() and _is_text_file(p)):
+            continue
+        content = _read_whole(p)
+        if content is None:
+            content = _read_clamped(p)
+            print(f"[DISCOVER] ⚠ {rel} exceeds {MAX_FILE_CHARS} chars — "
+                  f"force-including head+tail (rewrite may be rejected as truncated)")
+        _try_add(rel, content, "★ Force-included")
+
+    # ── 2. Fill remaining slots with score-ranked candidates ──────────────────
+    if len(included) < MAX_CONTEXT_FILES:
+        repo_root = Path(".")
+        candidates: list[tuple[int, Path]] = []
+        for path in repo_root.rglob("*"):
+            if path.is_dir():
+                continue
+            if any(part in SKIP_DIRS for part in path.parts):
+                continue
+            if not _is_text_file(path):
+                continue
+            rel_str = str(path).lstrip("./")
+            if rel_str in included:
+                continue
+            if any(re.search(pp, rel_str) for pp in CONTEXT_EXCLUDE_PATTERNS):
+                continue
+            sc = _score_file(path, error_signal, tech_stacks, pipeline_types)
+            if sc > 0:
+                candidates.append((sc, path))
+
+        candidates.sort(key=lambda x: (-x[0], len(str(x[1]))))
+        for score, path in candidates:
+            if len(included) >= MAX_CONTEXT_FILES:
+                break
+            content = _read_whole(path)
+            if content is None:
+                print(f"[DISCOVER] Skipped {path} — too large to rewrite safely "
+                      f"({path.stat().st_size} bytes)")
+                continue
+            _try_add(str(path).lstrip("./"), content, f"Scored (score={score})")
 
     context = "\n\n".join(parts)
     print(f"[DISCOVER] {len(included)} files, {len(context)} chars total")
@@ -383,9 +540,7 @@ def discover_context(error_signal: str,
 # STAGE 3 — ANALYSE
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Concise system prompt — 3B models follow short, direct instructions better
-# than long elaborate ones. Every extra sentence costs inference time AND
-# reduces compliance accuracy.
+# Concise system prompt — 3B models follow short, direct instructions better.
 SYSTEM_PROMPT = """\
 You are a CI/CD repair agent. Output ONLY valid JSON. No markdown fences. No explanation. Start with { end with }.
 
@@ -419,8 +574,6 @@ def build_prompt(error_signal: str, repo_context: str,
         error_signal=error_signal,
         repo_context=repo_context,
     )
-    # Hard cap: total prompt <= 7000 chars (~1750 tokens).
-    # Beyond this, prefill time on CPU exceeds 30s and instruction-following degrades.
     PROMPT_HARD_CAP = 7000
     full = SYSTEM_PROMPT + "\n\n" + user
     if len(full) > PROMPT_HARD_CAP:
@@ -442,23 +595,14 @@ def _detect_ollama_endpoint() -> tuple[str, str]:
     """
     Auto-detect which Ollama API format the endpoint uses.
     Returns (url, format) where format is 'openai' or 'native'.
-
-    Ollama exposes two APIs:
-      /v1/completions  — OpenAI-compatible. Streaming chunks look like:
-                         data: {"choices":[{"text":"..."}]}
-                         (SSE format — lines prefixed with "data: ")
-      /api/generate    — Native Ollama. Streaming chunks look like:
-                         {"response":"...","done":false}
-
-    The previous code used /v1/completions but parsed it as native JSON lines
-    without stripping the "data: " SSE prefix → got 0 chars from stream.
+    Prefer 'native' (/api/generate) — the JSON-schema `format` constraint is
+    reliable there.
     """
     url = OLLAMA_API_URL.rstrip("/")
     if "/api/generate" in url:
         return url, "native"
     if "/v1/completions" in url or "/v1/chat" in url:
         return url, "openai"
-    # Fallback: probe the base
     base = re.sub(r"/(v1|api)/.*$", "", url)
     return f"{base}/api/generate", "native"
 
@@ -469,41 +613,29 @@ def _extract_token(line: bytes, fmt: str) -> str:
         return ""
     try:
         text = line.decode("utf-8", errors="replace").strip()
-        # OpenAI SSE format: lines start with "data: "
-        if text.startswith("data: "):
+        if text.startswith("data: "):       # OpenAI SSE prefix
             text = text[6:].strip()
         if text in ("", "[DONE]"):
             return ""
         obj = json.loads(text)
         if fmt == "openai":
-            # /v1/completions streaming chunk
             return obj.get("choices", [{}])[0].get("text", "")
-        else:
-            # /api/generate native streaming chunk
-            return obj.get("response", "")
+        return obj.get("response", "")
     except (json.JSONDecodeError, UnicodeDecodeError):
         return ""
 
 
 def call_ai(error_signal: str, repo_context: str,
             pipeline_types: set, tech_stacks: set) -> str:
-    """
-    Call Ollama with auto-detected endpoint format and robust streaming.
-
-    Key fixes vs previous version:
-    1. Auto-detects /v1/completions (OpenAI SSE) vs /api/generate (native)
-       and strips the "data: " prefix that was silently dropping all tokens.
-    2. Falls back to reading full response body if stream yields 0 chars
-       (handles Ollama instances that ignore stream=true).
-    3. Heartbeat prints every 15s keep GitHub Actions from treating the
-       job as hung.
-    """
+    """Call Ollama with auto-detected endpoint, schema-constrained output, and
+    robust streaming + batch fallback."""
     user_prompt  = build_prompt(error_signal, repo_context, pipeline_types, tech_stacks)
     full_prompt  = f"{SYSTEM_PROMPT}\n\n{user_prompt}"
     endpoint, fmt = _detect_ollama_endpoint()
 
-    # Build payload for whichever API format
     if fmt == "openai":
+        # /v1/completions does not reliably honour JSON-schema grammar; rely on
+        # the prompt + parse_ai_response fallback here. Prefer native endpoint.
         payload = {
             "model":       OLLAMA_MODEL,
             "prompt":      full_prompt,
@@ -511,31 +643,31 @@ def call_ai(error_signal: str, repo_context: str,
             "max_tokens":  2000,
             "stream":      True,
         }
-    else:  # native /api/generate
+    else:  # native /api/generate — grammar-constrained to FIX_SCHEMA
         payload = {
             "model":   OLLAMA_MODEL,
             "prompt":  full_prompt,
+            "format":  FIX_SCHEMA,
             "options": {"temperature": 0.05, "num_predict": 2000},
             "stream":  True,
         }
 
-    print(f"[AI] Endpoint : {endpoint} (format: {fmt})")
+    print(f"[AI] Endpoint : {endpoint} (format: {fmt}"
+          f"{', schema-constrained' if fmt == 'native' else ''})")
     print(f"[AI] Prompt   : {len(full_prompt)} chars (~{len(full_prompt)//4} tokens)")
     print(f"[AI] Model    : {OLLAMA_MODEL} | timeout: {AI_TIMEOUT}s | max_tokens: 2000")
 
     last_exc = None
     for attempt in range(MAX_RETRIES):
         try:
-            print(f"[AI] Attempt {attempt+1}/{MAX_RETRIES} — streaming from {fmt} endpoint...")
+            print(f"[AI] Attempt {attempt+1}/{MAX_RETRIES} — streaming...")
             t_start    = time.time()
             last_print = t_start
             collected  = []
 
             resp = requests.post(
-                endpoint,
-                json=payload,
-                timeout=(10, AI_TIMEOUT),  # (connect_timeout, read_timeout)
-                stream=True,
+                endpoint, json=payload,
+                timeout=(10, AI_TIMEOUT), stream=True,
             )
             resp.raise_for_status()
 
@@ -543,37 +675,31 @@ def call_ai(error_signal: str, repo_context: str,
                 token = _extract_token(raw_line, fmt)
                 if token:
                     collected.append(token)
-
                 now = time.time()
                 if now - last_print > 15:
                     elapsed = int(now - t_start)
-                    chars_so_far = sum(len(t) for t in collected)
-                    print(f"[AI] ...generating ({elapsed}s | {chars_so_far} chars collected)")
+                    chars = sum(len(t) for t in collected)
+                    print(f"[AI] ...generating ({elapsed}s | {chars} chars)")
                     last_print = now
 
             raw = "".join(collected).strip()
             elapsed = time.time() - t_start
             print(f"[AI] Done in {elapsed:.1f}s — {len(raw)} chars received")
 
-            # If streaming yielded nothing, try reading body as a single
-            # non-streamed response (some Ollama builds ignore stream=true)
             if not raw:
-                print("[AI] Stream yielded 0 chars — attempting batch response parse...")
+                print("[AI] Stream yielded 0 chars — trying batch response parse...")
                 try:
                     body = resp.json()
-                    if fmt == "openai":
-                        raw = body.get("choices", [{}])[0].get("text", "").strip()
-                    else:
-                        raw = body.get("response", "").strip()
+                    raw = (body.get("choices", [{}])[0].get("text", "")
+                           if fmt == "openai" else body.get("response", "")).strip()
                     print(f"[AI] Batch fallback: {len(raw)} chars")
                 except Exception:
                     pass
 
             if not raw:
                 raise RuntimeError(
-                    "Ollama returned an empty response. "
-                    "Check: model is loaded (`ollama ps`), endpoint URL is correct, "
-                    "and Ollama process is healthy."
+                    "Ollama returned an empty response. Check: model loaded "
+                    "(`ollama ps`), endpoint URL correct, process healthy."
                 )
 
             print(f"[AI] Preview: {raw[:400]}{'...' if len(raw) > 400 else ''}")
@@ -584,14 +710,14 @@ def call_ai(error_signal: str, repo_context: str,
             elapsed  = time.time() - t_start
             wait     = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
             print(f"[AI] Timeout after {elapsed:.0f}s on attempt {attempt+1}. "
-                  f"Waiting {wait}s before retry...")
+                  f"Waiting {wait}s...")
             if attempt < MAX_RETRIES - 1:
                 time.sleep(wait)
 
         except requests.exceptions.ConnectionError as exc:
             raise RuntimeError(
-                f"Cannot connect to Ollama at {endpoint}. "
-                f"Is Ollama running on the self-hosted runner? Error: {exc}"
+                f"Cannot connect to Ollama at {endpoint}. Is Ollama running "
+                f"on the self-hosted runner? Error: {exc}"
             )
 
         except requests.exceptions.RequestException as exc:
@@ -599,14 +725,15 @@ def call_ai(error_signal: str, repo_context: str,
 
     raise RuntimeError(
         f"Ollama did not respond after {MAX_RETRIES} attempts ({AI_TIMEOUT}s each). "
-        f"Last error: {last_exc}. "
-        f"Tips: reduce MAX_TOTAL_CONTEXT further, use qwen2.5-coder:1.5b, "
-        f"or increase workflow timeout-minutes."
+        f"Last error: {last_exc}. Tips: reduce MAX_TOTAL_CONTEXT, use "
+        f"qwen2.5-coder:1.5b, or increase workflow timeout-minutes."
     )
 
 
 def _normalize_fix_keys(fixes: list) -> list:
-    """Normalize field names from non-compliant model responses."""
+    """Normalize field names from non-compliant responses. With the native
+    schema-constrained endpoint this should essentially never fire, but it
+    stays as belt-and-suspenders for the /v1/completions path."""
     KEY_MAP_FILE    = ("file_path", "path", "filename", "filepath", "name")
     KEY_MAP_CONTENT = ("content", "new_content", "fixed", "updated_content",
                        "corrected_content", "file_content", "code")
@@ -636,35 +763,28 @@ def _validate_fix_completeness(fix: dict, original_path: Path) -> tuple[bool, st
         non_empty = [l for l in content.splitlines()
                      if l.strip() and not l.strip().startswith("#")]
         if len(non_empty) < 3:
-            return False, (
-                f"Dockerfile fix truncated: only {len(non_empty)} instruction(s). "
-                f"Must output the COMPLETE Dockerfile."
-            )
+            return False, (f"Dockerfile fix truncated: only {len(non_empty)} "
+                           f"instruction(s). Must output the COMPLETE Dockerfile.")
         try:
             original = original_path.read_text(encoding="utf-8", errors="replace")
             for keyword in ["WORKDIR", "COPY", "RUN", "CMD", "EXPOSE"]:
                 if keyword in original and keyword not in content:
-                    return False, (
-                        f"Dockerfile fix dropped '{keyword}' — instruction missing. "
-                        f"Must preserve all existing instructions."
-                    )
+                    return False, (f"Dockerfile fix dropped '{keyword}'. "
+                                   f"Must preserve all existing instructions.")
         except Exception:
             pass
-
     return True, "ok"
 
 
 def parse_ai_response(raw: str) -> dict:
     cleaned = re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
     data = None
-
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
         pass
 
     if data is None:
-        # Find the largest valid JSON object in the response
         best = None
         for start in [i for i, c in enumerate(cleaned) if c == "{"]:
             depth = 0
@@ -693,13 +813,10 @@ def parse_ai_response(raw: str) -> dict:
 
     if "fixes" in data and isinstance(data["fixes"], list):
         data["fixes"] = _normalize_fix_keys(data["fixes"])
-        unmapped = [
-            f.get("file", "?") for f in data["fixes"]
-            if "file" not in f or "fixed_content" not in f
-        ]
+        unmapped = [f.get("file", "?") for f in data["fixes"]
+                    if "file" not in f or "fixed_content" not in f]
         if unmapped:
             print(f"[AI] Warning: could not normalize keys for: {unmapped}")
-
     return data
 
 
@@ -740,7 +857,6 @@ def validate_fix(fix: dict) -> tuple[bool, str]:
             ast.parse(content)
         except SyntaxError as exc:
             return False, f"Python syntax error: {exc}"
-
     elif re.search(r"\.ya?ml$", file):
         try:
             parsed = yaml.safe_load(content)
@@ -750,13 +866,11 @@ def validate_fix(fix: dict) -> tuple[bool, str]:
                 return False, "workflow YAML missing 'jobs' key"
         except yaml.YAMLError as exc:
             return False, f"YAML error: {exc}"
-
     elif file.endswith(".json"):
         try:
             json.loads(content)
         except json.JSONDecodeError as exc:
             return False, f"JSON error: {exc}"
-
     elif file.endswith(".toml"):
         if not re.search(r"\[.+\]", content):
             return False, "TOML looks empty or malformed"
@@ -827,10 +941,8 @@ def detect_test_commands(tech_stacks: set[str]) -> list[list[str]]:
 def run_tests(tech_stacks: set[str], written: list[str]) -> bool:
     for f in written:
         if Path(f).name.lower().startswith("dockerfile"):
-            lint = subprocess.run(
-                ["hadolint", "--no-fail", f],
-                capture_output=True, text=True, timeout=30
-            )
+            lint = subprocess.run(["hadolint", "--no-fail", f],
+                                  capture_output=True, text=True, timeout=30)
             if lint.returncode not in (0, 127):
                 for line in lint.stdout.splitlines()[-10:]:
                     print(f"  {line}")
@@ -854,7 +966,6 @@ def run_tests(tech_stacks: set[str], written: list[str]) -> bool:
             print(f"[TEST] {cmd[0]} not found — skipping")
         except subprocess.TimeoutExpired:
             print(f"[TEST] {cmd[0]} timed out — skipping")
-
     return all_passed
 
 
@@ -1046,9 +1157,7 @@ def open_issue(token: str, repo: str, reason: str,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Generic self-healing CI/CD auto-fixer"
-    )
+    parser = argparse.ArgumentParser(description="Generic self-healing CI/CD auto-fixer")
     parser.add_argument("--input",      required=True, help="Path to CI failure log")
     parser.add_argument("--dry-run",    action="store_true",
                         help="Validate but do not write files or open PR")
@@ -1066,7 +1175,8 @@ def main():
 
     print(f"[GIT FLOW] Base: {GIT_BASE_BRANCH} | Target: {GIT_TARGET_BRANCH}")
     print(f"[TIMING]   AI timeout: {AI_TIMEOUT}s × {MAX_RETRIES} retries | "
-          f"Context budget: {MAX_TOTAL_CONTEXT} chars | Hard prompt cap: 7000 chars")
+          f"Context: {MAX_CONTEXT_FILES} files / {MAX_TOTAL_CONTEXT} chars | "
+          f"Hard prompt cap: 7000 chars")
     t0 = time.time()
 
     if last_commit_was_bot():
@@ -1097,7 +1207,11 @@ def main():
     # ══ STAGE 2: DISCOVER ════════════════════════════════════════════════════
     print("\n━━━ STAGE 2: DISCOVER ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     t2 = time.time()
-    repo_context, included = discover_context(error_signal, tech_stacks, pipeline_types)
+    forced_paths = extract_referenced_paths(log_text)
+    repo_context, included = discover_context(
+        error_signal, tech_stacks, pipeline_types, forced_paths)
+    if not included:
+        print("[DISCOVER] WARNING: no files resolved — AI has no context to work with.")
     print(f"[TIMING] Stage 2 done in {time.time()-t2:.1f}s")
 
     # ══ STAGE 3: ANALYSE ═════════════════════════════════════════════════════
@@ -1183,11 +1297,9 @@ def main():
     # ══ STAGE 5: WRITE ═══════════════════════════════════════════════════════
     print("\n━━━ STAGE 5: WRITE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     written, originals = write_fixes(valid_fixes)
-
     if not written:
         print("[ERROR] No files were written.", file=sys.stderr)
         sys.exit(3)
-
     print(f"[WRITE] {len(written)} file(s): {written}")
 
     # ══ STAGE 6: TEST ════════════════════════════════════════════════════════
@@ -1224,6 +1336,7 @@ def main():
     print(f"  fixed      : {', '.join(written)}")
     print(f"  branch     : {branch} → {GIT_TARGET_BRANCH}")
     print(f"  PR         : {pr_url or 'not created'}")
+    print(f"  total time : {time.time()-t0:.1f}s")
 
 
 if __name__ == "__main__":
