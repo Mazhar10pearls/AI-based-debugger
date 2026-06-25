@@ -321,6 +321,50 @@ REFERENCED_PATH_PATTERNS = [
 ]
 
 
+# ── Build / setup / config error signatures ─────────────────────────────────
+# These failures happen in the CI WORKFLOW (setup-python version, build context,
+# action wiring) and name NO source file — so force-include-by-path can't catch
+# them. When the log matches, the CI workflow YAML itself is the prime suspect
+# and must be put in front of the model. The earlier 'Dockerfile missing'
+# misdiagnosis was exactly this: the real bug was in the build command, not the
+# Dockerfile, and the workflow file never reached the prompt.
+BUILD_CONFIG_SIGNALS = [
+    "setup-python", "python-version", "version not found",
+    "no such file or directory", "failed to read dockerfile",
+    "unable to prepare context", "failed to solve",
+    "invalid reference format", "context: ", "build context",
+    "is not a valid", "could not resolve", "no version found",
+    "unable to find version", "matching version", "actions/setup",
+    "with: ", "uses: ", "buildx", "docker build", "dockerfile:",
+]
+
+
+def looks_like_build_config_error(error_signal: str) -> bool:
+    low = error_signal.lower()
+    return any(sig in low for sig in BUILD_CONFIG_SIGNALS)
+
+
+def find_ci_workflow_files(repo_root: Path = Path(".")) -> list[str]:
+    """
+    Return repo-relative paths to CI workflow YAMLs that are legitimate fix
+    targets — i.e. the build/deploy pipelines, NOT the auto-fix / self-heal
+    workflows (those stay in CONTEXT_EXCLUDE_PATTERNS so we never feed the
+    system its own definition).
+    """
+    found = []
+    for d in WORKFLOW_DIRS:
+        base = repo_root / d
+        if not base.is_dir():
+            continue
+        for p in sorted(base.rglob("*")):
+            if p.is_file() and p.suffix in WORKFLOW_EXTENSIONS:
+                rel = str(p).lstrip("./")
+                if any(re.search(pp, rel) for pp in CONTEXT_EXCLUDE_PATTERNS):
+                    continue
+                found.append(rel)
+    return found
+
+
 def _basename_blocked(name: str) -> bool:
     return name in ALWAYS_BLOCKED
 
@@ -472,6 +516,22 @@ def discover_context(error_signal: str,
                      forced_paths: list[str]) -> tuple[str, list[str]]:
     parts, included, total = [], [], 0
 
+    # ── Build-config error? The CI workflow YAML is the prime suspect ─────────
+    # On setup-python / build-context / action-wiring failures the log names no
+    # source file, so force-include-by-path finds nothing useful. Detect the
+    # signature, push the build/deploy workflow YAML(s) to the FRONT of the
+    # forced list, and raise the file cap to 3 so the workflow sits ALONGSIDE
+    # the other suspects instead of evicting them.
+    file_cap = MAX_CONTEXT_FILES
+    if looks_like_build_config_error(error_signal):
+        wf_files = find_ci_workflow_files()
+        if wf_files:
+            file_cap = max(MAX_CONTEXT_FILES, 3)
+            # Prepend, de-duping against anything already referenced.
+            forced_paths = wf_files + [f for f in forced_paths if f not in wf_files]
+            print(f"[DISCOVER] Build-config error detected → CI workflow is prime "
+                  f"suspect; force-including {wf_files} (file cap raised to {file_cap})")
+
     def _try_add(rel: str, content: str, label: str) -> bool:
         nonlocal total
         block = f"### {rel}\n```\n{content}\n```"
@@ -488,7 +548,7 @@ def discover_context(error_signal: str,
     #     These take priority over any scored guess. This is the core fix for
     #     'model forgot the context it needed'.
     for rel in forced_paths:
-        if len(included) >= MAX_CONTEXT_FILES:
+        if len(included) >= file_cap:
             break
         p = Path(rel)
         if not (p.is_file() and _is_text_file(p)):
@@ -501,7 +561,7 @@ def discover_context(error_signal: str,
         _try_add(rel, content, "★ Force-included")
 
     # ── 2. Fill remaining slots with score-ranked candidates ──────────────────
-    if len(included) < MAX_CONTEXT_FILES:
+    if len(included) < file_cap:
         repo_root = Path(".")
         candidates: list[tuple[int, Path]] = []
         for path in repo_root.rglob("*"):
@@ -522,7 +582,7 @@ def discover_context(error_signal: str,
 
         candidates.sort(key=lambda x: (-x[0], len(str(x[1]))))
         for score, path in candidates:
-            if len(included) >= MAX_CONTEXT_FILES:
+            if len(included) >= file_cap:
                 break
             content = _read_whole(path)
             if content is None:
@@ -862,8 +922,33 @@ def validate_fix(fix: dict) -> tuple[bool, str]:
             parsed = yaml.safe_load(content)
             if not isinstance(parsed, dict):
                 return False, "YAML does not parse to a mapping"
-            if ".github/workflows" in file and "jobs" not in parsed:
-                return False, "workflow YAML missing 'jobs' key"
+            if ".github/workflows" in file:
+                # A workflow rewrite by a 3B can silently drop triggers, jobs, or
+                # whole steps. Guard the structure that makes it a valid pipeline.
+                # PyYAML parses the `on:` key as boolean True, so check both.
+                if "jobs" not in parsed:
+                    return False, "workflow YAML missing 'jobs' key"
+                if "on" not in parsed and True not in parsed:
+                    return False, "workflow YAML missing 'on:' trigger block"
+                if not isinstance(parsed.get("jobs"), dict) or not parsed["jobs"]:
+                    return False, "workflow YAML has no jobs defined"
+                # Don't let the model gut the pipeline: the rewrite must keep at
+                # least as many `steps:` entries as the original had.
+                try:
+                    orig = yaml.safe_load(
+                        Path(file).read_text(encoding="utf-8", errors="replace"))
+                    if isinstance(orig, dict):
+                        n_orig = sum(len(j.get("steps", []))
+                                     for j in orig.get("jobs", {}).values()
+                                     if isinstance(j, dict))
+                        n_new = sum(len(j.get("steps", []))
+                                    for j in parsed.get("jobs", {}).values()
+                                    if isinstance(j, dict))
+                        if n_orig and n_new < n_orig:
+                            return False, (f"workflow rewrite dropped steps "
+                                           f"({n_orig} → {n_new}) — must preserve all steps")
+                except Exception:
+                    pass
         except yaml.YAMLError as exc:
             return False, f"YAML error: {exc}"
     elif file.endswith(".json"):

@@ -66,7 +66,42 @@ jobs:
             -t ai-devops-sample-app:latest \
             --load \
             sample_app
-            
+
+      # ── Smoke test (always — catches runtime errors a build can't) ────────
+      # `docker build` succeeds even with a broken CMD/ENTRYPOINT (e.g. a typo'd
+      # app filename); the failure only shows when the container actually runs.
+      # This starts the image on a throwaway name+port and checks the app comes
+      # up, so runtime breakage surfaces on EVERY branch — not silently on a main
+      # deploy. Uses port 5001 so it never collides with the live :5000 container.
+      - name: Smoke-test the image
+        run: |
+          set -e
+          SMOKE=smoke-${{ github.sha }}
+          docker rm -f "$SMOKE" >/dev/null 2>&1 || true
+          docker run -d --name "$SMOKE" -p 5001:5000 ai-devops-sample-app:${{ github.sha }}
+
+          ok=0
+          for i in {1..15}; do
+            if curl -fs http://127.0.0.1:5001 > /dev/null; then ok=1; break; fi
+            # Container exited already? bad CMD / crash-on-start — stop waiting.
+            if [ "$(docker inspect -f '{{.State.Running}}' "$SMOKE" 2>/dev/null)" != "true" ]; then
+              echo "Smoke test: container exited early — likely a runtime/CMD error"
+              break
+            fi
+            echo "Smoke test: waiting for app... ($i/15)"
+            sleep 2
+          done
+
+          if [ "$ok" != "1" ]; then
+            echo "----- container logs -----"
+            docker logs "$SMOKE" || true
+            docker rm -f "$SMOKE" >/dev/null 2>&1 || true
+            echo "Smoke test FAILED — image does not run correctly"
+            exit 1
+          fi
+
+          echo "Smoke test PASSED"
+          docker rm -f "$SMOKE" >/dev/null 2>&1 || true
 
       # ── Deploy (main + push only) ─────────────────────────────────────────
       # Every deploy step is gated so PRs and develop pushes stop after build.
