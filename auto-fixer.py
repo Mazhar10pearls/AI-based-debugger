@@ -624,7 +624,7 @@ USER_PROMPT = """\
 ```
 {error_signal}
 ```
-
+{prescan_block}
 ## Repo files present (use to validate any filename referenced in COPY/CMD/etc):
 {repo_inventory}
 
@@ -650,31 +650,113 @@ def build_repo_inventory(limit: int = 120) -> str:
     return ", ".join(paths) if paths else "(none)"
 
 
+def _repo_basenames() -> set[str]:
+    names = set()
+    for p in Path(".").rglob("*"):
+        if p.is_file() and not any(part in SKIP_DIRS for part in p.parts):
+            names.add(p.name)
+    return names
+
+
+def prescan_issues(included_files: list[str]) -> list[str]:
+    """
+    Deterministically find bugs a 3B tends to miss when it anchors on the FIRST
+    error in the log. We hand these to the model as explicit "you MUST also fix
+    these" instructions, instead of relying on it to audit the file itself.
+
+    Currently scans Dockerfiles for:
+      - invalid `FROM` tags (e.g. python:3.1 / python:3. — not a real version)
+      - COPY/ADD/CMD/ENTRYPOINT referencing a file that doesn't exist in the repo
+
+    These are the mechanically-detectable bugs; anything subtler stays the
+    model's job. Returns a list of human-readable findings keyed by file.
+    """
+    findings: list[str] = []
+    repo_names = _repo_basenames()
+
+    # A bare-bones "looks like a real <name>:<tag>" check. We only flag tags that
+    # are obviously malformed (trailing dot, single-component like "3.1" for
+    # python) — never guess for images we don't recognise.
+    BAD_PY_TAG = re.compile(r'^python:3\.\d{0,1}$')  # python:3 , python:3. , python:3.1
+
+    for rel in included_files:
+        p = Path(rel)
+        if not (p.name.lower().startswith("dockerfile") and p.is_file()):
+            continue
+        try:
+            lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+
+        for ln in lines:
+            s = ln.strip()
+            if not s or s.startswith("#"):
+                continue
+
+            # 1. FROM with a malformed/too-old python tag
+            m = re.match(r'(?i)FROM\s+(\S+)', s)
+            if m and BAD_PY_TAG.match(m.group(1).strip()):
+                findings.append(
+                    f"{rel}: `{m.group(1)}` is not a valid Python image tag "
+                    f"— change it to a real version such as python:3.12.")
+                continue
+
+            # 2. COPY/ADD/CMD/ENTRYPOINT referencing a missing local file
+            kw = re.match(r'(?i)(COPY|ADD|CMD|ENTRYPOINT)\b(.*)', s)
+            if not kw:
+                continue
+            rest = kw.group(2)
+            # pull out token-looking filenames (skip flags, URLs, shell words)
+            for tok in re.findall(r'[\w./\-]+\.[A-Za-z0-9]+', rest):
+                base = Path(tok).name
+                # ignore obvious non-local refs and the catch-all "." copies
+                if "://" in rest or base in (".", ""):
+                    continue
+                if base not in repo_names:
+                    findings.append(
+                        f"{rel}: `{kw.group(1)} {tok}` references '{base}', which "
+                        f"does not exist in the repo — correct it to the real file.")
+
+    if findings:
+        print(f"[PRESCAN] Found {len(findings)} additional issue(s) the log did not surface:")
+        for f in findings:
+            print(f"[PRESCAN]   • {f}")
+    else:
+        print("[PRESCAN] No extra static issues found.")
+    return findings
+
+
 def build_prompt(error_signal: str, repo_context: str,
-                 pipeline_types: set, tech_stacks: set) -> str:
+                 pipeline_types: set, tech_stacks: set,
+                 prescan: list[str] | None = None) -> str:
     repo_inventory = build_repo_inventory()
-    user = USER_PROMPT.format(
-        pipeline_types=", ".join(sorted(pipeline_types)) or "unknown",
-        tech_stacks=", ".join(sorted(tech_stacks)) or "unknown",
-        error_signal=error_signal,
-        repo_inventory=repo_inventory,
-        repo_context=repo_context,
-    )
-    PROMPT_HARD_CAP = 7000
-    full = SYSTEM_PROMPT + "\n\n" + user
-    if len(full) > PROMPT_HARD_CAP:
-        overhead = len(USER_PROMPT.format(
-            pipeline_types="", tech_stacks="", error_signal=error_signal,
-            repo_inventory=repo_inventory, repo_context=""))
-        allowed  = PROMPT_HARD_CAP - len(SYSTEM_PROMPT) - overhead - 50
-        trimmed  = repo_context[:max(allowed, 1000)] + "\n...(trimmed for token budget)"
-        user = USER_PROMPT.format(
+    if prescan:
+        prescan_block = (
+            "\n## MUST-FIX issues found by static scan (the log did NOT show "
+            "these — you are REQUIRED to fix every one in the same pass):\n"
+            + "\n".join(f"- {f}" for f in prescan) + "\n"
+        )
+    else:
+        prescan_block = ""
+
+    def _fmt(ctx):
+        return USER_PROMPT.format(
             pipeline_types=", ".join(sorted(pipeline_types)) or "unknown",
             tech_stacks=", ".join(sorted(tech_stacks)) or "unknown",
             error_signal=error_signal,
+            prescan_block=prescan_block,
             repo_inventory=repo_inventory,
-            repo_context=trimmed,
+            repo_context=ctx,
         )
+
+    user = _fmt(repo_context)
+    PROMPT_HARD_CAP = 7000
+    full = SYSTEM_PROMPT + "\n\n" + user
+    if len(full) > PROMPT_HARD_CAP:
+        overhead = len(_fmt(""))
+        allowed  = PROMPT_HARD_CAP - len(SYSTEM_PROMPT) - overhead - 50
+        trimmed  = repo_context[:max(allowed, 1000)] + "\n...(trimmed for token budget)"
+        user = _fmt(trimmed)
         print(f"[AI] Prompt hard-trimmed to {len(SYSTEM_PROMPT + user)} chars")
     return user
 
@@ -714,10 +796,11 @@ def _extract_token(line: bytes, fmt: str) -> str:
 
 
 def call_ai(error_signal: str, repo_context: str,
-            pipeline_types: set, tech_stacks: set) -> str:
+            pipeline_types: set, tech_stacks: set,
+            prescan: list[str] | None = None) -> str:
     """Call Ollama with auto-detected endpoint, schema-constrained output, and
     robust streaming + batch fallback."""
-    user_prompt  = build_prompt(error_signal, repo_context, pipeline_types, tech_stacks)
+    user_prompt  = build_prompt(error_signal, repo_context, pipeline_types, tech_stacks, prescan)
     full_prompt  = f"{SYSTEM_PROMPT}\n\n{user_prompt}"
     endpoint, fmt = _detect_ollama_endpoint()
 
@@ -1325,13 +1408,14 @@ def main():
         error_signal, tech_stacks, pipeline_types, forced_paths)
     if not included:
         print("[DISCOVER] WARNING: no files resolved — AI has no context to work with.")
+    prescan = prescan_issues(included)
     print(f"[TIMING] Stage 2 done in {time.time()-t2:.1f}s")
 
     # ══ STAGE 3: ANALYSE ═════════════════════════════════════════════════════
     print("\n━━━ STAGE 3: ANALYSE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     t3 = time.time()
     try:
-        raw     = call_ai(error_signal, repo_context, pipeline_types, tech_stacks)
+        raw     = call_ai(error_signal, repo_context, pipeline_types, tech_stacks, prescan)
         ai_data = parse_ai_response(raw)
     except Exception as exc:
         print(f"[ERROR] AI failed: {exc}", file=sys.stderr)
