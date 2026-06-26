@@ -1383,7 +1383,29 @@ def _ensure_base_branch_exists() -> bool:
         return False
 
 
-def commit_to_branch(commit_msg: str) -> str:
+# ── Runtime artifacts the auto-fixer creates while running — NEVER commit these.
+RUNTIME_ARTIFACTS = ["failure.log", "workflow_logs.zip", "logs/"]
+
+
+def _ensure_artifacts_ignored():
+    """Gitignore the auto-fixer's own runtime artifacts, and untrack any a
+    previous run already committed — so PRs never carry failure.log /
+    workflow_logs.zip / logs/."""
+    gi = Path(".gitignore")
+    existing = gi.read_text(encoding="utf-8", errors="replace").splitlines() if gi.is_file() else []
+    missing = [a for a in RUNTIME_ARTIFACTS if a not in existing]
+    if missing:
+        with gi.open("a", encoding="utf-8") as fh:
+            if existing and existing[-1].strip():
+                fh.write("\n")
+            fh.write("# auto-fixer runtime artifacts (do not commit)\n")
+            fh.write("\n".join(missing) + "\n")
+        print(f"[GIT FLOW] Added to .gitignore: {missing}")
+    for a in RUNTIME_ARTIFACTS:
+        _git("rm", "--cached", "-r", "--ignore-unmatch", a, check=False)
+
+
+def commit_to_branch(commit_msg: str, written: list[str] | None = None) -> str:
     try:
         _git("config", "user.name",  BOT_NAME)
         _git("config", "user.email", BOT_EMAIL)
@@ -1399,7 +1421,23 @@ def commit_to_branch(commit_msg: str) -> str:
         branch = f"fix/{int(time.time())}"
         print(f"[GIT FLOW] Creating '{branch}' from '{GIT_BASE_BRANCH}'...")
         _git("checkout", "-b", branch)
-        _git("add", "-A")
+
+        # Ensure runtime artifacts are ignored + untracked. This stages a
+        # .gitignore update and the removal of any artifact a previous run
+        # already committed (your repo currently has failure.log / workflow_logs.zip).
+        _ensure_artifacts_ignored()
+
+        # Stage ONLY the files the AI actually fixed — never `git add -A`, which
+        # would sweep the runtime artifacts (failure.log, workflow_logs.zip,
+        # logs/) straight into the PR. Plus the .gitignore we just updated.
+        if written:
+            _git("add", "--", *written)
+            print(f"[GIT FLOW] Staged AI-written files: {written}")
+        else:
+            _git("add", "-u")
+            print("[GIT FLOW] No file list supplied — staged tracked changes only")
+        if Path(".gitignore").is_file():
+            _git("add", ".gitignore", check=False)
 
         if _git("diff", "--cached", "--quiet", check=False).returncode == 0:
             print("[COMMIT] Nothing to commit.")
@@ -1683,7 +1721,7 @@ def main():
 
     # ══ STAGE 7: COMMIT ══════════════════════════════════════════════════════
     print(f"\n━━━ STAGE 7: COMMIT (fix/* → {GIT_TARGET_BRANCH}) ━━━━━━━━━━━")
-    branch = commit_to_branch(commit_msg)
+    branch = commit_to_branch(commit_msg, written)
     if not branch:
         sys.exit(4)
 
