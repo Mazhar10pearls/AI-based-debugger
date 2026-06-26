@@ -605,46 +605,74 @@ SYSTEM_PROMPT = """\
 You are a CI/CD repair agent. Output ONLY valid JSON. No markdown fences. No explanation. Start with { end with }.
 
 JSON schema:
-{"pipeline_type":"string","root_cause":"one sentence","confidence":0.0-1.0,"commit_message":"fix: short description","fixes":[{"file":"exact/path","reason":"what changed","fixed_content":"COMPLETE file — every line preserved except the broken one"}]}
+{"pipeline_type":"string","root_cause":"one sentence","confidence":0.0-1.0,"commit_message":"fix: short description","fixes":[{"file":"exact/path","reason":"what changed","fixed_content":"COMPLETE corrected file with ALL errors fixed"}]}
 
 RULES:
 - fixed_content = the COMPLETE corrected file. Never a snippet or diff.
 - file = exact path from the ### header.
-- For Dockerfiles: keep ALL existing RUN/COPY/EXPOSE/CMD/WORKDIR/HEALTHCHECK lines. Only fix the broken instruction.
+- AUDIT THE WHOLE FILE. The log shows the FIRST failure only, but a file may contain SEVERAL bugs. Scan every line and fix ALL clear errors in one pass — do not stop at the line named in the log.
+- Verify filenames: if a COPY/ADD/CMD/ENTRYPOINT references a file, check it against "Repo files present" below. If that file does not exist, correct it to the closest real filename.
+- Check base images/versions: an invalid tag like `python:3.1` must become a real one (e.g. `python:3.12`).
+- Preserve every CORRECT line exactly. For Dockerfiles keep all RUN/COPY/EXPOSE/CMD/WORKDIR/HEALTHCHECK instructions; only change the broken ones.
 - Only include files that actually need changes.
 - confidence < 0.4 means you are unsure — set it low rather than guess."""
 
 USER_PROMPT = """\
 ## Pipeline: {pipeline_types} | Stack: {tech_stacks}
 
-## CI failure (key lines):
+## CI failure (key lines — may show only the FIRST of several bugs):
 ```
 {error_signal}
 ```
 
-## Repo files (read carefully — your fixed_content must be based on these):
+## Repo files present (use to validate any filename referenced in COPY/CMD/etc):
+{repo_inventory}
+
+## File contents (read carefully — your fixed_content must be based on these, and must fix EVERY error you can see):
 {repo_context}"""
+
+
+def build_repo_inventory(limit: int = 120) -> str:
+    """
+    A flat list of repo-relative file paths so the model can validate that a
+    filename referenced by COPY/ADD/CMD/ENTRYPOINT actually exists — and correct
+    it to the closest real one when it doesn't. Paths only (cheap on tokens).
+    """
+    paths = []
+    for p in sorted(Path(".").rglob("*")):
+        if p.is_file() and not any(part in SKIP_DIRS for part in p.parts):
+            rel = str(p).lstrip("./")
+            if any(re.search(pp, rel) for pp in CONTEXT_EXCLUDE_PATTERNS):
+                continue
+            paths.append(rel)
+            if len(paths) >= limit:
+                break
+    return ", ".join(paths) if paths else "(none)"
 
 
 def build_prompt(error_signal: str, repo_context: str,
                  pipeline_types: set, tech_stacks: set) -> str:
+    repo_inventory = build_repo_inventory()
     user = USER_PROMPT.format(
         pipeline_types=", ".join(sorted(pipeline_types)) or "unknown",
         tech_stacks=", ".join(sorted(tech_stacks)) or "unknown",
         error_signal=error_signal,
+        repo_inventory=repo_inventory,
         repo_context=repo_context,
     )
     PROMPT_HARD_CAP = 7000
     full = SYSTEM_PROMPT + "\n\n" + user
     if len(full) > PROMPT_HARD_CAP:
         overhead = len(USER_PROMPT.format(
-            pipeline_types="", tech_stacks="", error_signal=error_signal, repo_context=""))
+            pipeline_types="", tech_stacks="", error_signal=error_signal,
+            repo_inventory=repo_inventory, repo_context=""))
         allowed  = PROMPT_HARD_CAP - len(SYSTEM_PROMPT) - overhead - 50
         trimmed  = repo_context[:max(allowed, 1000)] + "\n...(trimmed for token budget)"
         user = USER_PROMPT.format(
             pipeline_types=", ".join(sorted(pipeline_types)) or "unknown",
             tech_stacks=", ".join(sorted(tech_stacks)) or "unknown",
             error_signal=error_signal,
+            repo_inventory=repo_inventory,
             repo_context=trimmed,
         )
         print(f"[AI] Prompt hard-trimmed to {len(SYSTEM_PROMPT + user)} chars")
