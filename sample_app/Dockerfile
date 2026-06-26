@@ -1,4 +1,4 @@
-FROM python:3.1
+FROM python:3.9
 WORKDIR /app
 COPY requirementsss11s.txt .
 RUN pip install --no-cache-dir -r requirements.txt
