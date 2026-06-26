@@ -112,13 +112,31 @@ SKIP_DIRS = {
 MAX_FILE_SIZE_BYTES = 100_000
 
 
+def _relstrip(rel: str) -> str:
+    """Strip ONLY a leading './' — never a bare '.', which would turn
+    '.github/...' into 'github/...' and (a) break the exclude regex and
+    (b) produce an invalid path. Used everywhere we normalise repo paths."""
+    return rel[2:] if rel.startswith("./") else rel
+
+# Files at or above this many chars are fixed with TARGETED find/replace edits
+# instead of a whole-file rewrite. Rationale: on a CPU 3B, regenerating a large
+# file to change a few lines is slow (output time scales with tokens) and
+# truncation-prone (hits num_predict mid-file → invalid output, rejected at
+# validation). A patch is tiny output → fast, can't truncate, can't drop lines.
+EDIT_MODE_THRESHOLD = 1500
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # STRUCTURED OUTPUT SCHEMA
 # ══════════════════════════════════════════════════════════════════════════════
 # Ollama constrains generation to this schema via grammar at the sampler level,
-# so even a 3B CANNOT emit malformed JSON or wrong key names. This removes the
-# entire class of failures that _normalize_fix_keys / the brace-repair loop
-# existed to patch.
+# so even a 3B CANNOT emit malformed JSON or wrong key names.
+#
+# Two fix modes per file (the model picks; code enforces by file size):
+#   - "edits": [{find, replace}, ...]  — TARGETED patch. Preferred for large
+#       files and localized changes. Tiny output, no truncation risk.
+#   - "fixed_content": "<whole file>"  — full rewrite. Fine for small files.
+# Both are optional in the schema; application logic prefers edits when present.
 FIX_SCHEMA = {
     "type": "object",
     "properties": {
@@ -131,11 +149,22 @@ FIX_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "file":          {"type": "string"},
-                    "reason":        {"type": "string"},
+                    "file":   {"type": "string"},
+                    "reason": {"type": "string"},
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "find":    {"type": "string"},
+                                "replace": {"type": "string"},
+                            },
+                            "required": ["find", "replace"],
+                        },
+                    },
                     "fixed_content": {"type": "string"},
                 },
-                "required": ["file", "reason", "fixed_content"],
+                "required": ["file", "reason"],
             },
         },
     },
@@ -578,14 +607,17 @@ def discover_context(error_signal: str,
 
     def _try_add(rel: str, content: str, label: str) -> bool:
         nonlocal total
-        block = f"### {rel}\n```\n{content}\n```"
+        # Tell the model which files are too big to safely rewrite whole, so it
+        # uses targeted find/replace edits instead.
+        size_tag = " (LARGE — use edits)" if len(content) >= EDIT_MODE_THRESHOLD else ""
+        block = f"### {rel}{size_tag}\n```\n{content}\n```"
         if total + len(block) > MAX_TOTAL_CONTEXT and included:
             print(f"[DISCOVER] Budget reached — skipping {rel}")
             return False
         parts.append(block)
         included.append(rel)
         total += len(block)
-        print(f"[DISCOVER] {label} {rel} ({len(content)} chars)")
+        print(f"[DISCOVER] {label} {rel} ({len(content)} chars{', edit-mode' if size_tag else ''})")
         return True
 
     # ── 1. FORCE-INCLUDE files explicitly named / suspected ───────────────────
@@ -614,7 +646,7 @@ def discover_context(error_signal: str,
                 continue
             if not _is_text_file(path):
                 continue
-            rel_str = str(path).lstrip("./")
+            rel_str = _relstrip(str(path))
             if rel_str in included:
                 continue
             if any(re.search(pp, rel_str) for pp in CONTEXT_EXCLUDE_PATTERNS):
@@ -627,12 +659,15 @@ def discover_context(error_signal: str,
         for score, path in candidates:
             if len(included) >= file_cap:
                 break
+            rel_str = _relstrip(str(path))
+            if rel_str in included:        # already force-included — don't re-log it
+                continue
             content = _read_whole(path)
             if content is None:
-                print(f"[DISCOVER] Skipped {path} — too large to rewrite safely "
+                print(f"[DISCOVER] Skipped {rel_str} — too large for whole-file context "
                       f"({path.stat().st_size} bytes)")
                 continue
-            _try_add(str(path).lstrip("./"), content, f"Scored (score={score})")
+            _try_add(rel_str, content, f"Scored (score={score})")
 
     context = "\n\n".join(parts)
     print(f"[DISCOVER] {len(included)} files, {len(context)} chars total")
@@ -648,15 +683,19 @@ SYSTEM_PROMPT = """\
 You are a CI/CD repair agent. Output ONLY valid JSON. No markdown fences. No explanation. Start with { end with }.
 
 JSON schema:
-{"pipeline_type":"string","root_cause":"one sentence","confidence":0.0-1.0,"commit_message":"fix: short description","fixes":[{"file":"exact/path","reason":"what changed","fixed_content":"COMPLETE corrected file with ALL errors fixed"}]}
+{"pipeline_type":"string","root_cause":"one sentence","confidence":0.0-1.0,"commit_message":"fix: short description","fixes":[{"file":"exact/path","reason":"what changed","edits":[{"find":"exact text from the file","replace":"corrected text"}]}]}
+
+HOW TO FIX — pick ONE mode per file:
+- PREFERRED for large files and small changes → "edits": a list of {find, replace}. `find` MUST be copied EXACTLY from the file shown below (same characters, same indentation, enough surrounding text to be unique). `replace` is the corrected version. Use one edit per distinct bug. This is fast and safe — use it whenever you are changing only a few lines.
+- ONLY for small files you are rewriting almost entirely → "fixed_content": the COMPLETE corrected file. Never a snippet.
+- A file marked "(LARGE — use edits)" MUST be fixed with "edits", never "fixed_content".
 
 RULES:
-- fixed_content = the COMPLETE corrected file. Never a snippet or diff.
 - file = exact path from the ### header.
-- AUDIT THE WHOLE FILE. The log shows the FIRST failure only, but a file may contain SEVERAL bugs. Scan every line and fix ALL clear errors in one pass — do not stop at the line named in the log.
-- Verify filenames: if a COPY/ADD/CMD/ENTRYPOINT references a file, check it against "Repo files present" below. If that file does not exist, correct it to the closest real filename.
-- Check base images/versions: an invalid tag like `python:3.1` must become a real one (e.g. `python:3.12`).
-- Preserve every CORRECT line exactly. For Dockerfiles keep all RUN/COPY/EXPOSE/CMD/WORKDIR/HEALTHCHECK instructions; only change the broken ones.
+- AUDIT THE WHOLE FILE. The log shows the FIRST failure only, but a file may contain SEVERAL bugs. Fix ALL clear errors in one pass (one edit each) — do not stop at the line named in the log.
+- Verify filenames: if a COPY/ADD/CMD/ENTRYPOINT references a file, check it against "Repo files present" below. If it does not exist, correct it to the closest real filename.
+- Invalid image/version tags (e.g. python:3.1, python-version: "3.1") must become real ones (e.g. python:3.12).
+- Preserve everything correct. Change only what is broken.
 - Only include files that actually need changes.
 - confidence < 0.4 means you are unsure — set it low rather than guess."""
 
@@ -684,7 +723,7 @@ def build_repo_inventory(limit: int = 120) -> str:
     paths = []
     for p in sorted(Path(".").rglob("*")):
         if p.is_file() and not any(part in SKIP_DIRS for part in p.parts):
-            rel = str(p).lstrip("./")
+            rel = _relstrip(str(p))
             if any(re.search(pp, rel) for pp in CONTEXT_EXCLUDE_PATTERNS):
                 continue
             paths.append(rel)
@@ -949,6 +988,74 @@ def call_ai(error_signal: str, repo_context: str,
     )
 
 
+def _apply_edits(original: str, edits: list[dict]) -> tuple[str | None, str]:
+    """
+    Apply a list of {find, replace} edits to `original`. Each `find` must occur
+    in the file. We try an exact match first, then a whitespace-tolerant match
+    (the 3B occasionally normalises indentation), so a near-miss still lands.
+    Returns (new_content, "ok") or (None, reason-it-failed).
+    """
+    content = original
+    for i, ed in enumerate(edits):
+        find = ed.get("find", "")
+        repl = ed.get("replace", "")
+        if not isinstance(find, str) or find == "":
+            return None, f"edit #{i+1} has an empty 'find'"
+        if find in content:
+            content = content.replace(find, repl)
+            continue
+        # Whitespace-tolerant fallback: match ignoring leading/trailing spaces
+        # per line, then splice the replacement in at the matched span.
+        norm = lambda s: "\n".join(l.strip() for l in s.splitlines())
+        nfind, ncontent = norm(find), norm(content)
+        if nfind and nfind in ncontent:
+            # Find the original (un-normalised) line range that corresponds.
+            flines = [l.strip() for l in find.splitlines()]
+            clines = content.splitlines()
+            hit = -1
+            for j in range(len(clines) - len(flines) + 1):
+                if [c.strip() for c in clines[j:j + len(flines)]] == flines:
+                    hit = j
+                    break
+            if hit >= 0:
+                # Preserve the original indentation of the matched block so the
+                # replacement doesn't break indentation-sensitive formats (YAML).
+                base = clines[hit][:len(clines[hit]) - len(clines[hit].lstrip())]
+                new_lines = [(base + rl if rl.strip() else rl)
+                             for rl in (repl.splitlines() or [""])]
+                clines[hit:hit + len(flines)] = new_lines
+                content = "\n".join(clines)
+                if original.endswith("\n") and not content.endswith("\n"):
+                    content += "\n"
+                continue
+        return None, (f"edit #{i+1} 'find' text not present in file — "
+                      f"the model's find string did not match the actual content")
+    if content == original:
+        return None, "edits produced no change"
+    return content, "ok"
+
+
+def _resolve_fix_content(fix: dict) -> tuple[str | None, str]:
+    """
+    Turn a fix (either `edits` or `fixed_content`) into the final file content.
+    Prefers targeted edits when present. The resolved content is what every
+    downstream check and the disk write operate on — so validation always runs
+    against the REAL post-fix file, whichever mode produced it.
+    """
+    file = (fix.get("file") or "").strip()
+    edits = fix.get("edits")
+    if edits:
+        p = Path(file)
+        if not p.is_file():
+            return None, f"file does not exist in repo: {file}"
+        original = p.read_text(encoding="utf-8", errors="replace")
+        return _apply_edits(original, edits)
+    fc = fix.get("fixed_content")
+    if isinstance(fc, str) and fc.strip():
+        return fc, "ok"
+    return None, "fix has neither 'edits' nor 'fixed_content'"
+
+
 def _normalize_fix_keys(fixes: list) -> list:
     """Normalize field names from non-compliant responses. With the native
     schema-constrained endpoint this should essentially never fire, but it
@@ -1052,7 +1159,6 @@ def _is_blocked(file_path: str) -> bool:
 
 def validate_fix(fix: dict) -> tuple[bool, str]:
     file    = (fix.get("file") or "").strip()
-    content = fix.get("fixed_content", "")
 
     if not file:
         return False, "missing 'file' key"
@@ -1060,12 +1166,21 @@ def validate_fix(fix: dict) -> tuple[bool, str]:
         return False, f"unsafe path: {file}"
     if _is_blocked(file):
         return False, f"blocked path: {file}"
-    if not isinstance(content, str) or not content.strip():
-        return False, f"empty fixed_content for {file}"
     if not Path(file).exists():
         return False, f"file does not exist in repo: {file}"
+
+    # Resolve whichever mode the model used (edits or fixed_content) into the
+    # final file content, then validate THAT. Cache it on the fix so write_fixes
+    # and the PR body use the identical resolved content.
+    content, reason = _resolve_fix_content(fix)
+    if content is None:
+        return False, reason
+    fix["fixed_content"] = content   # normalise: downstream always reads this
+
+    if not content.strip():
+        return False, f"empty result for {file}"
     if len(content) > 500_000:
-        return False, f"fixed_content too large ({len(content)} chars)"
+        return False, f"result too large ({len(content)} chars)"
 
     ok, reason = _validate_fix_completeness(fix, Path(file))
     if not ok:
@@ -1485,12 +1600,17 @@ def main():
     print(f"  confidence : {confidence:.0%}")
     print(f"  fixes      : {len(fixes)} file(s)")
     for fix in fixes:
-        content_len = len(fix.get("fixed_content", ""))
-        print(f"    → {fix.get('file','?')}  ({content_len} chars)")
-        print(f"      {fix.get('reason','')[:120]}")
-        if content_len < 50:
-            print(f"      ⚠ WARNING: fixed_content very short ({content_len} chars) "
-                  f"— likely truncated")
+        edits = fix.get("edits")
+        if edits:
+            print(f"    → {fix.get('file','?')}  ({len(edits)} edit(s))")
+            print(f"      {fix.get('reason','')[:120]}")
+        else:
+            content_len = len(fix.get("fixed_content", "") or "")
+            print(f"    → {fix.get('file','?')}  ({content_len} chars, whole-file)")
+            print(f"      {fix.get('reason','')[:120]}")
+            if content_len < 50:
+                print(f"      ⚠ WARNING: fixed_content very short ({content_len} chars) "
+                      f"— likely truncated")
 
     if confidence < CONFIDENCE_MIN:
         print(f"[SKIP] Confidence {confidence:.0%} below threshold.")
