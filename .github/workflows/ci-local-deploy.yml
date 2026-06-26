@@ -61,7 +61,7 @@ jobs:
         run: |
           docker buildx build \
             --platform linux/amd64 \
-            -f sample_app/Dockerfileqq \
+            -f sample_app/sample_app/Dockerfile \
             -t ai-devops-sample-app:${{ github.sha }} \
             -t ai-devops-sample-app:latest \
             --load \
