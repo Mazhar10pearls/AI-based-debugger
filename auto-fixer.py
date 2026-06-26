@@ -83,14 +83,16 @@ GIT_TARGET_BRANCH = os.environ.get("GIT_TARGET_BRANCH", "develop")
 # ── Files the AI must never touch ─────────────────────────────────────────────
 ALWAYS_BLOCKED = {".git", "auto-fixer.py", "self-healer.py"}
 BLOCKED_PATTERNS = [
-    r"\.github/workflows/auto-fix.*\.ya?ml$",
-    r"\.github/workflows/self-heal.*\.ya?ml$",
+    r"\.?github/workflows/auto-fix.*\.ya?ml$",
+    r"\.?github/workflows/self-heal.*\.ya?ml$",
 ]
 
 # ── Files to exclude from context discovery (noisy, never the culprit) ─────────
+# NOTE: patterns are leading-dot-optional (\.?) because some code paths historically
+# normalized ".github/..." to "github/..."; this keeps the exclude robust either way.
 CONTEXT_EXCLUDE_PATTERNS = [
-    r"\.github/workflows/auto-fix.*\.ya?ml$",   # this workflow itself
-    r"\.github/workflows/self-heal.*\.ya?ml$",
+    r"\.?github/workflows/auto-fix.*\.ya?ml$",   # this workflow itself
+    r"\.?github/workflows/self-heal.*\.ya?ml$",
     r"workflow-watcher\.py$",
     r"github-monitor\.py$",
     r"ci-platform-poller\.py$",
@@ -358,7 +360,9 @@ def find_ci_workflow_files(repo_root: Path = Path(".")) -> list[str]:
             continue
         for p in sorted(base.rglob("*")):
             if p.is_file() and p.suffix in WORKFLOW_EXTENSIONS:
-                rel = str(p).lstrip("./")
+                rel = str(p)
+                # match excludes on a dot-optional basis WITHOUT mangling the
+                # real path — the path must stay valid for Path(rel).is_file().
                 if any(re.search(pp, rel) for pp in CONTEXT_EXCLUDE_PATTERNS):
                     continue
                 found.append(rel)
@@ -395,8 +399,14 @@ def extract_referenced_paths(log_text: str, repo_root: Path = Path(".")) -> list
     order: list[str] = []
     counts: dict[str, int] = {}
 
+    def _norm(rel: str) -> str:
+        # Strip ONLY a leading "./" — never a bare "." (which would turn
+        # ".github/..." into "github/..." and break the exclude regex, letting
+        # the auto-fix workflow leak into its own context).
+        return rel[2:] if rel.startswith("./") else rel
+
     def _add(rel: str):
-        rel = rel.lstrip("./")
+        rel = _norm(rel)
         if _basename_blocked(Path(rel).name):
             return
         if any(re.search(pp, rel) for pp in CONTEXT_EXCLUDE_PATTERNS):
@@ -406,7 +416,7 @@ def extract_referenced_paths(log_text: str, repo_root: Path = Path(".")) -> list
         counts[rel] = counts.get(rel, 0) + 1
 
     for hit in raw_hits:
-        hit_norm = hit.lstrip("./")
+        hit_norm = _norm(hit)
         # 1. exact relative-path match
         if Path(hit_norm).is_file():
             _add(hit_norm)
@@ -510,27 +520,61 @@ def _score_file(path: Path, error_signal: str,
     return score
 
 
+def _read_whole_forced(path: Path):
+    """
+    Read a FORCE-INCLUDED file whole, allowing a larger budget than the normal
+    per-file cap. A force-included file is the prime suspect — the model must
+    see ALL of it to rewrite it without dropping lines (partial rewrites get
+    rejected by validation). We still cap hard so a runaway file can't blow the
+    prompt budget on the 8GB box.
+    """
+    FORCED_FILE_CHARS = 8000  # generous: a CI workflow YAML fits whole here
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        if len(raw) <= FORCED_FILE_CHARS:
+            return raw
+        return None  # genuinely huge — caller falls back to clamped
+    except Exception as exc:
+        return f"(unreadable: {exc})"
+
+
 def discover_context(error_signal: str,
                      tech_stacks: set[str],
                      pipeline_types: set[str],
-                     forced_paths: list[str]) -> tuple[str, list[str]]:
+                     forced_paths: list[str]) -> tuple[str, list[str], str]:
     parts, included, total = [], [], 0
+    suspect_note = ""   # extra instruction handed to the model (e.g. "fix the workflow, not the Dockerfile")
 
     # ── Build-config error? The CI workflow YAML is the prime suspect ─────────
     # On setup-python / build-context / action-wiring failures the log names no
     # source file, so force-include-by-path finds nothing useful. Detect the
     # signature, push the build/deploy workflow YAML(s) to the FRONT of the
-    # forced list, and raise the file cap to 3 so the workflow sits ALONGSIDE
-    # the other suspects instead of evicting them.
+    # forced list, and raise the file cap so the workflow sits ALONGSIDE the
+    # other suspects instead of evicting them.
     file_cap = MAX_CONTEXT_FILES
-    if looks_like_build_config_error(error_signal):
+    forced_is_build_config = looks_like_build_config_error(error_signal)
+    wf_files: list[str] = []
+    if forced_is_build_config:
         wf_files = find_ci_workflow_files()
         if wf_files:
             file_cap = max(MAX_CONTEXT_FILES, 3)
-            # Prepend, de-duping against anything already referenced.
             forced_paths = wf_files + [f for f in forced_paths if f not in wf_files]
             print(f"[DISCOVER] Build-config error detected → CI workflow is prime "
                   f"suspect; force-including {wf_files} (file cap raised to {file_cap})")
+            # The decisive instruction: stop the model 'fixing' a look-alike
+            # python:3.x in the Dockerfile when the real bug is in the workflow.
+            suspect_note = (
+                "This is a CI-CONFIGURATION failure (build/setup/version), not an "
+                "application bug. The defect is in the CI WORKFLOW YAML below "
+                f"({', '.join(wf_files)}) — most likely a setup-python `python-version`, "
+                "a build-context path, or an action input. Fix the WORKFLOW file. "
+                "Do NOT modify the Dockerfile or requirements unless the error text "
+                "explicitly names them — a similar-looking version in the Dockerfile "
+                "is a decoy, not the cause."
+            )
+
+    # Track whether a forced file is a workflow, so we know to budget it generously.
+    forced_set = set(forced_paths)
 
     def _try_add(rel: str, content: str, label: str) -> bool:
         nonlocal total
@@ -544,20 +588,19 @@ def discover_context(error_signal: str,
         print(f"[DISCOVER] {label} {rel} ({len(content)} chars)")
         return True
 
-    # ── 1. FORCE-INCLUDE files explicitly named in the failure log ────────────
-    #     These take priority over any scored guess. This is the core fix for
-    #     'model forgot the context it needed'.
+    # ── 1. FORCE-INCLUDE files explicitly named / suspected ───────────────────
+    #     The prime suspect MUST reach the model whole — never skipped for size.
     for rel in forced_paths:
         if len(included) >= file_cap:
             break
         p = Path(rel)
         if not (p.is_file() and _is_text_file(p)):
             continue
-        content = _read_whole(p)
+        content = _read_whole_forced(p)        # generous budget for the suspect
         if content is None:
             content = _read_clamped(p)
-            print(f"[DISCOVER] ⚠ {rel} exceeds {MAX_FILE_CHARS} chars — "
-                  f"force-including head+tail (rewrite may be rejected as truncated)")
+            print(f"[DISCOVER] ⚠ {rel} very large — force-including head+tail "
+                  f"(rewrite may be rejected as truncated)")
         _try_add(rel, content, "★ Force-included")
 
     # ── 2. Fill remaining slots with score-ranked candidates ──────────────────
@@ -593,7 +636,7 @@ def discover_context(error_signal: str,
 
     context = "\n\n".join(parts)
     print(f"[DISCOVER] {len(included)} files, {len(context)} chars total")
-    return context, included
+    return context, included, suspect_note
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -619,7 +662,7 @@ RULES:
 
 USER_PROMPT = """\
 ## Pipeline: {pipeline_types} | Stack: {tech_stacks}
-
+{suspect_note}
 ## CI failure (key lines — may show only the FIRST of several bugs):
 ```
 {error_signal}
@@ -728,7 +771,8 @@ def prescan_issues(included_files: list[str]) -> list[str]:
 
 def build_prompt(error_signal: str, repo_context: str,
                  pipeline_types: set, tech_stacks: set,
-                 prescan: list[str] | None = None) -> str:
+                 prescan: list[str] | None = None,
+                 suspect_note: str = "") -> str:
     repo_inventory = build_repo_inventory()
     if prescan:
         prescan_block = (
@@ -739,10 +783,13 @@ def build_prompt(error_signal: str, repo_context: str,
     else:
         prescan_block = ""
 
+    note_block = f"\n## ⚠ DIAGNOSIS DIRECTIVE\n{suspect_note}\n" if suspect_note else ""
+
     def _fmt(ctx):
         return USER_PROMPT.format(
             pipeline_types=", ".join(sorted(pipeline_types)) or "unknown",
             tech_stacks=", ".join(sorted(tech_stacks)) or "unknown",
+            suspect_note=note_block,
             error_signal=error_signal,
             prescan_block=prescan_block,
             repo_inventory=repo_inventory,
@@ -797,10 +844,11 @@ def _extract_token(line: bytes, fmt: str) -> str:
 
 def call_ai(error_signal: str, repo_context: str,
             pipeline_types: set, tech_stacks: set,
-            prescan: list[str] | None = None) -> str:
+            prescan: list[str] | None = None,
+            suspect_note: str = "") -> str:
     """Call Ollama with auto-detected endpoint, schema-constrained output, and
     robust streaming + batch fallback."""
-    user_prompt  = build_prompt(error_signal, repo_context, pipeline_types, tech_stacks, prescan)
+    user_prompt  = build_prompt(error_signal, repo_context, pipeline_types, tech_stacks, prescan, suspect_note)
     full_prompt  = f"{SYSTEM_PROMPT}\n\n{user_prompt}"
     endpoint, fmt = _detect_ollama_endpoint()
 
@@ -1404,7 +1452,7 @@ def main():
     print("\n━━━ STAGE 2: DISCOVER ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     t2 = time.time()
     forced_paths = extract_referenced_paths(log_text)
-    repo_context, included = discover_context(
+    repo_context, included, suspect_note = discover_context(
         error_signal, tech_stacks, pipeline_types, forced_paths)
     if not included:
         print("[DISCOVER] WARNING: no files resolved — AI has no context to work with.")
@@ -1415,7 +1463,8 @@ def main():
     print("\n━━━ STAGE 3: ANALYSE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     t3 = time.time()
     try:
-        raw     = call_ai(error_signal, repo_context, pipeline_types, tech_stacks, prescan)
+        raw     = call_ai(error_signal, repo_context, pipeline_types, tech_stacks,
+                          prescan, suspect_note)
         ai_data = parse_ai_response(raw)
     except Exception as exc:
         print(f"[ERROR] AI failed: {exc}", file=sys.stderr)
