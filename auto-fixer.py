@@ -37,6 +37,7 @@ Exit codes:
 
 import argparse
 import ast
+import difflib
 import json
 import os
 import re
@@ -732,6 +733,19 @@ def build_repo_inventory(limit: int = 120) -> str:
     return ", ".join(paths) if paths else "(none)"
 
 
+def _repo_path_index() -> tuple[set[str], dict[str, list[str]]]:
+    """Return (all_posix_paths, basename -> [posix paths]) for the whole repo."""
+    all_paths: set[str] = set()
+    name_to_paths: dict[str, list[str]] = {}
+    for p in Path(".").rglob("*"):
+        if p.is_file() and not any(part in SKIP_DIRS for part in p.parts):
+            posix = str(p).replace("\\", "/")
+            posix = posix[2:] if posix.startswith("./") else posix
+            all_paths.add(posix)
+            name_to_paths.setdefault(p.name, []).append(posix)
+    return all_paths, name_to_paths
+
+
 def _repo_basenames() -> set[str]:
     names = set()
     for p in Path(".").rglob("*"):
@@ -740,65 +754,159 @@ def _repo_basenames() -> set[str]:
     return names
 
 
-def prescan_issues(included_files: list[str]) -> list[str]:
+def _closest_repo_path(token: str,
+                       all_paths: set[str],
+                       name_to_paths: dict[str, list[str]]) -> str | None:
+    """Best-effort 'did you mean' for a referenced path that doesn't exist.
+    1) exact basename (unique) → 2) fuzzy on full path → 3) fuzzy on basename."""
+    tok = token.replace("\\", "/")
+    base = Path(tok).name
+    # 1. exact basename, unambiguous
+    exact = name_to_paths.get(base, [])
+    if len(exact) == 1:
+        return exact[0]
+    # 2. fuzzy match on full relative paths
+    m = difflib.get_close_matches(tok, list(all_paths), n=1, cutoff=0.6)
+    if m:
+        return m[0]
+    # 3. fuzzy match on basenames → unique path
+    nm = difflib.get_close_matches(base, list(name_to_paths.keys()), n=1, cutoff=0.6)
+    if nm and len(name_to_paths[nm[0]]) == 1:
+        return name_to_paths[nm[0]][0]
+    return None
+
+
+# Value flags whose ARGUMENT is not a build-context path (so we skip them when
+# hunting for the trailing `docker build` context).
+_DOCKER_VALUE_FLAGS = {
+    "-f", "--file", "-t", "--tag", "--platform", "--build-arg",
+    "--target", "--cache-from", "--cache-to", "--output", "-o", "--network",
+}
+
+
+def _extract_path_refs(rel: str, text: str) -> list[tuple[str, str]]:
     """
-    Deterministically find bugs a 3B tends to miss when it anchors on the FIRST
-    error in the log. We hand these to the model as explicit "you MUST also fix
-    these" instructions, instead of relying on it to audit the file itself.
+    Generic, file-type-agnostic extraction of LOCAL FILE references from a file,
+    by the position they appear in. This is the heart of the pre-scan: it is not
+    hardcoded to Dockerfiles — it knows the handful of places ANY build/CI file
+    points at a local path, and lets the existence check below do the rest.
 
-    Currently scans Dockerfiles for:
-      - invalid `FROM` tags (e.g. python:3.1 / python:3. — not a real version)
-      - COPY/ADD/CMD/ENTRYPOINT referencing a file that doesn't exist in the repo
-
-    These are the mechanically-detectable bugs; anything subtler stays the
-    model's job. Returns a list of human-readable findings keyed by file.
+    Yields (position_label, raw_path).
     """
-    findings: list[str] = []
-    repo_names = _repo_basenames()
+    refs: list[tuple[str, str]] = []
+    name = Path(rel).name.lower()
+    # collapse backslash line-continuations so a multi-line `docker build \` is one string
+    joined = re.sub(r"\\\s*\n\s*", " ", text)
 
-    # A bare-bones "looks like a real <name>:<tag>" check. We only flag tags that
-    # are obviously malformed (trailing dot, single-component like "3.1" for
-    # python) — never guess for images we don't recognise.
-    BAD_PY_TAG = re.compile(r'^python:3\.\d{0,1}$')  # python:3 , python:3. , python:3.1
-
-    for rel in included_files:
-        p = Path(rel)
-        if not (p.name.lower().startswith("dockerfile") and p.is_file()):
-            continue
-        try:
-            lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
-        except Exception:
-            continue
-
-        for ln in lines:
+    if name.startswith("dockerfile"):
+        for ln in text.splitlines():
             s = ln.strip()
             if not s or s.startswith("#"):
                 continue
+            ca = re.match(r"(?i)(COPY|ADD)\s+(.*)", s)
+            if ca:
+                toks = [t for t in ca.group(2).split() if not t.startswith("--")]
+                # in `COPY src... dest`, the last token is the in-image dest — skip it
+                sources = toks[:-1] if len(toks) > 1 else toks
+                for t in sources:
+                    refs.append((f"{ca.group(1).upper()} source", t))
+            ce = re.match(r"(?i)(CMD|ENTRYPOINT)\s+(.*)", s)
+            if ce:
+                for t in re.findall(r"[\w./\-]+\.[A-Za-z0-9]+", ce.group(2)):
+                    refs.append((ce.group(1).upper(), t))
+        return refs
 
-            # 1. FROM with a malformed/too-old python tag
-            m = re.match(r'(?i)FROM\s+(\S+)', s)
-            if m and BAD_PY_TAG.match(m.group(1).strip()):
-                findings.append(
-                    f"{rel}: `{m.group(1)}` is not a valid Python image tag "
-                    f"— change it to a real version such as python:3.12.")
+    # Everything else (CI workflow YAML, shell scripts): scan the commands that
+    # reference local paths — same logic regardless of which file they live in.
+    for m in re.finditer(r"docker\s+(?:buildx\s+)?build\b([^\n]*)", joined):
+        args = m.group(1)
+        fm = re.search(r"(?:-f|--file)\s+(\S+)", args)
+        if fm:
+            refs.append(("docker build -f", fm.group(1)))
+        # build context = trailing positional token, skipping flags + their values
+        toks = args.split()
+        i = len(toks) - 1
+        while i >= 0:
+            t = toks[i]
+            if t.startswith("-"):
+                i -= 1
                 continue
+            prev = toks[i - 1] if i - 1 >= 0 else ""
+            if prev in _DOCKER_VALUE_FLAGS:
+                i -= 2
+                continue
+            refs.append(("docker build context", t))
+            break
+    for m in re.finditer(r"pip\d*\s+install\b[^\n]*?(?:-r|--requirement)\s+(\S+)", joined):
+        refs.append(("pip install -r", m.group(1)))
+    for m in re.finditer(r"\b(?:python3?|bash|sh)\s+([\w./\-]+\.(?:py|sh))\b", joined):
+        refs.append(("script reference", m.group(1)))
+    return refs
 
-            # 2. COPY/ADD/CMD/ENTRYPOINT referencing a missing local file
-            kw = re.match(r'(?i)(COPY|ADD|CMD|ENTRYPOINT)\b(.*)', s)
-            if not kw:
-                continue
-            rest = kw.group(2)
-            # pull out token-looking filenames (skip flags, URLs, shell words)
-            for tok in re.findall(r'[\w./\-]+\.[A-Za-z0-9]+', rest):
-                base = Path(tok).name
-                # ignore obvious non-local refs and the catch-all "." copies
-                if "://" in rest or base in (".", ""):
-                    continue
-                if base not in repo_names:
+
+def prescan_issues(included_files: list[str]) -> list[str]:
+    """
+    Deterministically find bugs a 3B tends to miss when it anchors on the FIRST
+    error in the log. We hand these to the model as explicit "fix this EXACT
+    thing" instructions instead of relying on it to notice or guess.
+
+    One general rule, applied to EVERY file type (not hardcoded to Dockerfiles):
+      • any LOCAL PATH a file references (Dockerfile COPY/CMD, a workflow's
+        `docker build -f`/context, pip `-r`, a script runner) MUST exist in the
+        repo — if it doesn't, flag it and suggest the closest real path.
+    Plus a value check:
+      • an invalid base-image tag (python:3.1 / python:3.) → real version.
+    """
+    findings: list[str] = []
+    all_paths, name_to_paths = _repo_path_index()
+
+    for rel in included_files:
+        p = Path(rel)
+        if not p.is_file():
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        # ── value check: invalid Python base-image tag in a Dockerfile FROM ──
+        if p.name.lower().startswith("dockerfile"):
+            for ln in text.splitlines():
+                fm = re.match(r"(?i)\s*FROM\s+(\S+)", ln)
+                if fm and re.fullmatch(r"python:3\.?\d?", fm.group(1).strip()):
                     findings.append(
-                        f"{rel}: `{kw.group(1)} {tok}` references '{base}', which "
-                        f"does not exist in the repo — correct it to the real file.")
+                        f"{rel}: `{fm.group(1).strip()}` is not a valid Python image "
+                        f"tag — change it to a real version such as python:3.12.")
 
+        # ── general path-existence check (all file types) ────────────────────
+        for kind, raw in _extract_path_refs(rel, text):
+            tok = raw.strip().strip("\"'")
+            if not tok or tok in (".", ".."):
+                continue
+            # skip non-local refs: URLs, env/GH vars, image tags, action refs, kv args
+            if ("://" in tok or "$" in tok or "${{" in tok
+                    or ":" in tok or "@" in tok or "=" in tok):
+                continue
+            if not re.fullmatch(r"[\w./\-]+", tok):
+                continue
+            norm = tok[2:] if tok.startswith("./") else tok
+            if Path(norm).exists():
+                continue
+            suggestion = _closest_repo_path(norm, all_paths, name_to_paths)
+            # For a guessed build context, only speak up when we're confident
+            # (a close match exists) — avoids flagging odd-but-harmless tokens.
+            if kind == "docker build context" and not suggestion:
+                continue
+            if suggestion:
+                findings.append(
+                    f"{rel}: `{kind}` points to `{tok}`, which does not exist. "
+                    f"The real path is `{suggestion}` — change it to exactly that.")
+            else:
+                findings.append(
+                    f"{rel}: `{kind}` points to `{tok}`, which does not exist in the "
+                    f"repo — correct it to the real path.")
+
+    findings = list(dict.fromkeys(findings))  # de-dupe
     if findings:
         print(f"[PRESCAN] Found {len(findings)} additional issue(s) the log did not surface:")
         for f in findings:
