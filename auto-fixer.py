@@ -757,23 +757,82 @@ def _repo_basenames() -> set[str]:
 def _closest_repo_path(token: str,
                        all_paths: set[str],
                        name_to_paths: dict[str, list[str]]) -> str | None:
-    """Best-effort 'did you mean' for a referenced path that doesn't exist.
-    1) exact basename (unique) → 2) fuzzy on full path → 3) fuzzy on basename."""
+    """
+    Best-effort 'did you mean' for a referenced path that doesn't exist — robust
+    to heavy typos (requiremeqqqnts.txt → requirements.txt, appqqq.py → app.py).
+
+    Strategy, in order:
+      1) exact basename, unambiguous.
+      2) extension-aware STEM match: among repo files with the SAME extension,
+         pick the one whose filename-stem is most similar. A real stem that is
+         contained in (or contains) the typo'd stem gets a strong bonus, since
+         injected junk ('appqqq' ⊃ 'app') is the most common mangling. Lower
+         cutoff than a raw full-string match because the extension already
+         constrains the candidate set.
+      3) fuzzy match on the full relative path.
+    """
     tok = token.replace("\\", "/")
     base = Path(tok).name
+    if "." in base:
+        stem, ext = base.rsplit(".", 1)
+    else:
+        stem, ext = base, ""
+
     # 1. exact basename, unambiguous
     exact = name_to_paths.get(base, [])
     if len(exact) == 1:
         return exact[0]
-    # 2. fuzzy match on full relative paths
+
+    # 2. extension-aware stem similarity
+    best_score, best_paths = 0.0, None
+    for name, paths in name_to_paths.items():
+        if "." in name:
+            nstem, next_ = name.rsplit(".", 1)
+        else:
+            nstem, next_ = name, ""
+        # if the reference has an extension, the candidate must share it
+        if ext and next_ and ext.lower() != next_.lower():
+            continue
+        score = difflib.SequenceMatcher(None, stem.lower(), nstem.lower()).ratio()
+        # containment bonus: 'app' inside 'appqqq', or vice versa
+        if nstem and (nstem.lower() in stem.lower() or stem.lower() in nstem.lower()):
+            score = max(score, 0.75)
+        if score > best_score:
+            best_score, best_paths = score, paths
+    if best_paths and len(best_paths) == 1 and best_score >= 0.45:
+        return best_paths[0]
+
+    # 3. fuzzy match on full relative paths
     m = difflib.get_close_matches(tok, list(all_paths), n=1, cutoff=0.6)
     if m:
         return m[0]
-    # 3. fuzzy match on basenames → unique path
-    nm = difflib.get_close_matches(base, list(name_to_paths.keys()), n=1, cutoff=0.6)
-    if nm and len(name_to_paths[nm[0]]) == 1:
-        return name_to_paths[nm[0]][0]
     return None
+
+
+# ── Python version validity ──────────────────────────────────────────────────
+# A small, easy-to-update set of base-image / setup-python minors we treat as
+# "real". This is knowledge, not a hardcoded path: it lets us flag BOTH
+# syntactically-broken tags (3.1qq, 3.) AND valid-looking-but-unavailable ones
+# (3.1, 3.7). Bump this list as new Python versions ship.
+SUPPORTED_PY_MINORS = {"3.8", "3.9", "3.10", "3.11", "3.12", "3.13"}
+LATEST_PY = "3.12"
+
+
+def _bad_python_version(value: str) -> bool:
+    """True if a Python version string is invalid or unsupported.
+    Accepts: 3, latest, 3.12, 3.12.1, 3.12-slim, 3.12-bookworm.
+    Rejects: 3.1qq (junk), 3. (trailing dot), 3.1 / 3.7 (unsupported minor)."""
+    v = value.strip().strip("\"'")
+    if not v:
+        return False
+    core = v.split("-")[0]                 # drop -slim / -bookworm suffixes
+    if core in ("latest", "3"):
+        return False
+    if not re.fullmatch(r"\d+(\.\d+){1,2}", core):   # syntactically broken
+        return True
+    parts = core.split(".")
+    minor = f"{parts[0]}.{parts[1]}"
+    return minor not in SUPPORTED_PY_MINORS
 
 
 # Value flags whose ARGUMENT is not a build-context path (so we skip them when
