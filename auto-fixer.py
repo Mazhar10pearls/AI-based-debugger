@@ -844,20 +844,30 @@ def _extract_path_refs(rel: str, text: str) -> list[tuple[str, str]]:
     return refs
 
 
-def prescan_issues(included_files: list[str]) -> list[str]:
+def prescan_issues(included_files: list[str]) -> tuple[list[str], list[dict]]:
     """
     Deterministically find bugs a 3B tends to miss when it anchors on the FIRST
-    error in the log. We hand these to the model as explicit "fix this EXACT
-    thing" instructions instead of relying on it to notice or guess.
+    error in the log.
+
+    Returns (messages, autofixes):
+      • messages  — human-readable findings, fed to the model as must-fix hints
+                    for anything we can't fix ourselves.
+      • autofixes — fixes we can apply WITHOUT the model: each is
+                    {"file","reason","find","replace"} where `find` is the exact
+                    wrong substring taken from the file and `replace` is the
+                    deterministically-computed correction. These never go through
+                    the model, so there is no find-string to hallucinate and no
+                    timeout — applied straight to disk.
 
     One general rule, applied to EVERY file type (not hardcoded to Dockerfiles):
       • any LOCAL PATH a file references (Dockerfile COPY/CMD, a workflow's
         `docker build -f`/context, pip `-r`, a script runner) MUST exist in the
-        repo — if it doesn't, flag it and suggest the closest real path.
+        repo — if it doesn't and we can resolve the real path, auto-fix it.
     Plus a value check:
       • an invalid base-image tag (python:3.1 / python:3.) → real version.
     """
     findings: list[str] = []
+    autofixes: list[dict] = []
     all_paths, name_to_paths = _repo_path_index()
 
     for rel in included_files:
@@ -872,11 +882,20 @@ def prescan_issues(included_files: list[str]) -> list[str]:
         # ── value check: invalid Python base-image tag in a Dockerfile FROM ──
         if p.name.lower().startswith("dockerfile"):
             for ln in text.splitlines():
-                fm = re.match(r"(?i)\s*FROM\s+(\S+)", ln)
-                if fm and re.fullmatch(r"python:3\.?\d?", fm.group(1).strip()):
+                fm = re.match(r"(?i)(\s*FROM\s+)(\S+)", ln)
+                if fm and re.fullmatch(r"python:3\.?\d?", fm.group(2).strip()):
+                    bad = fm.group(2).strip()
                     findings.append(
-                        f"{rel}: `{fm.group(1).strip()}` is not a valid Python image "
-                        f"tag — change it to a real version such as python:3.12.")
+                        f"{rel}: `{bad}` is not a valid Python image tag — change "
+                        f"it to a real version such as python:3.12.")
+                    # exact find = the whole 'FROM <tag>' as it appears (unique,
+                    # avoids python:3.1 being a substring of python:3.12)
+                    autofixes.append({
+                        "file": rel,
+                        "reason": f"Invalid Python image tag {bad} → python:3.12",
+                        "find": ln.strip(),
+                        "replace": ln.strip().replace(bad, "python:3.12"),
+                    })
 
         # ── general path-existence check (all file types) ────────────────────
         for kind, raw in _extract_path_refs(rel, text):
@@ -901,6 +920,15 @@ def prescan_issues(included_files: list[str]) -> list[str]:
                 findings.append(
                     f"{rel}: `{kind}` points to `{tok}`, which does not exist. "
                     f"The real path is `{suggestion}` — change it to exactly that.")
+                # Deterministic auto-fix: literal replace of the exact wrong token
+                # (which is guaranteed present in the file) with the real path.
+                if tok in text:
+                    autofixes.append({
+                        "file": rel,
+                        "reason": f"{kind}: '{tok}' does not exist → '{suggestion}'",
+                        "find": tok,
+                        "replace": suggestion,
+                    })
             else:
                 findings.append(
                     f"{rel}: `{kind}` points to `{tok}`, which does not exist in the "
@@ -908,12 +936,30 @@ def prescan_issues(included_files: list[str]) -> list[str]:
 
     findings = list(dict.fromkeys(findings))  # de-dupe
     if findings:
-        print(f"[PRESCAN] Found {len(findings)} additional issue(s) the log did not surface:")
+        print(f"[PRESCAN] Found {len(findings)} issue(s) the log did not surface:")
         for f in findings:
             print(f"[PRESCAN]   • {f}")
+        if autofixes:
+            print(f"[PRESCAN] {len(autofixes)} of these can be auto-fixed deterministically "
+                  f"(no model needed).")
     else:
         print("[PRESCAN] No extra static issues found.")
-    return findings
+    return findings, autofixes
+
+
+def group_autofixes(autofixes: list[dict]) -> list[dict]:
+    """Collapse per-issue autofixes into one fix-dict per file, with an `edits`
+    list — the same shape the model produces, so they flow through the existing
+    validate → write → commit → PR path unchanged."""
+    by_file: dict[str, dict] = {}
+    for af in autofixes:
+        f = by_file.setdefault(af["file"], {"file": af["file"], "reason": [], "edits": []})
+        f["reason"].append(af["reason"])
+        f["edits"].append({"find": af["find"], "replace": af["replace"]})
+    fixes = []
+    for f in by_file.values():
+        fixes.append({"file": f["file"], "reason": "; ".join(f["reason"]), "edits": f["edits"]})
+    return fixes
 
 
 def build_prompt(error_signal: str, repo_context: str,
@@ -1717,46 +1763,64 @@ def main():
         error_signal, tech_stacks, pipeline_types, forced_paths)
     if not included:
         print("[DISCOVER] WARNING: no files resolved — AI has no context to work with.")
-    prescan = prescan_issues(included)
+    prescan, prescan_autofixes = prescan_issues(included)
     print(f"[TIMING] Stage 2 done in {time.time()-t2:.1f}s")
 
     # ══ STAGE 3: ANALYSE ═════════════════════════════════════════════════════
     print("\n━━━ STAGE 3: ANALYSE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     t3 = time.time()
-    try:
-        raw     = call_ai(error_signal, repo_context, pipeline_types, tech_stacks,
-                          prescan, suspect_note)
-        ai_data = parse_ai_response(raw)
-    except Exception as exc:
-        print(f"[ERROR] AI failed: {exc}", file=sys.stderr)
-        if token and repo:
-            open_issue(token, repo, f"AI analysis failed: {exc}",
-                       pipeline_type=", ".join(pipeline_types))
-        sys.exit(2)
-    print(f"[TIMING] Stage 3 done in {time.time()-t3:.1f}s")
 
-    root_cause    = ai_data.get("root_cause",    "unknown")
-    confidence    = float(ai_data.get("confidence", 1.0))
-    commit_msg    = ai_data.get("commit_message", "fix: auto-fixer rewrite")
-    fixes         = ai_data.get("fixes",         [])
-    detected_type = ai_data.get("pipeline_type", ", ".join(sorted(pipeline_types)))
+    if prescan_autofixes:
+        # ── Deterministic path: the pre-scan computed exact corrections, so we
+        #    apply them WITHOUT the model — no find-string to hallucinate, no
+        #    timeout. The model is only for bugs the pre-scan can't resolve.
+        fixes         = group_autofixes(prescan_autofixes)
+        root_cause    = "; ".join(f.get("reason", "") for f in fixes) or "pre-scan corrections"
+        commit_msg    = "fix: correct invalid path/version references (auto-detected)"
+        confidence    = 1.0
+        detected_type = ", ".join(sorted(pipeline_types))
+        print(f"[ANALYSE] Pre-scan resolved {len(prescan_autofixes)} issue(s) "
+              f"deterministically — skipping model call.")
+        print(f"  root_cause : {root_cause}")
+        print(f"  fixes      : {len(fixes)} file(s)")
+        for fix in fixes:
+            print(f"    → {fix['file']}  ({len(fix['edits'])} edit(s))")
+        print(f"[TIMING] Stage 3 done in {time.time()-t3:.1f}s (no model)")
+    else:
+        try:
+            raw     = call_ai(error_signal, repo_context, pipeline_types, tech_stacks,
+                              prescan, suspect_note)
+            ai_data = parse_ai_response(raw)
+        except Exception as exc:
+            print(f"[ERROR] AI failed: {exc}", file=sys.stderr)
+            if token and repo:
+                open_issue(token, repo, f"AI analysis failed: {exc}",
+                           pipeline_type=", ".join(pipeline_types))
+            sys.exit(2)
+        print(f"[TIMING] Stage 3 done in {time.time()-t3:.1f}s")
 
-    print(f"\n  pipeline   : {detected_type}")
-    print(f"  root_cause : {root_cause}")
-    print(f"  confidence : {confidence:.0%}")
-    print(f"  fixes      : {len(fixes)} file(s)")
-    for fix in fixes:
-        edits = fix.get("edits")
-        if edits:
-            print(f"    → {fix.get('file','?')}  ({len(edits)} edit(s))")
-            print(f"      {fix.get('reason','')[:120]}")
-        else:
-            content_len = len(fix.get("fixed_content", "") or "")
-            print(f"    → {fix.get('file','?')}  ({content_len} chars, whole-file)")
-            print(f"      {fix.get('reason','')[:120]}")
-            if content_len < 50:
-                print(f"      ⚠ WARNING: fixed_content very short ({content_len} chars) "
-                      f"— likely truncated")
+        root_cause    = ai_data.get("root_cause",    "unknown")
+        confidence    = float(ai_data.get("confidence", 1.0))
+        commit_msg    = ai_data.get("commit_message", "fix: auto-fixer rewrite")
+        fixes         = ai_data.get("fixes",         [])
+        detected_type = ai_data.get("pipeline_type", ", ".join(sorted(pipeline_types)))
+
+        print(f"\n  pipeline   : {detected_type}")
+        print(f"  root_cause : {root_cause}")
+        print(f"  confidence : {confidence:.0%}")
+        print(f"  fixes      : {len(fixes)} file(s)")
+        for fix in fixes:
+            edits = fix.get("edits")
+            if edits:
+                print(f"    → {fix.get('file','?')}  ({len(edits)} edit(s))")
+                print(f"      {fix.get('reason','')[:120]}")
+            else:
+                content_len = len(fix.get("fixed_content", "") or "")
+                print(f"    → {fix.get('file','?')}  ({content_len} chars, whole-file)")
+                print(f"      {fix.get('reason','')[:120]}")
+                if content_len < 50:
+                    print(f"      ⚠ WARNING: fixed_content very short ({content_len} chars) "
+                          f"— likely truncated")
 
     if confidence < CONFIDENCE_MIN:
         print(f"[SKIP] Confidence {confidence:.0%} below threshold.")
