@@ -1,4 +1,4 @@
-name: Auto Fix Failed Local CI
+name: AI-Based Debugger Pipeline
 
 permissions:
   contents: write
