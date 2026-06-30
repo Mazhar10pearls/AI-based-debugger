@@ -6,4 +6,4 @@ def test_homepage():
     response = client.get("/")
 
     assert response.status_code == 200
-    assert response.status_code == 200
+    assert b"Hello from local AI DevOps app!" in response.data
