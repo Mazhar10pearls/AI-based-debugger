@@ -968,7 +968,20 @@ def prescan_issues(included_files: list[str]) -> tuple[list[str], list[dict]]:
                         "replace": ln.strip().replace(bad, "python:3.12"),
                     })
 
-        # ── general path-existence check (all file types) ────────────────────
+        # ── Dockerfile path refs are NOT repo-relative — skip existence check ─
+        # A Dockerfile COPY/ADD source is relative to the BUILD CONTEXT, and a
+        # CMD/ENTRYPOINT path is relative to the image WORKDIR after COPY. Neither
+        # is relative to the repo checkout, and we don't know the build-context
+        # dir — so "app.py missing at repo root → rewrite to sample_app/app.py"
+        # is exactly wrong: with context = sample_app/, `COPY . .` puts the file
+        # at /app/app.py and `CMD ["python","app.py"]` is correct. Validating
+        # against the repo regressed a working CMD (PR that broke the smoke test).
+        # The FROM-tag value check above is reliable and stays; layout bugs go to
+        # the model, which sees WORKDIR + COPY + the runtime error.
+        if p.name.lower().startswith("dockerfile"):
+            continue
+
+        # ── general path-existence check (workflows, scripts) ────────────────
         for kind, raw in _extract_path_refs(rel, text):
             tok = raw.strip().strip("\"'")
             if not tok or tok in (".", ".."):
