@@ -7,4 +7,4 @@ def hello():
     return "Hello from local AI DevOps app!"
 
 if __name__ == "__main__":
-    raise RuntimeError("intentional crash")
+    print("Running app...")
