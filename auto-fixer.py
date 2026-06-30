@@ -707,7 +707,8 @@ RULES:
 - file = exact path from the ### header.
 - AUDIT THE WHOLE FILE. The log shows the FIRST failure only, but a file may contain SEVERAL bugs. Fix ALL clear errors in one pass (one edit each) — do not stop at the line named in the log.
 - Verify filenames: if a COPY/ADD/CMD/ENTRYPOINT references a file, check it against "Repo files present" below. If it does not exist, correct it to the closest real filename.
-- Invalid image/version tags (e.g. python:3.1, python-version: "3.1") must become real ones (e.g. python:3.12).
+- Do NOT change Python or base-image versions, or `python-version` values — version validity is handled separately and the versions shown to you are already correct. Never claim a version is "unavailable", "outdated", or "not found"; that is not your job and is usually wrong.
+- Base your root_cause ONLY on the actual error text shown above. Do NOT invent a cause the log does not state. If the error names a file, a package (e.g. a line in requirements.txt), or a specific line, fix THAT — not something unrelated that merely looks suspicious.
 - Preserve everything correct. Change only what is broken.
 - Only include files that actually need changes.
 - confidence < 0.4 means you are unsure — set it low rather than guess."""
@@ -1028,6 +1029,93 @@ def prescan_issues(included_files: list[str]) -> tuple[list[str], list[dict]]:
                   f"(no model needed).")
     else:
         print("[PRESCAN] No extra static issues found.")
+    return findings, autofixes
+
+
+# ── Cross-file PORT consistency ───────────────────────────────────────────────
+# A whole class of failures has NO error in the log: the app starts fine, but a
+# smoke test / healthcheck can't reach it because the app's listen port no longer
+# matches the port the container contract (EXPOSE), the HEALTHCHECK and the CI
+# smoke test all expect. The log shows success ("Running on ...:5001") plus a
+# generic "Smoke test FAILED" — nothing the error-signal extractor OR the model
+# can pin to a file, and app.py/Dockerfile/workflow rarely fit in context together
+# to be correlated. So we resolve it deterministically by reading the files
+# directly: the Dockerfile EXPOSE is the declared contract; the app must bind it.
+# If an app file's listen port disagrees, change the APP to match EXPOSE (never
+# the reverse — EXPOSE/healthcheck/CI define the contract the app must honour).
+# Fires ONLY on a single unambiguous EXPOSE port and a single dissenting app
+# port, so it cannot guess wrong; otherwise it stays silent.
+
+_APP_PORT_PATTERNS = [
+    re.compile(r"(?P<a>\.run\([^)]*\bport\s*=\s*)(?P<n>\d{2,5})"),       # Flask: app.run(..., port=NNNN)
+    re.compile(r"(?P<a>\.listen\(\s*)(?P<n>\d{2,5})"),                   # Node: app.listen(NNNN)
+    re.compile(r"(?P<a>\bPORT[\"']?\s*[,=]\s*[\"']?)(?P<n>\d{2,5})"),    # os.environ.get("PORT", NNNN) / PORT=NNNN
+]
+
+
+def _expose_port(repo_root: Path) -> int | None:
+    """The single declared container port from Dockerfile EXPOSE, or None if
+    there is zero or more than one (ambiguous → we refuse to guess)."""
+    ports: set[int] = set()
+    for p in repo_root.rglob("Dockerfile*"):
+        if not p.is_file() or any(part in SKIP_DIRS for part in p.parts):
+            continue
+        try:
+            txt = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for m in re.finditer(r"(?im)^\s*EXPOSE\s+(\d{2,5})", txt):
+            ports.add(int(m.group(1)))
+    return next(iter(ports)) if len(ports) == 1 else None
+
+
+def prescan_port_consistency(repo_root: Path = Path(".")) -> tuple[list[str], list[dict]]:
+    findings: list[str] = []
+    autofixes: list[dict] = []
+    contract = _expose_port(repo_root)
+    if contract is None:
+        return findings, autofixes          # no single declared port → don't guess
+
+    APP_EXTS = (".py", ".js", ".ts")
+    for p in repo_root.rglob("*"):
+        if not p.is_file() or p.suffix not in APP_EXTS:
+            continue
+        if any(part in SKIP_DIRS for part in p.parts):
+            continue
+        rel = _relstrip(str(p))
+        if any(re.search(pp, rel) for pp in CONTEXT_EXCLUDE_PATTERNS):
+            continue                         # never touch our own tooling
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for pat in _APP_PORT_PATTERNS:
+            m = pat.search(text)
+            if not m:
+                continue
+            app_port = int(m.group("n"))
+            if app_port == contract:
+                break                        # already consistent
+            find = m.group(0)
+            if text.count(find) != 1:
+                break                        # ambiguous occurrence — don't touch
+            replace = m.group("a") + str(contract)
+            findings.append(
+                f"{rel}: app listens on port {app_port}, but the container contract "
+                f"(Dockerfile EXPOSE) is {contract} — the healthcheck and CI smoke "
+                f"test target {contract}, so the app is unreachable. Change it to {contract}.")
+            autofixes.append({
+                "file": rel,
+                "reason": f"App listen port {app_port} != EXPOSE {contract} → bind {contract}",
+                "find": find,
+                "replace": replace,
+            })
+            break                            # one listen-port fix per file
+    if findings:
+        print(f"[PRESCAN] Port-consistency: {len(findings)} mismatch(es) vs "
+              f"EXPOSE {contract} (no error in the log — caught by direct scan):")
+        for f in findings:
+            print(f"[PRESCAN]   • {f}")
     return findings, autofixes
 
 
@@ -1378,6 +1466,46 @@ def _validate_fix_completeness(fix: dict, original_path: Path) -> tuple[bool, st
         except Exception:
             pass
     return True, "ok"
+
+
+def _fix_changes_valid_py_version(fix: dict) -> bool:
+    """
+    True if this MODEL fix rewrites an ALREADY-VALID Python version. Version
+    validity is owned by the deterministic prescan (_bad_python_version /
+    SUPPORTED_PY_MINORS); the model has no better information than that, so any
+    model edit that changes a version we already know is fine is a confabulation
+    — the recurring 'python:3.12 is not available' hallucination — not a fix.
+    """
+    def _versions(text: str) -> list[str]:
+        vs = []
+        for m in re.finditer(r"python:([A-Za-z0-9.\-]+)", text):
+            vs.append(m.group(1).strip().strip("\"'"))
+        for m in re.finditer(r'python-version:\s*["\']?([0-9][^"\'\s#]*)', text):
+            vs.append(m.group(1).strip().strip("\"'"))
+        return vs
+
+    edits = fix.get("edits")
+    if edits:
+        for e in edits:
+            find_v = _versions(e.get("find", "") or "")
+            repl_v = _versions(e.get("replace", "") or "")
+            for v in find_v:
+                if not _bad_python_version(v) and v not in repl_v:
+                    return True
+        return False
+
+    fc = fix.get("fixed_content")
+    if isinstance(fc, str) and fc.strip():
+        file = (fix.get("file") or "").strip()
+        try:
+            orig = Path(file).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return False
+        new_v = _versions(fc)
+        for v in _versions(orig):
+            if not _bad_python_version(v) and v not in new_v:
+                return True
+    return False
 
 
 def parse_ai_response(raw: str) -> dict:
@@ -1889,6 +2017,12 @@ def main():
     if not included:
         print("[DISCOVER] WARNING: no files resolved — AI has no context to work with.")
     prescan, prescan_autofixes = prescan_issues(included)
+    # Cross-file port mismatch leaves NO error in the log (the app starts fine),
+    # so it can't be discovered from the failure signal — scan the files directly.
+    port_findings, port_autofixes = prescan_port_consistency()
+    if port_autofixes:
+        prescan += port_findings
+        prescan_autofixes += port_autofixes
     print(f"[TIMING] Stage 2 done in {time.time()-t2:.1f}s")
 
     # ══ STAGE 3: ANALYSE ═════════════════════════════════════════════════════
@@ -1929,6 +2063,18 @@ def main():
         commit_msg    = ai_data.get("commit_message", "fix: auto-fixer rewrite")
         fixes         = ai_data.get("fixes",         [])
         detected_type = ai_data.get("pipeline_type", ", ".join(sorted(pipeline_types)))
+
+        # Veto confabulated version fixes: the prescan owns version validity, so a
+        # model edit that rewrites an ALREADY-VALID Python version is the recurring
+        # "python:3.12 is unavailable" hallucination, not a real fix. Drop it and
+        # let the run escalate to an issue rather than open a wrong PR.
+        vetoed = [f for f in fixes if _fix_changes_valid_py_version(f)]
+        if vetoed:
+            for f in vetoed:
+                print(f"[ANALYSE] ✗ Vetoed confabulated version change in "
+                      f"{f.get('file','?')} — that Python version is already valid; "
+                      f"versions are owned by the prescan.", file=sys.stderr)
+            fixes = [f for f in fixes if not _fix_changes_valid_py_version(f)]
 
         print(f"\n  pipeline   : {detected_type}")
         print(f"  root_cause : {root_cause}")
