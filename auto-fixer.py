@@ -88,6 +88,20 @@ BLOCKED_PATTERNS = [
     r"\.?github/workflows/self-heal.*\.ya?ml$",
 ]
 
+# ── Test files are NEVER auto-edited ──────────────────────────────────────────
+# A test encodes intent. When it fails, either the code is wrong (fix the CODE)
+# or the test is wrong (a HUMAN decides which). Rewriting a test to force CI green
+# destroys the signal the test exists to provide — the worst thing a self-healing
+# system can do. So the model may READ tests for context but never write to them;
+# a failing test whose only "fix" is the test itself escalates to an issue.
+TEST_FILE_PATTERNS = [
+    r"(^|/)tests?/",            # anything under a tests/ or test/ directory
+    r"(^|/)test_[^/]*\.py$",    # test_*.py
+    r"_test\.py$",              # *_test.py
+    r"(^|/)conftest\.py$",      # pytest fixtures
+    r"\.(test|spec)\.[jt]sx?$", # *.test.js / *.spec.ts etc.
+]
+
 # ── Files to exclude from context discovery (noisy, never the culprit) ─────────
 # NOTE: patterns are leading-dot-optional (\.?) because some code paths historically
 # normalized ".github/..." to "github/..."; this keeps the exclude robust either way.
@@ -376,6 +390,24 @@ def looks_like_build_config_error(error_signal: str) -> bool:
     return any(sig in low for sig in BUILD_CONFIG_SIGNALS)
 
 
+# ── Container startup / runtime failure signatures ────────────────────────────
+# These mean the image BUILT but the container won't run/stay up. The CI log
+# often carries NO traceback (buffered/swallowed stderr → you see only "exited
+# early"), so there is nothing to extract. When we see this AND no traceback, we
+# reproduce the crash locally (probe_startup) to get a real error signal.
+STARTUP_FAILURE_SIGNALS = [
+    "container exited early", "image does not run correctly",
+    "smoke test failed", "exited with code", "exited (", "container died",
+    "crashloopbackoff", "back-off restarting", "container failed to start",
+    "runtime/cmd error", "did not start", "no such process",
+]
+
+
+def looks_like_startup_failure(error_signal: str) -> bool:
+    low = error_signal.lower()
+    return any(s in low for s in STARTUP_FAILURE_SIGNALS)
+
+
 def find_ci_workflow_files(repo_root: Path = Path(".")) -> list[str]:
     """
     Return repo-relative paths to CI workflow YAMLs that are legitimate fix
@@ -397,6 +429,51 @@ def find_ci_workflow_files(repo_root: Path = Path(".")) -> list[str]:
                     continue
                 found.append(rel)
     return found
+
+
+RUNTIME_CRASH_SIGNALS = [
+    "container exited early", "image does not run", "does not run correctly",
+    "smoke test failed", "exited with code", "exited (", "exit status",
+    "runtime/cmd error", "exec format error", "cannot execute",
+    "application startup failed", "crashloopbackoff",
+]
+
+
+def looks_like_runtime_crash(error_signal: str) -> bool:
+    low = error_signal.lower()
+    return any(s in low for s in RUNTIME_CRASH_SIGNALS)
+
+
+def find_container_entrypoint(repo_root: Path = Path(".")) -> list[str]:
+    """
+    Resolve the script the container actually RUNS — the Dockerfile CMD /
+    ENTRYPOINT target — to a real repo file. On a startup crash the log often has
+    no traceback (just "container exited early"), so force-include-by-path finds
+    nothing; this puts the crashing entrypoint in front of the model anyway.
+    """
+    name_to_paths: dict[str, list[str]] = {}
+    for p in repo_root.rglob("*"):
+        if p.is_file() and not any(part in SKIP_DIRS for part in p.parts):
+            name_to_paths.setdefault(p.name, []).append(_relstrip(str(p)))
+
+    targets: list[str] = []
+    for df in repo_root.rglob("Dockerfile*"):
+        if not df.is_file() or any(part in SKIP_DIRS for part in df.parts):
+            continue
+        try:
+            txt = df.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for ln in txt.splitlines():
+            m = re.match(r"(?i)\s*(CMD|ENTRYPOINT)\s+(.*)", ln)
+            if not m:
+                continue
+            for tok in re.findall(r"[\w./\-]+\.(?:py|js|ts|sh)", m.group(2)):
+                if (repo_root / tok).is_file():
+                    targets.append(_relstrip(tok))
+                else:
+                    targets.extend(name_to_paths.get(Path(tok).name, []))
+    return list(dict.fromkeys(targets))
 
 
 def _basename_blocked(name: str) -> bool:
@@ -1564,6 +1641,15 @@ def _is_blocked(file_path: str) -> bool:
     return any(re.search(p, file_path) for p in BLOCKED_PATTERNS)
 
 
+def _is_test_file(file_path: str) -> bool:
+    """Test files are the spec/safety net — never auto-edited. A failing test
+    means either the code is wrong (fix the CODE) or the test is wrong (a human
+    decides). Rewriting the test to make CI green destroys the signal, so we
+    refuse and let the run escalate to an issue."""
+    fp = file_path.replace("\\", "/")
+    return any(re.search(p, fp) for p in TEST_FILE_PATTERNS)
+
+
 def validate_fix(fix: dict) -> tuple[bool, str]:
     file    = (fix.get("file") or "").strip()
 
@@ -1573,6 +1659,10 @@ def validate_fix(fix: dict) -> tuple[bool, str]:
         return False, f"unsafe path: {file}"
     if _is_blocked(file):
         return False, f"blocked path: {file}"
+    if _is_test_file(file):
+        return False, (f"test file — refusing to edit {file}. A self-healing "
+                       f"system must never rewrite tests to force them green; a "
+                       f"failing test is escalated for human review instead.")
     if not Path(file).exists():
         return False, f"file does not exist in repo: {file}"
 
@@ -1704,6 +1794,66 @@ def detect_test_commands(tech_stacks: set[str]) -> list[list[str]]:
     return commands
 
 
+def _resolve_entrypoint(repo_root: Path = Path(".")) -> tuple[str | None, list[str] | None]:
+    """
+    Find the Python entrypoint the container runs (Dockerfile CMD/ENTRYPOINT) and
+    resolve it to a real repo file. Returns (repo_relative_path, argv) for use
+    with probe_startup, or (None, None) if no python entrypoint is found.
+    """
+    for p in sorted(repo_root.rglob("Dockerfile*")):
+        if not p.is_file() or any(part in SKIP_DIRS for part in p.parts):
+            continue
+        try:
+            txt = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for m in re.finditer(r'(?im)^\s*(?:CMD|ENTRYPOINT)\s+(.+)$', txt):
+            scripts = re.findall(r'([\w./\-]+\.py)', m.group(1))
+            if not scripts:
+                continue
+            name = Path(scripts[0]).name
+            for f in sorted(repo_root.rglob(name)):
+                if f.is_file() and not any(d in f.parts for d in SKIP_DIRS):
+                    rel = _relstrip(str(f).replace("\\", "/"))
+                    return rel, ["python", "-u", rel]
+    return None, None
+
+
+def probe_startup(argv: list[str], timeout: int = 6) -> tuple[str, str]:
+    """
+    Run the app entrypoint locally to reproduce a startup crash OR confirm it
+    serves. A web entrypoint blocks (serves forever), so 'still running at the
+    timeout' is the SUCCESS case; a quick non-zero exit is the crash we want.
+    Returns (status, captured_output):
+      "crash"  — exited non-zero before timeout; captured output has the cause
+      "exited" — exited 0 immediately; runs but does not stay up / serve
+      "served" — still running at timeout; started OK (we kill it)
+      "skip"   — could not run, or failed on missing deps in the fixer env
+                 (inconclusive — caller must NOT treat as a real failure)
+    """
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+    except (FileNotFoundError, OSError):
+        return "skip", ""
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+        return "served", ""
+    out = out or ""
+    if proc.returncode != 0:
+        low = out.lower()
+        if "modulenotfounderror" in low or "importerror" in low:
+            return "skip", out[-2000:]          # fixer env lacks the app's deps
+        return "crash", out[-2000:]
+    return "exited", out[-2000:]
+
+
 def run_tests(tech_stacks: set[str], written: list[str]) -> bool:
     for f in written:
         if Path(f).name.lower().startswith("dockerfile"):
@@ -1732,6 +1882,28 @@ def run_tests(tech_stacks: set[str], written: list[str]) -> bool:
             print(f"[TEST] {cmd[0]} not found — skipping")
         except subprocess.TimeoutExpired:
             print(f"[TEST] {cmd[0]} timed out — skipping")
+
+    # Startup validation: pytest exercises routes in-process and NEVER runs the
+    # entrypoint's __main__/server, so it cannot tell a fix that restores serving
+    # from one that just deletes the crash and leaves the app non-serving. If a
+    # fix touched the entrypoint, actually start it and confirm it stays up.
+    ep_rel, argv = _resolve_entrypoint()
+    if ep_rel and ep_rel in written:
+        status, out = probe_startup(argv)
+        if status == "crash":
+            print(f"[TEST] ✗ Startup probe: {ep_rel} still crashes after the fix:")
+            for line in out.splitlines()[-12:]:
+                print(f"  {line}")
+            all_passed = False
+        elif status == "exited":
+            print(f"[TEST] ✗ Startup probe: {ep_rel} exits immediately and never "
+                  f"serves — the fix removed the crash but no server starts.")
+            all_passed = False
+        elif status == "served":
+            print(f"[TEST] ✓ Startup probe: {ep_rel} starts and stays up.")
+        else:
+            print(f"[TEST] Startup probe inconclusive for {ep_rel} "
+                  f"(app deps not importable in fixer env) — skipping.")
     return all_passed
 
 
@@ -2012,6 +2184,36 @@ def main():
     print("\n━━━ STAGE 2: DISCOVER ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     t2 = time.time()
     forced_paths = extract_referenced_paths(log_text)
+    # Startup failures frequently leave NO traceback in the CI log — the
+    # container's stderr is buffered or swallowed and you see only "exited early".
+    # When that's the case, reproduce the crash locally to capture the REAL error
+    # and point the model at the entrypoint, instead of flying blind.
+    has_traceback = ("traceback" in error_signal.lower()
+                     or bool(re.search(r'File "[^"]+"', error_signal)))
+    if looks_like_startup_failure(error_signal) and not has_traceback:
+        ep_rel, argv = _resolve_entrypoint()
+        if ep_rel:
+            print(f"[DISCOVER] Startup failure with no traceback in the log — "
+                  f"reproducing locally via {ep_rel} ...")
+            status, captured = probe_startup(argv)
+            if status == "crash" and captured.strip():
+                print(f"[DISCOVER] Reproduced the crash — using captured output as "
+                      f"the error signal and force-including {ep_rel}.")
+                error_signal = (error_signal + "\n--- reproduced locally ---\n"
+                                + captured.strip())[-4000:]
+                forced_paths = [ep_rel] + [f for f in forced_paths if f != ep_rel]
+            elif status == "exited":
+                print(f"[DISCOVER] {ep_rel} exits immediately without serving.")
+                error_signal += (f"\n--- reproduced locally ---\n{ep_rel}: the "
+                                 f"process exits immediately and never starts a "
+                                 f"server (no app.run()/serve call is reached).")
+                forced_paths = [ep_rel] + [f for f in forced_paths if f != ep_rel]
+            elif status == "served":
+                print(f"[DISCOVER] {ep_rel} starts and stays up — startup is fine; "
+                      f"the failure is elsewhere (check port / healthcheck).")
+            else:
+                print(f"[DISCOVER] Startup probe inconclusive (app deps not "
+                      f"importable in fixer env) — proceeding with the log as-is.")
     repo_context, included, suspect_note = discover_context(
         error_signal, tech_stacks, pipeline_types, forced_paths)
     if not included:
