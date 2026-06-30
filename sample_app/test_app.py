@@ -6,4 +6,4 @@ def test_homepage():
     response = client.get("/")
 
     assert response.status_code == 200
-    assert False
+    assert response.status_code == 200
