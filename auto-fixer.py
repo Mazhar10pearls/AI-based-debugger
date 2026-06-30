@@ -699,7 +699,7 @@ JSON schema:
 {"pipeline_type":"string","root_cause":"one sentence","confidence":0.0-1.0,"commit_message":"fix: short description","fixes":[{"file":"exact/path","reason":"what changed","edits":[{"find":"exact text from the file","replace":"corrected text"}]}]}
 
 HOW TO FIX — pick ONE mode per file:
-- PREFERRED for large files and small changes → "edits": a list of {find, replace}. `find` MUST be copied EXACTLY from the file shown below (same characters, same indentation, enough surrounding text to be unique). `replace` is the corrected version. Use one edit per distinct bug. This is fast and safe — use it whenever you are changing only a few lines.
+- PREFERRED for large files and small changes → "edits": a list of {find, replace}. `find` MUST be the SHORTEST exact snippet copied VERBATIM from the file that uniquely identifies the change — ideally just the single wrong token (a bad filename, version, flag, or path), NOT the whole line. Copy it character-for-character from the file shown below; NEVER retype it, reconstruct it from memory, or guess the surrounding line or instruction type. `replace` is that same snippet corrected. Use one edit per distinct bug. This is fast and safe — use it whenever you are changing only a few lines.
 - ONLY for small files you are rewriting almost entirely → "fixed_content": the COMPLETE corrected file. Never a snippet.
 - A file marked "(LARGE — use edits)" MUST be fixed with "edits", never "fixed_content".
 
@@ -1226,6 +1226,36 @@ def call_ai(error_signal: str, repo_context: str,
     )
 
 
+def _salvage_token_edit(content: str, find: str, replace: str) -> str | None:
+    """
+    Last-resort edit recovery for a flaky 3B. When `find` doesn't match the file
+    verbatim, the model has usually fabricated the surrounding line (e.g. called
+    a `RUN pip install -r X` a `COPY X`) but got the actual changed TOKEN right.
+    Strip the longest common prefix and suffix of find/replace to isolate the
+    changed fragment; if that exact old fragment appears EXACTLY ONCE in the
+    file, apply just that swap. The single-occurrence requirement is the safety
+    guard — we never touch an ambiguous or absent match.
+    """
+    if not find or not replace or find == replace:
+        return None
+    # longest common prefix
+    i = 0
+    while i < len(find) and i < len(replace) and find[i] == replace[i]:
+        i += 1
+    # longest common suffix (not overlapping the prefix)
+    j = 0
+    while (j < len(find) - i and j < len(replace) - i
+           and find[-1 - j] == replace[-1 - j]):
+        j += 1
+    old_frag = find[i:len(find) - j]
+    new_frag = replace[i:len(replace) - j]
+    if len(old_frag.strip()) < 3:          # too small to be a safe anchor
+        return None
+    if content.count(old_frag) != 1:       # ambiguous or absent — refuse
+        return None
+    return content.replace(old_frag, new_frag, 1)
+
+
 def _apply_edits(original: str, edits: list[dict]) -> tuple[str | None, str]:
     """
     Apply a list of {find, replace} edits to `original`. Each `find` must occur
@@ -1266,6 +1296,16 @@ def _apply_edits(original: str, edits: list[dict]) -> tuple[str | None, str]:
                 if original.endswith("\n") and not content.endswith("\n"):
                     content += "\n"
                 continue
+        # Final salvage: the model frequently fabricates the surrounding line
+        # but gets the actual changed token right (it called this a COPY when it
+        # was a RUN pip install). Isolate the changed fragment and, if it occurs
+        # exactly once in the file, swap just that.
+        salvaged = _salvage_token_edit(content, find, repl)
+        if salvaged is not None and salvaged != content:
+            print(f"[EDIT] Salvaged edit #{i+1} by unique-token match "
+                  f"(model's find did not match verbatim)")
+            content = salvaged
+            continue
         return None, (f"edit #{i+1} 'find' text not present in file — "
                       f"the model's find string did not match the actual content")
     if content == original:
@@ -1378,7 +1418,8 @@ def parse_ai_response(raw: str) -> dict:
     if "fixes" in data and isinstance(data["fixes"], list):
         data["fixes"] = _normalize_fix_keys(data["fixes"])
         unmapped = [f.get("file", "?") for f in data["fixes"]
-                    if "file" not in f or "fixed_content" not in f]
+                    if "file" not in f
+                    or ("fixed_content" not in f and "edits" not in f)]
         if unmapped:
             print(f"[AI] Warning: could not normalize keys for: {unmapped}")
     return data
