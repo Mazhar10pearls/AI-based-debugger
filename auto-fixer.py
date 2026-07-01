@@ -963,6 +963,11 @@ def _extract_path_refs(rel: str, text: str) -> list[tuple[str, str]]:
             if ce:
                 for t in re.findall(r"[\w./\-]+\.[A-Za-z0-9]+", ce.group(2)):
                     refs.append((ce.group(1).upper(), t))
+        # RUN pip install -r <file>: the requirements file was COPY'd in from the
+        # repo, so its real name IS knowable — include it so typos here are caught.
+        joined_df = re.sub(r"\\\s*\n\s*", " ", text)
+        for m in re.finditer(r"pip\d*\s+install\b[^\n]*?(?:-r|--requirement)\s+(\S+)", joined_df):
+            refs.append(("RUN pip install -r", m.group(1)))
         return refs
 
     # Everything else (CI workflow YAML, shell scripts): scan the commands that
@@ -1046,17 +1051,49 @@ def prescan_issues(included_files: list[str]) -> tuple[list[str], list[dict]]:
                         "replace": ln.strip().replace(bad, "python:3.12"),
                     })
 
-        # ── Dockerfile path refs are NOT repo-relative — skip existence check ─
-        # A Dockerfile COPY/ADD source is relative to the BUILD CONTEXT, and a
-        # CMD/ENTRYPOINT path is relative to the image WORKDIR after COPY. Neither
-        # is relative to the repo checkout, and we don't know the build-context
-        # dir — so "app.py missing at repo root → rewrite to sample_app/app.py"
-        # is exactly wrong: with context = sample_app/, `COPY . .` puts the file
-        # at /app/app.py and `CMD ["python","app.py"]` is correct. Validating
-        # against the repo regressed a working CMD (PR that broke the smoke test).
-        # The FROM-tag value check above is reliable and stays; layout bugs go to
-        # the model, which sees WORKDIR + COPY + the runtime error.
+        # ── Dockerfile references: safe WHOLE-FILE typo scan ─────────────────
+        # We deliberately do NOT resolve Dockerfile paths against the repo — COPY
+        # sources are build-context-relative and CMD paths are WORKDIR-relative,
+        # which is what caused the earlier app.py → sample_app/app.py regression.
+        # But a reference whose BASENAME exists NOWHERE in the repo is an
+        # unambiguous typo (requirement.txt, requirementdddds.txt). This walks the
+        # ENTIRE Dockerfile and fixes EVERY such typo in one pass — not just the
+        # first one the model happens to anchor on — replacing only the filename
+        # with the closest real BASENAME (never a path prefix), so a valid-but-
+        # relocated file like app.py is left untouched.
         if p.name.lower().startswith("dockerfile"):
+            repo_basenames = {Path(x).name for x in all_paths}
+            for kind, raw in _extract_path_refs(rel, text):
+                tok  = raw.strip().strip("\"'")
+                base = Path(tok).name
+                if (not base or "." not in base or "$" in tok or "://" in tok
+                        or tok in (".", "..")):
+                    continue
+                if base in repo_basenames:          # real file → never touch
+                    continue
+                match = _closest_repo_path(base, all_paths, name_to_paths)
+                if not match:
+                    findings.append(
+                        f"{rel}: `{kind}` references `{base}`, which does not exist "
+                        f"in the repo — correct it to the real filename.")
+                    continue
+                real = Path(match).name              # BASENAME only — no path prefix
+                if real == base:
+                    continue
+                if text.count(base) != 1:            # ambiguous → hint the model instead
+                    findings.append(
+                        f"{rel}: `{kind}` references `{base}` (does not exist) — "
+                        f"did you mean `{real}`?")
+                    continue
+                findings.append(
+                    f"{rel}: `{kind}` references `{base}`, which does not exist — "
+                    f"correcting to `{real}`.")
+                autofixes.append({
+                    "file": rel,
+                    "reason": f"{kind}: '{base}' does not exist → '{real}'",
+                    "find": base,
+                    "replace": real,
+                })
             continue
 
         # ── general path-existence check (workflows, scripts) ────────────────
