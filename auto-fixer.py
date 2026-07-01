@@ -1882,28 +1882,6 @@ def run_tests(tech_stacks: set[str], written: list[str]) -> bool:
             print(f"[TEST] {cmd[0]} not found — skipping")
         except subprocess.TimeoutExpired:
             print(f"[TEST] {cmd[0]} timed out — skipping")
-
-    # Startup validation: pytest exercises routes in-process and NEVER runs the
-    # entrypoint's __main__/server, so it cannot tell a fix that restores serving
-    # from one that just deletes the crash and leaves the app non-serving. If a
-    # fix touched the entrypoint, actually start it and confirm it stays up.
-    ep_rel, argv = _resolve_entrypoint()
-    if ep_rel and ep_rel in written:
-        status, out = probe_startup(argv)
-        if status == "crash":
-            print(f"[TEST] ✗ Startup probe: {ep_rel} still crashes after the fix:")
-            for line in out.splitlines()[-12:]:
-                print(f"  {line}")
-            all_passed = False
-        elif status == "exited":
-            print(f"[TEST] ✗ Startup probe: {ep_rel} exits immediately and never "
-                  f"serves — the fix removed the crash but no server starts.")
-            all_passed = False
-        elif status == "served":
-            print(f"[TEST] ✓ Startup probe: {ep_rel} starts and stays up.")
-        else:
-            print(f"[TEST] Startup probe inconclusive for {ep_rel} "
-                  f"(app deps not importable in fixer env) — skipping.")
     return all_passed
 
 
@@ -2184,38 +2162,54 @@ def main():
     print("\n━━━ STAGE 2: DISCOVER ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     t2 = time.time()
     forced_paths = extract_referenced_paths(log_text)
-    # Startup failures frequently leave NO traceback in the CI log — the
-    # container's stderr is buffered or swallowed and you see only "exited early".
-    # When that's the case, reproduce the crash locally to capture the REAL error
-    # and point the model at the entrypoint, instead of flying blind.
+
+    # ── Startup / runtime crash handling ─────────────────────────────────────
+    # On a startup failure the ENTRYPOINT is the crash site, so it MUST reach the
+    # model — ahead of less-relevant files like requirements.txt that the 2-file
+    # budget was otherwise evicting it behind (the model then 'fixes' a file it
+    # never saw). Prioritize entrypoint + Dockerfile (EXPOSE port + CMD); if the
+    # log has no traceback, reproduce the crash locally to capture the real error.
+    startup_ep = None
     has_traceback = ("traceback" in error_signal.lower()
                      or bool(re.search(r'File "[^"]+"', error_signal)))
-    if looks_like_startup_failure(error_signal) and not has_traceback:
+    if looks_like_startup_failure(error_signal):
         ep_rel, argv = _resolve_entrypoint()
         if ep_rel:
-            print(f"[DISCOVER] Startup failure with no traceback in the log — "
-                  f"reproducing locally via {ep_rel} ...")
-            status, captured = probe_startup(argv)
-            if status == "crash" and captured.strip():
-                print(f"[DISCOVER] Reproduced the crash — using captured output as "
-                      f"the error signal and force-including {ep_rel}.")
-                error_signal = (error_signal + "\n--- reproduced locally ---\n"
-                                + captured.strip())[-4000:]
-                forced_paths = [ep_rel] + [f for f in forced_paths if f != ep_rel]
-            elif status == "exited":
-                print(f"[DISCOVER] {ep_rel} exits immediately without serving.")
-                error_signal += (f"\n--- reproduced locally ---\n{ep_rel}: the "
-                                 f"process exits immediately and never starts a "
-                                 f"server (no app.run()/serve call is reached).")
-                forced_paths = [ep_rel] + [f for f in forced_paths if f != ep_rel]
-            elif status == "served":
-                print(f"[DISCOVER] {ep_rel} starts and stays up — startup is fine; "
-                      f"the failure is elsewhere (check port / healthcheck).")
-            else:
-                print(f"[DISCOVER] Startup probe inconclusive (app deps not "
-                      f"importable in fixer env) — proceeding with the log as-is.")
+            startup_ep = ep_rel
+            if not has_traceback:
+                print(f"[DISCOVER] Startup failure, no traceback in log — "
+                      f"reproducing locally via {ep_rel} ...")
+                status, captured = probe_startup(argv)
+                if status == "crash" and captured.strip():
+                    print("[DISCOVER] Reproduced the crash — using captured output.")
+                    error_signal = (error_signal + "\n--- reproduced locally ---\n"
+                                    + captured.strip())[-4000:]
+                elif status == "exited":
+                    error_signal += (f"\n--- reproduced locally ---\n{ep_rel}: the "
+                                     f"process exits immediately without starting a server.")
+            # Entrypoint first, then any referenced Dockerfile; everything else
+            # (requirements.txt etc.) goes last so the crash file is never evicted.
+            dfs = [f for f in forced_paths
+                   if Path(f).name.lower().startswith("dockerfile")]
+            forced_paths = ([ep_rel] + dfs
+                            + [f for f in forced_paths if f != ep_rel and f not in dfs])
+            print(f"[DISCOVER] Startup failure → entrypoint {ep_rel} prioritized "
+                  f"into context (with Dockerfile).")
+
     repo_context, included, suspect_note = discover_context(
         error_signal, tech_stacks, pipeline_types, forced_paths)
+
+    # A 3B will happily delete a crash and leave __main__ empty — which removes the
+    # crash but makes the container exit without serving. Forbid that explicitly.
+    if startup_ep and startup_ep in included:
+        directive = (
+            f"{startup_ep} is the application ENTRYPOINT; the container runs it and "
+            f"it MUST start a long-running server. If you remove or change the crash, "
+            f"the __main__ block MUST still start the server — for Flask that is "
+            f"exactly: app.run(host=\"0.0.0.0\", port=<the EXPOSE port in the "
+            f"Dockerfile>). NEVER leave __main__ empty, a bare pass, or a print: the "
+            f"process would exit immediately and fail the smoke test.")
+        suspect_note = (suspect_note + "\n" + directive) if suspect_note else directive
     if not included:
         print("[DISCOVER] WARNING: no files resolved — AI has no context to work with.")
     prescan, prescan_autofixes = prescan_issues(included)
@@ -2363,6 +2357,33 @@ def main():
             sys.exit(5)
     else:
         print("[TEST] Skipped (--skip-tests)")
+
+    # ── Startup gate — ALWAYS runs, even with --skip-tests ───────────────────
+    # Skipping unit tests is a choice; skipping "does the app even start" is not.
+    # If a fix touched the entrypoint, start it and confirm it stays up. This is
+    # what catches a fix that deleted a crash but left the app non-serving — the
+    # exact failure that reached PR #46.
+    if startup_ep and startup_ep in written:
+        _, ep_argv = _resolve_entrypoint()
+        status, out = probe_startup(ep_argv or ["python", "-u", startup_ep])
+        if status in ("crash", "exited"):
+            print(f"[GATE] ✗ {startup_ep} does not serve after the fix ({status}):",
+                  file=sys.stderr)
+            for line in out.splitlines()[-12:]:
+                print(f"  {line}")
+            revert_files(originals)
+            if token and repo:
+                open_issue(token, repo,
+                           f"Fix applied but {startup_ep} still does not start/serve "
+                           f"({status}) — reverted for manual fix. Root cause: {root_cause}",
+                           pipeline_type=detected_type)
+            sys.exit(5)
+        elif status == "served":
+            print(f"[GATE] ✓ {startup_ep} starts and stays up.")
+        else:
+            print(f"[GATE] Startup check inconclusive for {startup_ep} (app deps not "
+                  f"importable in fixer env) — NOT blocking. Install requirements in "
+                  f"the fixer step, or use a docker-run probe, to make this gate real.")
 
     # ══ STAGE 7: COMMIT ══════════════════════════════════════════════════════
     print(f"\n━━━ STAGE 7: COMMIT (fix/* → {GIT_TARGET_BRANCH}) ━━━━━━━━━━━")
