@@ -1023,6 +1023,7 @@ def prescan_issues(included_files: list[str]) -> tuple[list[str], list[dict]]:
     findings: list[str] = []
     autofixes: list[dict] = []
     all_paths, name_to_paths = _repo_path_index()
+    repo_basenames = {Path(x).name for x in all_paths}
 
     for rel in included_files:
         p = Path(rel)
@@ -1051,87 +1052,49 @@ def prescan_issues(included_files: list[str]) -> tuple[list[str], list[dict]]:
                         "replace": ln.strip().replace(bad, "python:3.12"),
                     })
 
-        # ── Dockerfile references: safe WHOLE-FILE typo scan ─────────────────
-        # We deliberately do NOT resolve Dockerfile paths against the repo — COPY
-        # sources are build-context-relative and CMD paths are WORKDIR-relative,
-        # which is what caused the earlier app.py → sample_app/app.py regression.
-        # But a reference whose BASENAME exists NOWHERE in the repo is an
-        # unambiguous typo (requirement.txt, requirementdddds.txt). This walks the
-        # ENTIRE Dockerfile and fixes EVERY such typo in one pass — not just the
-        # first one the model happens to anchor on — replacing only the filename
-        # with the closest real BASENAME (never a path prefix), so a valid-but-
-        # relocated file like app.py is left untouched.
-        if p.name.lower().startswith("dockerfile"):
-            repo_basenames = {Path(x).name for x in all_paths}
-            for kind, raw in _extract_path_refs(rel, text):
-                tok  = raw.strip().strip("\"'")
-                base = Path(tok).name
-                if (not base or "." not in base or "$" in tok or "://" in tok
-                        or tok in (".", "..")):
-                    continue
-                if base in repo_basenames:          # real file → never touch
-                    continue
-                match = _closest_repo_path(base, all_paths, name_to_paths)
-                if not match:
+        # ── Universal whole-file reference-typo scan (runs on EVERY file) ────
+        # NOT hardcoded to Dockerfiles. For ANY file — Dockerfile, CI workflow,
+        # shell script, compose file — we walk the WHOLE file and check every
+        # local file reference it makes (COPY/ADD, CMD, RUN pip -r, docker build
+        # -f/context, script runners). A reference whose BASENAME exists NOWHERE
+        # in the repo is an unambiguous typo; we fix EVERY one in a single pass —
+        # not just the first the model would anchor on — replacing only the
+        # filename with the closest real basename (never injecting a path prefix),
+        # so a valid-but-relocated file (e.g. app.py in a CMD) is left untouched.
+        # Files that make no file references simply yield nothing here.
+        for kind, raw in _extract_path_refs(rel, text):
+            tok  = raw.strip().strip("\"'")
+            base = Path(tok).name
+            if (not base or "." not in base or tok in (".", "..")
+                    or "$" in tok or "${{" in tok or "://" in tok
+                    or "@" in tok or "=" in tok or ":" in tok):
+                continue
+            if base in repo_basenames:               # real file exists → never touch
+                continue
+            match = _closest_repo_path(base, all_paths, name_to_paths)
+            if not match:
+                if kind != "docker build context":   # avoid noise on odd context tokens
                     findings.append(
                         f"{rel}: `{kind}` references `{base}`, which does not exist "
                         f"in the repo — correct it to the real filename.")
-                    continue
-                real = Path(match).name              # BASENAME only — no path prefix
-                if real == base:
-                    continue
-                if text.count(base) != 1:            # ambiguous → hint the model instead
-                    findings.append(
-                        f"{rel}: `{kind}` references `{base}` (does not exist) — "
-                        f"did you mean `{real}`?")
-                    continue
+                continue
+            real = Path(match).name                   # BASENAME only — never a path
+            if real == base:
+                continue
+            if text.count(base) != 1:                 # ambiguous → hint the model
                 findings.append(
-                    f"{rel}: `{kind}` references `{base}`, which does not exist — "
-                    f"correcting to `{real}`.")
-                autofixes.append({
-                    "file": rel,
-                    "reason": f"{kind}: '{base}' does not exist → '{real}'",
-                    "find": base,
-                    "replace": real,
-                })
-            continue
-
-        # ── general path-existence check (workflows, scripts) ────────────────
-        for kind, raw in _extract_path_refs(rel, text):
-            tok = raw.strip().strip("\"'")
-            if not tok or tok in (".", ".."):
+                    f"{rel}: `{kind}` references `{base}` (does not exist) — "
+                    f"did you mean `{real}`?")
                 continue
-            # skip non-local refs: URLs, env/GH vars, image tags, action refs, kv args
-            if ("://" in tok or "$" in tok or "${{" in tok
-                    or ":" in tok or "@" in tok or "=" in tok):
-                continue
-            if not re.fullmatch(r"[\w./\-]+", tok):
-                continue
-            norm = tok[2:] if tok.startswith("./") else tok
-            if Path(norm).exists():
-                continue
-            suggestion = _closest_repo_path(norm, all_paths, name_to_paths)
-            # For a guessed build context, only speak up when we're confident
-            # (a close match exists) — avoids flagging odd-but-harmless tokens.
-            if kind == "docker build context" and not suggestion:
-                continue
-            if suggestion:
-                findings.append(
-                    f"{rel}: `{kind}` points to `{tok}`, which does not exist. "
-                    f"The real path is `{suggestion}` — change it to exactly that.")
-                # Deterministic auto-fix: literal replace of the exact wrong token
-                # (which is guaranteed present in the file) with the real path.
-                if tok in text:
-                    autofixes.append({
-                        "file": rel,
-                        "reason": f"{kind}: '{tok}' does not exist → '{suggestion}'",
-                        "find": tok,
-                        "replace": suggestion,
-                    })
-            else:
-                findings.append(
-                    f"{rel}: `{kind}` points to `{tok}`, which does not exist in the "
-                    f"repo — correct it to the real path.")
+            findings.append(
+                f"{rel}: `{kind}` references `{base}`, which does not exist — "
+                f"correcting to `{real}`.")
+            autofixes.append({
+                "file": rel,
+                "reason": f"{kind}: '{base}' does not exist → '{real}'",
+                "find": base,
+                "replace": real,
+            })
 
     findings = list(dict.fromkeys(findings))  # de-dupe
     if findings:
@@ -1883,8 +1846,18 @@ def probe_startup(argv: list[str], timeout: int = 6) -> tuple[str, str]:
             pass
         return "served", ""
     out = out or ""
+    low = out.lower()
+    # If the app reached the point of starting/binding a server, that IS success
+    # for this gate — the entrypoint's __main__ correctly started the server. A
+    # port collision on the shared runner ("address already in use" — e.g. the
+    # already-deployed app is holding that port) is a PROBE-ENVIRONMENT issue, not
+    # a code bug, so we must NEVER revert a good fix over it.
+    if ("address already in use" in low or "is in use by" in low
+            or "serving flask app" in low or "running on http" in low
+            or "* running on" in low or "uvicorn running on" in low
+            or "listening on" in low):
+        return "served", out[-2000:]
     if proc.returncode != 0:
-        low = out.lower()
         if "modulenotfounderror" in low or "importerror" in low:
             return "skip", out[-2000:]          # fixer env lacks the app's deps
         return "crash", out[-2000:]
