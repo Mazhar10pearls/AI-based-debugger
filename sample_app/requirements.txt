@@ -1,3 +1,3 @@
 Flask==2.3.3
 pytest==7.4.0
-wrong-version==2.30.0
+requests>=2.30.0
