@@ -1052,6 +1052,29 @@ def prescan_issues(included_files: list[str]) -> tuple[list[str], list[dict]]:
                         "replace": ln.strip().replace(bad, "python:3.12"),
                     })
 
+        # ── value check: invalid setup-python version in a CI workflow ───────
+        # Versions are owned by the prescan — the model is explicitly forbidden
+        # from touching them (to kill the "3.12 is unavailable" confabulation), so
+        # a genuinely-bad workflow python-version like "3.1" MUST be caught here
+        # deterministically, or it falls through the crack and never gets fixed.
+        rel_posix = rel.replace("\\", "/")
+        if re.search(r"\.ya?ml$", rel_posix) and ".github/workflows" in rel_posix:
+            for ln in text.splitlines():
+                pv = re.search(r'(?i)(python-version:\s*)(["\']?)([^"\'\s#]+)\2', ln)
+                if pv and _bad_python_version(pv.group(3)):
+                    bad = pv.group(3)
+                    stripped = ln.strip()
+                    findings.append(
+                        f"{rel}: setup-python version `{bad}` is invalid/unsupported "
+                        f"— change it to `{LATEST_PY}`.")
+                    if text.count(stripped) == 1:
+                        autofixes.append({
+                            "file": rel,
+                            "reason": f"Invalid python-version {bad} → {LATEST_PY}",
+                            "find": stripped,
+                            "replace": stripped.replace(bad, LATEST_PY),
+                        })
+
         # ── Universal whole-file reference-typo scan (runs on EVERY file) ────
         # NOT hardcoded to Dockerfiles. For ANY file — Dockerfile, CI workflow,
         # shell script, compose file — we walk the WHOLE file and check every

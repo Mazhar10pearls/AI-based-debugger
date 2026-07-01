@@ -83,44 +83,78 @@ jobs:
           OLLAMA_MODEL:   ${{ secrets.OLLAMA_MODEL }}
           GH_PAT:         ${{ secrets.GH_PAT }}
 
+      # ── Download failed workflow logs (race-proof) ───────────────────────
+      # A fast, early failure (e.g. a bad setup-python version) finishes in
+      # seconds — the workflow_run event fires BEFORE GitHub finishes archiving
+      # the run logs, so /logs returns an empty/not-ready zip and failure.log
+      # comes out empty. Fix: retry the run-logs endpoint with backoff, then fall
+      # back to fetching each FAILED job's logs directly (plain text, reliable
+      # even for very-early failures).
       - name: Download failed workflow logs
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           python3 - <<'PY'
-          import json, os, pathlib, requests, zipfile, sys
+          import json, os, pathlib, requests, zipfile, sys, time, io
 
-          with open(os.environ['GITHUB_EVENT_PATH'], 'r', encoding='utf-8') as f:
+          with open(os.environ['GITHUB_EVENT_PATH'], encoding='utf-8') as f:
               event = json.load(f)
 
           run_id    = event['workflow_run']['id']
           repo_full = event['repository']['full_name']
-          headers   = {
-              'Authorization': f"Bearer {os.environ['GH_PAT']}",
-              'Accept': 'application/vnd.github+json'
-          }
-          url  = f'https://api.github.com/repos/{repo_full}/actions/runs/{run_id}/logs'
-          resp = requests.get(url, headers=headers, timeout=120)
-          if resp.status_code != 200:
-              print(f'Failed to download logs: HTTP {resp.status_code}', file=sys.stderr)
-              sys.exit(1)
+          headers   = {'Authorization': f"Bearer {os.environ['GH_PAT']}",
+                       'Accept': 'application/vnd.github+json'}
 
-          with open('workflow_logs.zip', 'wb') as fh:
-              fh.write(resp.content)
+          def zip_to_text(content):
+              try:
+                  zf = zipfile.ZipFile(io.BytesIO(content))
+              except zipfile.BadZipFile:
+                  return ''
+              parts = []
+              for name in sorted(zf.namelist()):
+                  if name.endswith('.txt'):
+                      parts.append(f'=== {name} ===\n'
+                                   + zf.read(name).decode('utf-8', 'replace'))
+              return '\n\n'.join(parts)
 
-          extract_dir = pathlib.Path('logs')
-          extract_dir.mkdir(parents=True, exist_ok=True)
-          with zipfile.ZipFile('workflow_logs.zip', 'r') as zf:
-              zf.extractall(extract_dir)
+          # 1. Run-logs endpoint, retried until the archive is actually populated.
+          text = ''
+          for attempt in range(1, 8):
+              r = requests.get(
+                  f'https://api.github.com/repos/{repo_full}/actions/runs/{run_id}/logs',
+                  headers=headers, timeout=120)
+              if r.status_code == 200:
+                  text = zip_to_text(r.content)
+                  if text.strip():
+                      print(f'Run logs ready on attempt {attempt} ({len(text)} chars)')
+                      break
+              print(f'Attempt {attempt}: logs not ready '
+                    f'(HTTP {r.status_code}, {len(text)} chars) — waiting 10s...')
+              time.sleep(10)
 
-          out_path = pathlib.Path('failure.log')
-          with out_path.open('w', encoding='utf-8') as out:
-              for path in sorted(extract_dir.rglob('*.txt')):
-                  out.write(f'=== {path.relative_to(extract_dir)} ===\n')
-                  out.write(path.read_text(encoding='utf-8', errors='replace'))
-                  out.write('\n\n')
+          # 2. Fallback: pull each FAILED job's logs directly. The jobs endpoint
+          #    returns plain text and is reliable even for very-early failures.
+          if not text.strip():
+              jr = requests.get(
+                  f'https://api.github.com/repos/{repo_full}/actions/runs/{run_id}/jobs',
+                  headers=headers, timeout=60)
+              if jr.status_code == 200:
+                  chunks = []
+                  for job in jr.json().get('jobs', []):
+                      if job.get('conclusion') == 'failure':
+                          lr = requests.get(
+                              f"https://api.github.com/repos/{repo_full}/actions/jobs/{job['id']}/logs",
+                              headers=headers, timeout=60)
+                          if lr.status_code == 200 and lr.text.strip():
+                              chunks.append(f"=== job: {job.get('name')} ===\n{lr.text}")
+                  text = '\n\n'.join(chunks)
+                  if text.strip():
+                      print(f'Recovered {len(text)} chars from failed-job logs')
 
-          print(f'Generated failure.log ({out_path.stat().st_size} bytes)')
+          pathlib.Path('failure.log').write_text(text, encoding='utf-8')
+          print(f'Generated failure.log ({len(text)} bytes)')
+          if not text.strip():
+              print('WARNING: no logs retrievable for this run', file=sys.stderr)
           PY
 
       - name: Check failure log is non-empty
