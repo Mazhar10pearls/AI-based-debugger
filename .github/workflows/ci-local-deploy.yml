@@ -13,7 +13,7 @@ name: Local CI/CD Deploy
 # branches racing on an 8GB single-box runner collide on the port and on RAM.
 on:
   push:
-    branches: [main, develop, 'qa/**', 'fix/**']
+    branches: [main, develop, 'qa/**']
   pull_request:
     branches: [main, develop, 'qa/**']
   workflow_dispatch:
