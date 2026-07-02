@@ -13,9 +13,9 @@ name: Local CI/CD Deploy
 # branches racing on an 8GB single-box runner collide on the port and on RAM.
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, 'fix/**']
   pull_request:
-    branches: [main, develop]
+    branches: [main, develop, 'qa/**']
   workflow_dispatch:
 
 # Cancel an in-flight run of the SAME ref when a newer commit lands.
