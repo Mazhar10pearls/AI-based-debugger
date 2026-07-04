@@ -82,6 +82,19 @@ MAX_BOT_ATTEMPTS = 3
 MAX_FIX_ITERATIONS = 3      # AI attempts, each verified by a real build+run
 VERIFY_LOCALLY     = True   # set False only if the runner has no Docker
 
+# ── Pure-AI mode ──────────────────────────────────────────────────────────────
+# When True, the deterministic prescan NO LONGER applies fixes itself — every
+# failure (versions, paths, ports, logic, crashes) is diagnosed and fixed by the
+# AI, and each fix is accepted ONLY if it passes the verify-and-run loop above.
+# The prescan's static findings are still handed to the model as HINTS (the model
+# still does the fixing), which improves its aim without doing the work for it.
+# Trade-off vs. the deterministic layer: correctness is now guaranteed by
+# VERIFICATION instead of by the prescan — but every fix, even a one-character
+# version typo, now costs a full model inference (~230s) + an image build, and
+# a class that can't be verified by build+run (e.g. a pure unit-test failure with
+# no server to hit) loses its safety net. Set False to restore prescan authority.
+PURE_AI_MODE = True
+
 BOT_NAME   = "github-actions[bot]"
 BOT_EMAIL  = "github-actions[bot]@users.noreply.github.com"
 BOT_PREFIX = "fix:"
@@ -2346,7 +2359,7 @@ def main():
     print("\n━━━ STAGE 3: ANALYSE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     t3 = time.time()
 
-    if prescan_autofixes:
+    if prescan_autofixes and not PURE_AI_MODE:
         # ── Deterministic path: the pre-scan computed exact corrections, so we
         #    apply them WITHOUT the model — no find-string to hallucinate, no
         #    timeout. The model is only for bugs the pre-scan can't resolve.
