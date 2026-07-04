@@ -42,7 +42,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.q2"
+          python-version: "3.12"
 
       - name: Install dependencies
         run: |
@@ -55,13 +55,13 @@ jobs:
 
       # ── Build (always — validates the Dockerfile on every branch) ─────────
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v2
 
       - name: Build Docker image
         run: |
           docker buildx build \
             --platform linux/amd64 \
-            -f sample_app/Dockerfilessss \
+            -f sample_app/Dockerfile \
             -t ai-devops-sample-app:${{ github.sha }} \
             -t ai-devops-sample-app:latest \
             --load \
