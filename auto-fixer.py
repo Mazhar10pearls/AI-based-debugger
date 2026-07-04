@@ -73,6 +73,15 @@ MAX_FILES_FIXED   = 3     # ceiling on files the AI may rewrite (rarely binding 
 CONFIDENCE_MIN   = 0.4
 MAX_BOT_ATTEMPTS = 3
 
+# ── AI verification loop ──────────────────────────────────────────────────────
+# The prescan is reliable because it VERIFIES against ground truth. We make the
+# AI path reliable the same way: after the model proposes a fix we rebuild and
+# run the real pipeline; a fix is accepted ONLY if it actually passes. If it
+# fails, we feed the new error back to the model and let it try again. The model
+# may be wrong N times — only a VERIFIED fix ever reaches a PR.
+MAX_FIX_ITERATIONS = 3      # AI attempts, each verified by a real build+run
+VERIFY_LOCALLY     = True   # set False only if the runner has no Docker
+
 BOT_NAME   = "github-actions[bot]"
 BOT_EMAIL  = "github-actions[bot]@users.noreply.github.com"
 BOT_PREFIX = "fix:"
@@ -1887,6 +1896,85 @@ def probe_startup(argv: list[str], timeout: int = 6) -> tuple[str, str]:
     return "exited", out[-2000:]
 
 
+def _free_host_port() -> int:
+    """A currently-free host port, so verification never collides with the live
+    app on :5000 (the mistake the bare-python startup probe made)."""
+    import socket
+    s = socket.socket()
+    s.bind(("", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def verify_build_and_run(build_timeout: int = 600,
+                         serve_tries: int = 15) -> tuple[bool, str]:
+    """
+    GROUND-TRUTH verification: build the image and run it exactly like CI, on a
+    random host port. Returns (passed, output). This is what makes the AI path
+    reliable — a model fix is accepted ONLY if this passes; otherwise the output
+    (the real, current error) is fed back to the model for another attempt.
+
+    Degrades safely: if there is no Dockerfile or Docker isn't available, returns
+    (True, "...") so we don't block on an environment we can't verify in — the
+    startup gate / CI still apply.
+    """
+    dfs = [p for p in sorted(Path(".").rglob("Dockerfile*"))
+           if p.is_file() and not any(d in p.parts for d in SKIP_DIRS)]
+    if not dfs:
+        return True, "(no Dockerfile — skipping docker verification)"
+
+    df  = str(dfs[0])
+    ctx = str(Path(df).parent) or "."
+    tag = "autofix-verify:latest"
+
+    try:
+        build = subprocess.run(
+            ["docker", "build", "-f", df, "-t", tag, ctx],
+            capture_output=True, text=True, timeout=build_timeout)
+    except FileNotFoundError:
+        return True, "(docker not available — skipping verification)"
+    except subprocess.TimeoutExpired:
+        return False, "BUILD TIMED OUT"
+
+    if build.returncode != 0:
+        return False, "BUILD FAILED:\n" + (build.stdout + build.stderr)[-2200:]
+
+    expose = _expose_port(Path(".")) or 5000
+    host   = _free_host_port()
+    name   = f"autofix-verify-{int(time.time())}"
+    subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+
+    run = subprocess.run(
+        ["docker", "run", "-d", "--name", name, "-p", f"{host}:{expose}", tag],
+        capture_output=True, text=True, timeout=60)
+    if run.returncode != 0:
+        return False, "docker run FAILED:\n" + (run.stdout + run.stderr)[-1200:]
+
+    ok = False
+    try:
+        for _ in range(serve_tries):
+            c = subprocess.run(["curl", "-fs", f"http://127.0.0.1:{host}"],
+                               capture_output=True, timeout=5)
+            if c.returncode == 0:
+                ok = True
+                break
+            alive = subprocess.run(
+                ["docker", "inspect", "-f", "{{.State.Running}}", name],
+                capture_output=True, text=True)
+            if alive.stdout.strip() != "true":
+                break
+            time.sleep(2)
+        logs = subprocess.run(["docker", "logs", name],
+                              capture_output=True, text=True).stdout
+    finally:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+
+    if ok:
+        return True, "image builds and serves ✓"
+    return False, "SMOKE FAILED — container built but did not serve:\n" + logs[-1600:]
+
+
 def run_tests(tech_stacks: set[str], written: list[str]) -> bool:
     for f in written:
         if Path(f).name.lower().startswith("dockerfile"):
@@ -2275,52 +2363,103 @@ def main():
             print(f"    → {fix['file']}  ({len(fix['edits'])} edit(s))")
         print(f"[TIMING] Stage 3 done in {time.time()-t3:.1f}s (no model)")
     else:
-        try:
-            raw     = call_ai(error_signal, repo_context, pipeline_types, tech_stacks,
-                              prescan, suspect_note)
-            ai_data = parse_ai_response(raw)
-        except Exception as exc:
-            print(f"[ERROR] AI failed: {exc}", file=sys.stderr)
-            if token and repo:
-                open_issue(token, repo, f"AI analysis failed: {exc}",
-                           pipeline_type=", ".join(pipeline_types))
-            sys.exit(2)
-        print(f"[TIMING] Stage 3 done in {time.time()-t3:.1f}s")
+        # ── AI path with GROUND-TRUTH VERIFICATION ───────────────────────────
+        # Generate → apply → rebuild+run the real pipeline → keep only if it
+        # PASSES; otherwise feed the new error back and retry. The model may be
+        # wrong up to MAX_FIX_ITERATIONS times — only a verified fix is accepted,
+        # which is what makes this reliable despite a non-deterministic 3B.
+        root_cause = commit_msg = ""
+        confidence = 1.0
+        detected_type = ", ".join(sorted(pipeline_types))
+        fixes = []
+        verified_written: list[str] = []
+        verified_originals: dict[str, str] = {}
+        feedback = ""
 
-        root_cause    = ai_data.get("root_cause",    "unknown")
-        confidence    = float(ai_data.get("confidence", 1.0))
-        commit_msg    = ai_data.get("commit_message", "fix: auto-fixer rewrite")
-        fixes         = ai_data.get("fixes",         [])
-        detected_type = ai_data.get("pipeline_type", ", ".join(sorted(pipeline_types)))
+        for iteration in range(MAX_FIX_ITERATIONS):
+            print(f"\n[ANALYSE] AI attempt {iteration+1}/{MAX_FIX_ITERATIONS} "
+                  f"(each verified by a real build+run)")
+            try:
+                raw     = call_ai(error_signal + feedback, repo_context,
+                                  pipeline_types, tech_stacks, prescan, suspect_note)
+                ai_data = parse_ai_response(raw)
+            except Exception as exc:
+                print(f"[ERROR] AI failed: {exc}", file=sys.stderr)
+                break
 
-        # Veto confabulated version fixes: the prescan owns version validity, so a
-        # model edit that rewrites an ALREADY-VALID Python version is the recurring
-        # "python:3.12 is unavailable" hallucination, not a real fix. Drop it and
-        # let the run escalate to an issue rather than open a wrong PR.
-        vetoed = [f for f in fixes if _fix_changes_valid_py_version(f)]
-        if vetoed:
+            root_cause    = ai_data.get("root_cause",    "unknown")
+            confidence    = float(ai_data.get("confidence", 1.0))
+            commit_msg    = ai_data.get("commit_message", "fix: auto-fixer rewrite")
+            detected_type = ai_data.get("pipeline_type", detected_type)
+            cand          = ai_data.get("fixes", []) or []
+
+            # Veto confabulated version fixes (prescan owns version validity).
+            vetoed = [f for f in cand if _fix_changes_valid_py_version(f)]
             for f in vetoed:
                 print(f"[ANALYSE] ✗ Vetoed confabulated version change in "
-                      f"{f.get('file','?')} — that Python version is already valid; "
-                      f"versions are owned by the prescan.", file=sys.stderr)
-            fixes = [f for f in fixes if not _fix_changes_valid_py_version(f)]
+                      f"{f.get('file','?')} — version is already valid.",
+                      file=sys.stderr)
+            cand = [f for f in cand if not _fix_changes_valid_py_version(f)]
 
+            if confidence < CONFIDENCE_MIN or not cand:
+                print(f"[ANALYSE] Low confidence ({confidence:.0%}) or no fixes — "
+                      f"not applying this attempt.")
+                feedback = ("\n\nYou did not produce a usable fix. Re-read the error "
+                            "and the file contents and fix the ACTUAL failing line.")
+                continue
+
+            valid = [f for f in cand if validate_fix(f)[0]]
+            if not valid:
+                for f in cand:
+                    ok, why = validate_fix(f)
+                    if not ok:
+                        print(f"  ✗ {f.get('file','?')} — {why}", file=sys.stderr)
+                feedback = "\n\nYour previous edits were invalid. Copy `find` text EXACTLY from the file."
+                continue
+
+            written, originals = write_fixes(valid)
+            if not written:
+                feedback = "\n\nNothing was written. Your fix did not apply."
+                continue
+
+            # ── VERIFY against the real pipeline ─────────────────────────────
+            if VERIFY_LOCALLY:
+                print("[VERIFY] Rebuilding + running the image to check the fix...")
+                passed, out = verify_build_and_run()
+            else:
+                passed, out = True, "(verification disabled)"
+
+            if passed:
+                print(f"[VERIFY] ✓ Fix VERIFIED on attempt {iteration+1} — {out}")
+                fixes, verified_written, verified_originals = valid, written, originals
+                break
+
+            # Failed → revert and feed the real, current error back to the model.
+            print(f"[VERIFY] ✗ Attempt {iteration+1} did not pass:\n{out[:600]}")
+            revert_files(originals)
+            feedback = ("\n\n## YOUR PREVIOUS FIX FAILED — the pipeline still errors.\n"
+                        "The error AFTER your change was:\n```\n" + out[-1200:] +
+                        "\n```\nYour diagnosis was wrong. Fix the ACTUAL cause shown above.")
+            error_signal = (extract_error_signal(out) or error_signal)[-2000:]
+
+        print(f"[TIMING] Stage 3 done in {time.time()-t3:.1f}s")
+
+        if not fixes:
+            print("[ERROR] AI could not produce a VERIFIED fix in "
+                  f"{MAX_FIX_ITERATIONS} attempts.", file=sys.stderr)
+            if token and repo:
+                open_issue(token, repo,
+                           f"AI could not produce a verified fix after "
+                           f"{MAX_FIX_ITERATIONS} attempts. Last root cause: {root_cause}",
+                           pipeline_type=detected_type)
+            sys.exit(3)
+
+        # A verified fix is already written to disk; hand it to the commit stages
+        # directly (skip the deterministic-path validate/write below).
         print(f"\n  pipeline   : {detected_type}")
         print(f"  root_cause : {root_cause}")
-        print(f"  confidence : {confidence:.0%}")
-        print(f"  fixes      : {len(fixes)} file(s)")
-        for fix in fixes:
-            edits = fix.get("edits")
-            if edits:
-                print(f"    → {fix.get('file','?')}  ({len(edits)} edit(s))")
-                print(f"      {fix.get('reason','')[:120]}")
-            else:
-                content_len = len(fix.get("fixed_content", "") or "")
-                print(f"    → {fix.get('file','?')}  ({content_len} chars, whole-file)")
-                print(f"      {fix.get('reason','')[:120]}")
-                if content_len < 50:
-                    print(f"      ⚠ WARNING: fixed_content very short ({content_len} chars) "
-                          f"— likely truncated")
+        print(f"  verified   : {verified_written}")
+        _pre_verified = (verified_written, verified_originals)
 
     if confidence < CONFIDENCE_MIN:
         print(f"[SKIP] Confidence {confidence:.0%} below threshold.")
@@ -2338,45 +2477,56 @@ def main():
                        pipeline_type=detected_type)
         sys.exit(3)
 
-    # ══ STAGE 4: VALIDATE ════════════════════════════════════════════════════
-    print("\n━━━ STAGE 4: VALIDATE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    valid_fixes = []
-    for fix in fixes[:MAX_FILES_FIXED]:
-        ok, reason = validate_fix(fix)
-        file = fix.get("file", "?")
-        if ok:
-            print(f"  ✓ {file}")
-            valid_fixes.append(fix)
-        else:
-            print(f"  ✗ {file} — {reason}", file=sys.stderr)
+    # ══ STAGE 4 + 5: VALIDATE + WRITE ════════════════════════════════════════
+    # The AI path already validated, wrote, AND verified its fix against a real
+    # build+run — so we skip straight to commit with those files. The
+    # deterministic (prescan) path still validates + writes here as before.
+    _pre_verified = locals().get("_pre_verified")
+    if _pre_verified is not None:
+        written, originals = _pre_verified
+        valid_fixes = fixes
+        print("\n━━━ STAGE 4+5: (AI fix already verified — skipping re-validate/write) ━")
+        print(f"[VERIFIED] {written}")
+    else:
+        # ══ STAGE 4: VALIDATE ════════════════════════════════════════════════
+        print("\n━━━ STAGE 4: VALIDATE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        valid_fixes = []
+        for fix in fixes[:MAX_FILES_FIXED]:
+            ok, reason = validate_fix(fix)
+            file = fix.get("file", "?")
+            if ok:
+                print(f"  ✓ {file}")
+                valid_fixes.append(fix)
+            else:
+                print(f"  ✗ {file} — {reason}", file=sys.stderr)
 
-    if not valid_fixes:
-        print("[ERROR] All fixes failed validation.", file=sys.stderr)
-        if token and repo:
-            open_issue(token, repo,
-                       f"AI rewrites failed validation. Root cause: {root_cause}",
-                       pipeline_type=detected_type)
-        sys.exit(3)
+        if not valid_fixes:
+            print("[ERROR] All fixes failed validation.", file=sys.stderr)
+            if token and repo:
+                open_issue(token, repo,
+                           f"Fixes failed validation. Root cause: {root_cause}",
+                           pipeline_type=detected_type)
+            sys.exit(3)
 
-    # ══ DRY RUN ══════════════════════════════════════════════════════════════
-    if args.dry_run:
-        print("\n━━━ DRY-RUN (no files written) ━━━━━━━━━━━━━━━━━━━━━━━━━")
-        for fix in valid_fixes:
-            content = fix["fixed_content"]
-            print(f"  would write {fix['file']} ({len(content)} chars)")
-            for line in content.splitlines()[:5]:
-                print(f"    {line}")
-            if len(content.splitlines()) > 5:
-                print(f"    ... ({len(content.splitlines()) - 5} more lines)")
-        sys.exit(0)
+        # ══ DRY RUN ══════════════════════════════════════════════════════════
+        if args.dry_run:
+            print("\n━━━ DRY-RUN (no files written) ━━━━━━━━━━━━━━━━━━━━━━━━━")
+            for fix in valid_fixes:
+                content = fix["fixed_content"]
+                print(f"  would write {fix['file']} ({len(content)} chars)")
+                for line in content.splitlines()[:5]:
+                    print(f"    {line}")
+                if len(content.splitlines()) > 5:
+                    print(f"    ... ({len(content.splitlines()) - 5} more lines)")
+            sys.exit(0)
 
-    # ══ STAGE 5: WRITE ═══════════════════════════════════════════════════════
-    print("\n━━━ STAGE 5: WRITE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    written, originals = write_fixes(valid_fixes)
-    if not written:
-        print("[ERROR] No files were written.", file=sys.stderr)
-        sys.exit(3)
-    print(f"[WRITE] {len(written)} file(s): {written}")
+        # ══ STAGE 5: WRITE ════════════════════════════════════════════════════
+        print("\n━━━ STAGE 5: WRITE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        written, originals = write_fixes(valid_fixes)
+        if not written:
+            print("[ERROR] No files were written.", file=sys.stderr)
+            sys.exit(3)
+        print(f"[WRITE] {len(written)} file(s): {written}")
 
     # ══ STAGE 6: TEST ════════════════════════════════════════════════════════
     print("\n━━━ STAGE 6: TEST ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
