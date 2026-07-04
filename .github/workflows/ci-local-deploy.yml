@@ -51,7 +51,7 @@ jobs:
 
       # ── Test (always) ────────────────────────────────────────────────────
       - name: Run unit tests
-        run: pytest sample_app/test_app11.py
+        run: pytest sample_app/test_app.py
 
       # ── Build (always — validates the Dockerfile on every branch) ─────────
       - name: Set up Docker Buildx
