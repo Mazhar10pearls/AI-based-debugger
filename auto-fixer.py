@@ -93,7 +93,7 @@ VERIFY_LOCALLY     = True   # set False only if the runner has no Docker
 # version typo, now costs a full model inference (~230s) + an image build, and
 # a class that can't be verified by build+run (e.g. a pure unit-test failure with
 # no server to hit) loses its safety net. Set False to restore prescan authority.
-PURE_AI_MODE = True
+PURE_AI_MODE = False        # hybrid: determinism owns AI-hostile classes; AI owns reasoning
 
 BOT_NAME   = "github-actions[bot]"
 BOT_EMAIL  = "github-actions[bot]@users.noreply.github.com"
@@ -709,13 +709,32 @@ def discover_context(error_signal: str,
                 "is a decoy, not the cause."
             )
         else:
-            # The log referenced concrete files — trust them, do NOT hijack the
-            # context with the workflow and do NOT emit the decoy directive.
-            print(f"[DISCOVER] Build-config signals present but log referenced "
-                  f"{referenced_sources} — trusting those, not forcing workflow.")
+            # The log referenced concrete files — trust them first, don't hijack
+            # context or emit the decoy directive. BUT still append the CI
+            # workflow as a SECONDARY suspect: a build-config failure can live in
+            # the build COMMAND itself (e.g. `docker build -f sample_app/Dockerfiless`
+            # — a typo'd -f path that names no real file, so it's never a
+            # referenced source). Without this the file containing the bug never
+            # reaches context and neither prescan nor AI can fix it.
+            if wf_files:
+                file_cap = max(MAX_CONTEXT_FILES, 3)
+                forced_paths = forced_paths + [f for f in wf_files if f not in forced_paths]
+                print(f"[DISCOVER] Build-config signals + referenced "
+                      f"{referenced_sources}: trusting those, workflow {wf_files} "
+                      f"added as secondary suspect (file cap {file_cap}).")
+            else:
+                print(f"[DISCOVER] Build-config signals present but log referenced "
+                      f"{referenced_sources} — trusting those, no workflow found.")
 
     # Track whether a forced file is a workflow, so we know to budget it generously.
     forced_set = set(forced_paths)
+    # A CI workflow YAML is ~5KB; the default 5200-char budget can't hold it
+    # alongside another forced file, evicting the very file that has the bug. When
+    # a workflow is a forced suspect, widen the budget for this run.
+    budget = MAX_TOTAL_CONTEXT
+    if any(re.search(r"\.github/workflows/.*\.ya?ml$", f.replace("\\", "/"))
+           for f in forced_paths):
+        budget = max(MAX_TOTAL_CONTEXT, 12000)
 
     def _try_add(rel: str, content: str, label: str) -> bool:
         nonlocal total
@@ -723,7 +742,7 @@ def discover_context(error_signal: str,
         # uses targeted find/replace edits instead.
         size_tag = " (LARGE — use edits)" if len(content) >= EDIT_MODE_THRESHOLD else ""
         block = f"### {rel}{size_tag}\n```\n{content}\n```"
-        if total + len(block) > MAX_TOTAL_CONTEXT and included:
+        if total + len(block) > budget and included:
             print(f"[DISCOVER] Budget reached — skipping {rel}")
             return False
         parts.append(block)
@@ -806,8 +825,8 @@ RULES:
 - file = exact path from the ### header.
 - AUDIT THE WHOLE FILE. The log shows the FIRST failure only, but a file may contain SEVERAL bugs. Fix ALL clear errors in one pass (one edit each) — do not stop at the line named in the log.
 - Verify filenames: if a COPY/ADD/CMD/ENTRYPOINT references a file, check it against "Repo files present" below. If it does not exist, correct it to the closest real filename.
-- Do NOT change Python or base-image versions, or `python-version` values — version validity is handled separately and the versions shown to you are already correct. Never claim a version is "unavailable", "outdated", or "not found"; that is not your job and is usually wrong.
-- Base your root_cause ONLY on the actual error text shown above. Do NOT invent a cause the log does not state. If the error names a file, a package (e.g. a line in requirements.txt), or a specific line, fix THAT — not something unrelated that merely looks suspicious.
+- Only change a Python / base-image version or a `python-version` value when the ERROR TEXT explicitly says that version is not found / unavailable / unsupported (e.g. "Version 3.2 ... not found"). Then set it to a current stable version (e.g. 3.12). NEVER invent a version problem the error does not state, and never change a version the error did not flag — that is the #1 way this system goes wrong.
+- Base your root_cause ONLY on the actual error text and the static-scan hints shown. If a file, a package, or a specific line is named, fix THAT — plus every other issue the static scan lists, in the same pass.
 - Preserve everything correct. Change only what is broken.
 - Only include files that actually need changes.
 - confidence < 0.4 means you are unsure — set it low rather than guess."""
@@ -1110,9 +1129,17 @@ def prescan_issues(included_files: list[str]) -> tuple[list[str], list[dict]]:
         for kind, raw in _extract_path_refs(rel, text):
             tok  = raw.strip().strip("\"'")
             base = Path(tok).name
-            if (not base or "." not in base or tok in (".", "..")
+            # These kinds ALWAYS point at a single file (not a directory), so a
+            # missing extension is fine — this is how we catch a typo'd Dockerfile
+            # reference like `docker build -f ...Dockerfilesss` (no extension, just
+            # like a real Dockerfile). For every other kind we still require a dot,
+            # so we don't mistake a directory (e.g. a build context) for a file.
+            ext_optional = kind in {"docker build -f", "pip install -r",
+                                    "RUN pip install -r", "script reference"}
+            if (not base or tok in (".", "..")
                     or "$" in tok or "${{" in tok or "://" in tok
-                    or "@" in tok or "=" in tok or ":" in tok):
+                    or "@" in tok or "=" in tok or ":" in tok
+                    or ("." not in base and not ext_optional)):
                 continue
             if base in repo_basenames:               # real file exists → never touch
                 continue
@@ -2346,13 +2373,24 @@ def main():
         suspect_note = (suspect_note + "\n" + directive) if suspect_note else directive
     if not included:
         print("[DISCOVER] WARNING: no files resolved — AI has no context to work with.")
-    prescan, prescan_autofixes = prescan_issues(included)
-    # Cross-file port mismatch leaves NO error in the log (the app starts fine),
-    # so it can't be discovered from the failure signal — scan the files directly.
-    port_findings, port_autofixes = prescan_port_consistency()
-    if port_autofixes:
-        prescan += port_findings
-        prescan_autofixes += port_autofixes
+
+    if PURE_AI_MODE:
+        # Totally-AI: no deterministic detection at all. The AI diagnoses and
+        # fixes from the error signal + file contents alone; correctness is
+        # guaranteed by the verify-and-run loop, not by static analysis. (Context
+        # gathering above — force-including referenced files and reproducing a
+        # startup crash — stays: that feeds the AI the right files, it doesn't
+        # fix anything.)
+        prescan, prescan_autofixes = [], []
+        print("[ANALYSE] PURE_AI_MODE — prescan disabled; AI does all diagnosis & fixing.")
+    else:
+        prescan, prescan_autofixes = prescan_issues(included)
+        # Cross-file port mismatch leaves NO error in the log (the app starts fine),
+        # so it can't be discovered from the failure signal — scan the files directly.
+        port_findings, port_autofixes = prescan_port_consistency()
+        if port_autofixes:
+            prescan += port_findings
+            prescan_autofixes += port_autofixes
     print(f"[TIMING] Stage 2 done in {time.time()-t2:.1f}s")
 
     # ══ STAGE 3: ANALYSE ═════════════════════════════════════════════════════
