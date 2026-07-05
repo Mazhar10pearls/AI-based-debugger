@@ -663,6 +663,31 @@ def validate_fix(fix: dict) -> tuple:
     return True, "ok"
 
 
+def _safe_fact_replace(text: str, wrong: str, right: str):
+    """
+    Apply a known (wrong -> right) fact fix safely: replace `wrong` only when
+    it matches as a COMPLETE token (not immediately followed by another word/
+    dot character) and matches exactly once. The boundary check alone is what
+    makes this safe both ways:
+      - Already fixed (python:3.1 -> python:3.12): 'python:3.1' no longer
+        matches as a complete token inside 'python:3.12' (the lookahead sees
+        the trailing '2'), so it correctly reports nothing left to fix —
+        instead of matching the substring and corrupting it into 'python:3.122'.
+      - Filename facts (requirement.txt -> requirements.txt): the CORRECT name
+        may legitimately already appear elsewhere in the file for an unrelated
+        line (e.g. a correct COPY next to a still-broken RUN) — that must NOT
+        be mistaken for "already resolved". Matching the WRONG token directly,
+        rather than checking whether `right` exists anywhere, gets this right.
+    Returns the patched text, or None if not found / not uniquely matchable.
+    """
+    pattern = re.escape(wrong) + r"(?![\w.])"
+    matches = list(re.finditer(pattern, text))
+    if len(matches) != 1:
+        return None
+    m = matches[0]
+    return text[:m.start()] + right + text[m.end():]
+
+
 def write_fixes(fixes: list, hints: list = None) -> tuple:
     hints = hints or []
     written, originals, reasons = [], {}, []
@@ -683,11 +708,11 @@ def write_fixes(fixes: list, hints: list = None) -> tuple:
                 except Exception:
                     original = None
                 if original is not None:
-                    patched = original
-                    applied_any = False
+                    patched, applied_any = original, False
                     for wrong, right in file_hints:
-                        if patched.count(wrong) == 1:
-                            patched = patched.replace(wrong, right, 1)
+                        result = _safe_fact_replace(patched, wrong, right)
+                        if result is not None:
+                            patched = result
                             applied_any = True
                     if applied_any and patched != original:
                         print(f"  ✓ {file} — recovered via verified-fact fallback "
@@ -712,6 +737,34 @@ def write_fixes(fixes: list, hints: list = None) -> tuple:
         tmp.replace(p)
         print(f"  ✓ {file} — {fix.get('reason','')[:100]}")
         written.append(file)
+
+    # ── Independent fact reconciliation ──────────────────────────────────────
+    # The per-fix fallback above only fires if the model's OWN file choice
+    # matches the fact's file. That misses the real failure mode: the model
+    # applies a known fact's fix to the WRONG file (e.g. the 'requirement.txt'
+    # typo fact belongs to sample_app/Dockerfile, but the model wrote its edit
+    # under plain 'requirements.txt'). So after all AI fixes are processed,
+    # check every fact against ITS OWN correct file — independent of whatever
+    # file the model tried — and apply it if still unresolved. This is not a
+    # guess: it's the same computed fact already shown to the model verbatim.
+    for hf, wrong, right, _note in hints:
+        try:
+            if not Path(hf).is_file():
+                continue
+            current = Path(hf).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        patched = _safe_fact_replace(current, wrong, right)
+        if patched is None:
+            continue
+        if hf not in originals:
+            originals[hf] = current
+        Path(hf).write_text(patched, encoding="utf-8")
+        if hf not in written:
+            written.append(hf)
+        print(f"  ✓ {hf} — recovered via fact reconciliation "
+              f"(model applied this fact to the wrong file)")
+
     return written, originals, reasons
 
 
