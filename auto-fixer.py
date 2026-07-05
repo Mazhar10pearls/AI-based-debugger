@@ -262,10 +262,12 @@ def discover_context(signal: str, stacks: set, forced: list) -> tuple:
 
 def static_hints(included: list) -> list:
     """
-    Facts Python can VERIFY about the included files, handed to the AI inside the
-    same single prompt. The AI still writes every fix — these stop it inventing
-    causes (the 'python:3.12 is unavailable' / 'create Dockerfiless' class of
-    hallucination). Zero extra LLM calls.
+    Facts Python can VERIFY about the included files: returns (file, wrong,
+    right, note) tuples. `note` is handed to the AI as ground truth in the
+    prompt; (file, wrong, right) is ALSO used as a guaranteed fallback
+    correction in write_fixes() if the model's own edit fails to apply verbatim
+    -- since these are computed facts (not guesses), they are safe to apply
+    directly rather than lost when the model's phrasing drifts.
     """
     import difflib
     hints = []
@@ -279,7 +281,7 @@ def static_hints(included: list) -> list:
     expose = None
     for p in Path(".").rglob("Dockerfile*"):
         if p.is_file() and not any(d in SKIP_DIRS for d in p.parts):
-            m = re.search(r"(?im)^\s*EXPOSE\s+(\d{2,5})", 
+            m = re.search(r"(?im)^\s*EXPOSE\s+(\d{2,5})",
                           p.read_text(encoding="utf-8", errors="replace"))
             if m:
                 expose = int(m.group(1))
@@ -298,14 +300,18 @@ def static_hints(included: list) -> list:
             core = tag.split("-")[0]
             minor = ".".join(core.split(".")[:2])
             if core not in ("3", "latest") and minor not in SUPPORTED_PY:
-                hints.append(f"{rel}: `python:{tag}` is NOT a valid image tag. "
-                             f"The correct fix is `python:3.12`.")
+                if text.count(f"python:{tag}") == 1:
+                    hints.append((rel, f"python:{tag}", "python:3.12",
+                                 f"`python:{tag}` is NOT a valid image tag. "
+                                 f"The correct fix is `python:3.12`."))
+
         for m in re.finditer(r'python-version:\s*["\']?([\d][\w.]*)', text):
             v = m.group(1)
             minor = ".".join(v.split(".")[:2])
-            if v != "3" and minor not in SUPPORTED_PY:
-                hints.append(f"{rel}: python-version \"{v}\" is NOT valid. "
-                             f"The correct fix is \"3.12\".")
+            if v != "3" and minor not in SUPPORTED_PY and text.count(v) == 1:
+                hints.append((rel, v, "3.12",
+                             f"python-version \"{v}\" is NOT valid. "
+                             f"The correct fix is \"3.12\"."))
 
         for m in re.finditer(r"(?:(?:-r|--requirement|--file|-f)\s+|(?:COPY|ADD)\s+)([\w./\-]+)",
                              text):
@@ -315,22 +321,24 @@ def static_hints(included: list) -> list:
                     or tok in (".", "..")):
                 continue
             close = difflib.get_close_matches(base, list(names.keys()), n=1, cutoff=0.6)
-            if close:
-                hints.append(f"{rel}: references `{base}` which does NOT exist. "
-                             f"The real file is `{close[0]}` — change `{base}` to "
-                             f"`{close[0]}`, do NOT create a new file.")
+            if close and text.count(base) == 1:
+                hints.append((rel, base, close[0],
+                             f"references `{base}` which does NOT exist. "
+                             f"The real file is `{close[0]}` -- change `{base}` to "
+                             f"`{close[0]}`, do NOT create a new file."))
 
         if expose and rel.endswith(".py"):
             pm = re.search(r"\.run\([^)]*\bport\s*=\s*(\d{2,5})", text)
-            if pm and int(pm.group(1)) != expose:
-                hints.append(f"{rel}: the app listens on port {pm.group(1)} but the "
-                             f"Dockerfile EXPOSEs {expose} — change the app's port "
-                             f"to {expose}.")
+            if pm and int(pm.group(1)) != expose and text.count(f"port={pm.group(1)}") == 1:
+                hints.append((rel, f"port={pm.group(1)}", f"port={expose}",
+                             f"the app listens on port {pm.group(1)} but the "
+                             f"Dockerfile EXPOSEs {expose} -- change the app's port "
+                             f"to {expose}."))
 
     if hints:
         print(f"[HINTS] {len(hints)} verified fact(s) added to the prompt:")
-        for h in hints:
-            print(f"[HINTS]   • {h}")
+        for rel, _, _, note in hints:
+            print(f"[HINTS]   - {rel}: {note}")
     return hints
 
 
@@ -391,7 +399,8 @@ def build_prompt(signal, context, stacks, hints=None):
     if hints:
         hints_block = ("## Verified facts (computed from the actual repo — these "
                        "are TRUE, fix exactly these):\n"
-                       + "\n".join(f"- {h}" for h in hints) + "\n\n")
+                       + "\n".join(f"- {rel}: {note}" for rel, _, _, note in hints)
+                       + "\n\n")
     def fmt(ctx):
         return USER_PROMPT.format(stacks=", ".join(sorted(stacks)) or "unknown",
                                   signal=signal, hints_block=hints_block, context=ctx)
@@ -539,6 +548,29 @@ def parse_ai_response(raw: str) -> dict:
 # STAGE 4 — APPLY FILES + VALIDATE SYNTAX
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _salvage_fragment(content: str, find: str, replace: str) -> str | None:
+    """
+    Last-resort recovery when `find` doesn't match verbatim. The model often
+    paraphrases the surrounding line/quotes but gets the actual changed TOKEN
+    right. Strip the longest common prefix/suffix of find vs replace to isolate
+    just the changed fragment; apply it ONLY if that fragment occurs exactly
+    once in the file (never ambiguous, never a guess).
+    """
+    if not find or not replace or find == replace:
+        return None
+    i = 0
+    while i < len(find) and i < len(replace) and find[i] == replace[i]:
+        i += 1
+    j = 0
+    while (j < len(find) - i and j < len(replace) - i
+           and find[-1 - j] == replace[-1 - j]):
+        j += 1
+    old_frag, new_frag = find[i:len(find) - j], replace[i:len(replace) - j]
+    if len(old_frag.strip()) < 3 or content.count(old_frag) != 1:
+        return None
+    return content.replace(old_frag, new_frag, 1)
+
+
 def _apply_edits(original: str, edits: list) -> tuple:
     content = original
     for i, ed in enumerate(edits):
@@ -551,6 +583,7 @@ def _apply_edits(original: str, edits: list) -> tuple:
         # whitespace-tolerant fallback
         nf = "\n".join(l.strip() for l in find.splitlines())
         nc = "\n".join(l.strip() for l in content.splitlines())
+        matched = False
         if nf and nf in nc:
             fl = [l.strip() for l in find.splitlines()]
             cl = content.splitlines()
@@ -562,11 +595,19 @@ def _apply_edits(original: str, edits: list) -> tuple:
                     content = "\n".join(cl)
                     if original.endswith("\n") and not content.endswith("\n"):
                         content += "\n"
+                    matched = True
                     break
-            else:
-                return None, f"edit #{i+1} 'find' not found"
+        if matched:
             continue
-        return None, f"edit #{i+1} 'find' text not present in file"
+        # final salvage: isolate the actual changed fragment, apply only if unique
+        salvaged = _salvage_fragment(content, find, repl)
+        if salvaged is not None and salvaged != content:
+            print(f"[EDIT] Salvaged edit #{i+1} via unique-fragment match "
+                  f"(model's 'find' did not match the file verbatim)")
+            content = salvaged
+            continue
+        return None, (f"edit #{i+1} 'find' text not present in file — "
+                      f"model's find: {find[:120]!r}")
     if content == original:
         return None, "edits produced no change"
     return content, "ok"
@@ -622,14 +663,45 @@ def validate_fix(fix: dict) -> tuple:
     return True, "ok"
 
 
-def write_fixes(fixes: list) -> tuple:
-    written, originals = [], {}
+def write_fixes(fixes: list, hints: list = None) -> tuple:
+    hints = hints or []
+    written, originals, reasons = [], {}, []
     for fix in fixes[:MAX_FILES_FIXED]:
         ok, reason = validate_fix(fix)
         file = fix.get("file", "").strip()
+
         if not ok:
+            # The model's own edit didn't apply. Before giving up, check whether
+            # a VERIFIED fact (static_hints) exists for this exact file — if so,
+            # apply that known-correct (wrong -> right) swap directly instead of
+            # the model's possibly-imperfect find/replace. This is not a guess:
+            # it's the same fact already shown to the model in the prompt.
+            file_hints = [(w, r) for (hf, w, r, _) in hints if hf == file]
+            if file_hints and Path(file).is_file():
+                try:
+                    original = Path(file).read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    original = None
+                if original is not None:
+                    patched = original
+                    applied_any = False
+                    for wrong, right in file_hints:
+                        if patched.count(wrong) == 1:
+                            patched = patched.replace(wrong, right, 1)
+                            applied_any = True
+                    if applied_any and patched != original:
+                        print(f"  ✓ {file} — recovered via verified-fact fallback "
+                              f"(model's edit did not apply verbatim)")
+                        originals[file] = original
+                        Path(file).write_text(patched, encoding="utf-8")
+                        written.append(file)
+                        continue
+
+            print(f"  ✗ {file or '?'} — {reason}")          # stdout: always visible in Action logs
             print(f"  ✗ {file or '?'} — {reason}", file=sys.stderr)
+            reasons.append(f"{file or '?'}: {reason}")
             continue
+
         originals[file] = Path(file).read_text(encoding="utf-8", errors="replace")
         content = fix["fixed_content"]
         if not content.endswith("\n"):
@@ -640,7 +712,7 @@ def write_fixes(fixes: list) -> tuple:
         tmp.replace(p)
         print(f"  ✓ {file} — {fix.get('reason','')[:100]}")
         written.append(file)
-    return written, originals
+    return written, originals, reasons
 
 
 def revert_files(originals: dict):
@@ -937,11 +1009,14 @@ def main():
             print(f"  {'would write' if ok else 'reject'} {fix.get('file','?')} — {reason}")
         sys.exit(0)
 
-    written, originals = write_fixes(fixes)
+    written, originals, reject_reasons = write_fixes(fixes, hints)
     if not written:
-        print("[ERROR] No valid fix applied.", file=sys.stderr)
+        detail = "; ".join(reject_reasons) or "no detail captured"
+        print(f"[ERROR] No valid fix applied. {detail}", file=sys.stderr)
         if token and repo:
-            open_issue(token, repo, f"AI fix failed validation. Root cause: {root_cause}", run_url)
+            open_issue(token, repo,
+                       f"AI fix failed validation. Root cause: {root_cause}\n\n"
+                       f"Rejection detail: {detail}", run_url)
         sys.exit(3)
 
     # ── STAGE 5: run tests ──
