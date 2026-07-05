@@ -712,9 +712,24 @@ def last_commit_was_bot() -> bool:
 
 
 def count_recent_bot_commits(n=10) -> int:
+    """
+    Count a CONSECUTIVE run of bot commits walking back from HEAD — stops at the
+    first human commit. This distinguishes a genuine stuck loop (bot fixes →
+    fails → bot fixes → fails, back to back with nothing in between) from a
+    healthy history where 3+ PAST bot fixes were reviewed and merged by a human
+    at various points. Counting "any N bot commits in recent history" (the old
+    behavior) permanently blocks the fixer forever once enough fixes have
+    accumulated and been merged — that's not a loop, that's the system working.
+    """
     try:
-        return sum(1 for l in _git("log", f"-{n}", "--pretty=%an").stdout.splitlines()
-                   if l.strip() == BOT_NAME)
+        lines = _git("log", f"-{n}", "--pretty=%an").stdout.splitlines()
+        count = 0
+        for author in lines:
+            if author.strip() == BOT_NAME:
+                count += 1
+            else:
+                break  # a human commit breaks the streak — not a loop
+        return count
     except Exception:
         return 0
 
