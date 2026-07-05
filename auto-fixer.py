@@ -313,9 +313,27 @@ def static_hints(included: list) -> list:
                              f"python-version \"{v}\" is NOT valid. "
                              f"The correct fix is \"3.12\"."))
 
+        # Generic "does this referenced file actually exist" check. Not
+        # hardcoded to any directive or filename — it scans every place a
+        # Dockerfile/script names a local file (pip -r/--file, COPY/ADD
+        # sources, and CMD/ENTRYPOINT in both exec-array and shell form) and
+        # checks the BASENAME against every file that actually exists in the
+        # repo. Any directive naming a file that isn't there is caught the
+        # same way, regardless of which directive it was.
+        ref_tokens = []
         for m in re.finditer(r"(?:(?:-r|--requirement|--file|-f)\s+|(?:COPY|ADD)\s+)([\w./\-]+)",
                              text):
-            tok = m.group(1).strip()
+            ref_tokens.append(m.group(1).strip())
+        for m in re.finditer(r"(?im)^\s*(?:CMD|ENTRYPOINT)\s*(.*)$", text):
+            line = m.group(1)
+            quoted = re.findall(r'"([^"]+)"', line)
+            tokens = quoted if quoted else line.split()
+            for tok in tokens:
+                tok = tok.strip().strip(",")
+                if tok and not tok.startswith("-") and "." in Path(tok).name:
+                    ref_tokens.append(tok)
+
+        for tok in ref_tokens:
             base = Path(tok).name
             if (not base or base in names or "$" in tok or ":" in tok
                     or tok in (".", "..")):
