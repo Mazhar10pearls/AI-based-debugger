@@ -205,6 +205,39 @@ def _score_file(path: Path, signal: str, stacks: set) -> int:
     return score
 
 
+def find_ci_workflow_files(root: Path = Path(".")) -> list:
+    """
+    Fallback candidate source for failures that name NO real source file in
+    the log — e.g. a fast setup-action failure (bad python-version) that dies
+    before pip/build/test ever runs, so nothing in the log points at app code.
+    By elimination, a failure with no file trace is a workflow-configuration
+    problem, so the repo's own CI workflow YAML(s) become the prime suspect.
+    Not tied to any specific bug or filename — this is a general "when nothing
+    else is referenced, check the thing that defines the pipeline" rule.
+
+    Excludes the self-heal workflow itself (detected generically by content,
+    not by a hardcoded filename) so the fixer never targets its own definition.
+    """
+    found = []
+    wf_dir = root / ".github" / "workflows"
+    if not wf_dir.is_dir():
+        return found
+    for p in sorted(wf_dir.glob("*.y*ml")):
+        if not p.is_file():
+            continue
+        rel = _relstrip(str(p))
+        if _is_blocked(rel):
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        if "auto-fixer.py" in text or "auto_fixer.py" in text:
+            continue  # this IS the workflow that runs us — never a fix target
+        found.append(rel)
+    return found
+
+
 def discover_context(signal: str, stacks: set, forced: list) -> tuple:
     parts, included, total = [], [], 0
 
@@ -783,6 +816,7 @@ def write_fixes(fixes: list, hints: list = None) -> tuple:
         print(f"  ✓ {hf} — recovered via fact reconciliation "
               f"(model applied this fact to the wrong file)")
 
+    written = list(dict.fromkeys(written))   # same file can be fixed by >1 entry
     return written, originals, reasons
 
 
@@ -1021,6 +1055,12 @@ def main():
     # ── STAGE 2: discover files ──
     print("\n━━━ DISCOVER FILES ━━━")
     forced = extract_referenced_paths(log_text)
+    if not forced:
+        wf = find_ci_workflow_files()
+        if wf:
+            print(f"[DISCOVER] No source file referenced in the log — falling back "
+                  f"to the CI workflow as the prime suspect: {wf}")
+            forced = wf
     context, included = discover_context(signal, stacks, forced)
     if not included:
         print("[DISCOVER] WARNING: no files resolved.")
