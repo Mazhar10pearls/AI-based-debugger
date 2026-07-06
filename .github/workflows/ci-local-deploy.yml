@@ -28,7 +28,7 @@ permissions:
 
 jobs:
   build-test-deploy:
-    name: Build, Test, and (main only) Deploy
+    name: Build, Test, and  Deploy
     runs-on: self-hosted
 
     steps:
@@ -42,12 +42,12 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.2"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r sample_app/requirements.txt
+          pip install -r sample_app/requirement.txt
 
       # ── Test (always) ────────────────────────────────────────────────────
       - name: Run unit tests
