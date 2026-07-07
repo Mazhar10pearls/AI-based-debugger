@@ -41,6 +41,11 @@ OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL",   "qwen2.5-coder:3b")
 AI_TIMEOUT     = 210
 MAX_RETRIES    = 2
 RETRY_BACKOFF  = [20, 20]
+# A small local model reliably fixes ONE bug per call, even when a file has
+# several and is told so explicitly. Rather than rely on a single shot being
+# exhaustive, re-ask up to this many times, re-scanning between rounds — each
+# round only has to do what the model already does reliably: fix one thing.
+MAX_AI_ROUNDS  = 3
 
 # ── Prompt / context budget ───────────────────────────────────────────────────
 MAX_ERROR_LINES   = 14
@@ -315,18 +320,21 @@ def scan_reference_hints(included_contents: dict) -> str:
     basenames = {}
     for f in all_repo:
         basenames.setdefault(Path(f).name.lower(), []).append(f)
+    all_repo_set = set(all_repo)
     lines = []
     for rel, content in included_contents.items():
         name = Path(rel).name.lower()
         if "dockerfile" not in name and "docker-compose" not in name and "compose.y" not in name:
             continue
-        for pat, label in DOCKERFILE_REF_PATTERNS:
+        docker_dir = Path(rel).parent  # COPY/ADD/-r paths resolve relative to the build
+        for pat, label in DOCKERFILE_REF_PATTERNS:              # context (the Dockerfile's own dir), not the repo root
             for m in pat.finditer(content):
                 ref = m.group(1).strip().strip("'\"")
                 if not ref or ref in (".", "..") or ref.startswith("-") or ref.startswith("$"):
                     continue
                 ref_clean = ref.lstrip("./")
-                if Path(ref_clean).is_file() or ref_clean in all_repo:
+                candidates = {ref_clean, _relstrip(str(docker_dir / ref_clean))}
+                if any(Path(c).is_file() or c in all_repo_set for c in candidates):
                     continue
                 close = difflib.get_close_matches(Path(ref_clean).name.lower(),
                                                    basenames.keys(), n=1, cutoff=0.4)
@@ -1041,6 +1049,60 @@ def main():
                        f"AI fix failed validation. Root cause: {root_cause}\n\n"
                        f"Rejection detail: {detail}", run_url)
         sys.exit(3)
+
+    # ── STAGE 4b: additional rounds — catch bugs round 1 missed ──
+    # If the static scanner still finds an unresolved reference mismatch after
+    # round 1's fix was applied, there's proof more remains to fix, so ask the
+    # model again against the now-partially-fixed files. Stops the moment a
+    # round finds nothing left to flag, the model returns no new grounded fix,
+    # or a round repeats the exact same unresolved hints as the round before
+    # (model is stuck on it — escalating to another call won't help).
+    prev_hints = None
+    for round_no in range(2, MAX_AI_ROUNDS + 1):
+        r_context, r_included, r_contents = discover_context(signal, stacks, forced)
+        r_hints = scan_reference_hints(r_contents)
+        if not r_hints:
+            print(f"[LOOP] Static scan is clean after round {round_no - 1} — no more rounds needed.")
+            break
+        if r_hints == prev_hints:
+            print(f"[LOOP] Round {round_no - 1} left the same issue(s) flagged — "
+                  f"model isn't resolving it, stopping.")
+            break
+        prev_hints = r_hints
+
+        print(f"\n━━━ SEND TO AI (round {round_no}/{MAX_AI_ROUNDS}) ━━━")
+        try:
+            raw_r = call_ai(signal, r_context, stacks, r_hints)
+            data_r = parse_ai_response(raw_r)
+        except Exception as exc:
+            print(f"[LOOP] round {round_no} AI call failed: {exc} — stopping.")
+            break
+
+        fixes_r = data_r.get("fixes", []) or []
+        grounded_r = []
+        for f in fixes_r:
+            fp = (f.get("file") or "").strip()
+            if fp in r_included:
+                grounded_r.append(f)
+            else:
+                print(f"  ✗ {fp or '?'} — rejected: model was never shown this file "
+                      f"(hallucination guard)", file=sys.stderr)
+
+        conf_r = float(data_r.get("confidence", 1.0))
+        print(f"  round {round_no} confidence: {conf_r:.0%}, fixes: {len(grounded_r)} file(s)")
+        if conf_r < 0.5 or not grounded_r:
+            print(f"[LOOP] Nothing more to apply this round — stopping.")
+            break
+
+        print(f"\n━━━ APPLY + VALIDATE (round {round_no}) ━━━")
+        written_r, originals_r, _ = write_fixes(grounded_r)
+        if not written_r:
+            print(f"[LOOP] Round {round_no} produced no valid fix — stopping.")
+            break
+        for f in written_r:
+            originals.setdefault(f, originals_r[f])
+        written = list(dict.fromkeys(written + written_r))
+        fixes = fixes + grounded_r
 
     # ── STAGE 5: run tests ──
     print("\n━━━ RUN TESTS ━━━")
