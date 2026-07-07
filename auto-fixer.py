@@ -239,7 +239,7 @@ def find_ci_workflow_files(root: Path = Path(".")) -> list:
 
 
 def discover_context(signal: str, stacks: set, forced: list) -> tuple:
-    parts, included, total = [], [], 0
+    parts, included, contents, total = [], [], {}, 0
 
     def read_whole(path, cap=MAX_FILE_CHARS):
         try:
@@ -253,7 +253,7 @@ def discover_context(signal: str, stacks: set, forced: list) -> tuple:
         block = f"### {rel}\n```\n{content}\n```"
         if total + len(block) > MAX_TOTAL_CONTEXT and included:
             return False
-        parts.append(block); included.append(rel); total += len(block)
+        parts.append(block); included.append(rel); contents[rel] = content; total += len(block)
         print(f"[DISCOVER] + {rel} ({len(content)} chars)")
         return True
 
@@ -290,8 +290,53 @@ def discover_context(signal: str, stacks: set, forced: list) -> tuple:
 
     context = "\n\n".join(parts)
     print(f"[DISCOVER] {len(included)} files, {len(context)} chars")
-    return context, included
+    return context, included, contents
 
+
+# ── static reference scan (hints only — AI still decides what's real) ──────────
+# A small local model reliably finds the FIRST bug in a file and then stops.
+# This does not diagnose or fix anything itself; it just extracts every file
+# path a Dockerfile/compose file references and checks whether that exact path
+# exists in the repo, so a second (or third) broken reference in the same file
+# can't slip past the model unnoticed. The AI still verifies each candidate,
+# decides if it's a real problem, and writes the actual fix.
+DOCKERFILE_REF_PATTERNS = [
+    (re.compile(r'^\s*COPY\s+(?:--from=\S+\s+)?(\S+)\s+\S+', re.I | re.M), "COPY"),
+    (re.compile(r'^\s*ADD\s+(?:--from=\S+\s+)?(\S+)\s+\S+', re.I | re.M), "ADD"),
+    (re.compile(r'-r\s+(\S+\.txt)'), "pip install -r"),
+    (re.compile(r'CMD\s*\[\s*"[^"]*"\s*,\s*"([^"]+)"', re.I), "CMD"),
+    (re.compile(r'ENTRYPOINT\s*\[\s*"[^"]*"\s*,\s*"([^"]+)"', re.I), "ENTRYPOINT"),
+]
+
+
+def scan_reference_hints(included_contents: dict) -> str:
+    all_repo = [_relstrip(str(p)) for p in Path(".").rglob("*")
+                if p.is_file() and not any(d in SKIP_DIRS for d in p.parts)]
+    basenames = {}
+    for f in all_repo:
+        basenames.setdefault(Path(f).name.lower(), []).append(f)
+    lines = []
+    for rel, content in included_contents.items():
+        name = Path(rel).name.lower()
+        if "dockerfile" not in name and "docker-compose" not in name and "compose.y" not in name:
+            continue
+        for pat, label in DOCKERFILE_REF_PATTERNS:
+            for m in pat.finditer(content):
+                ref = m.group(1).strip().strip("'\"")
+                if not ref or ref in (".", "..") or ref.startswith("-") or ref.startswith("$"):
+                    continue
+                ref_clean = ref.lstrip("./")
+                if Path(ref_clean).is_file() or ref_clean in all_repo:
+                    continue
+                close = difflib.get_close_matches(Path(ref_clean).name.lower(),
+                                                   basenames.keys(), n=1, cutoff=0.4)
+                suggestion = ", ".join(basenames[close[0]]) if close else "no close match in repo"
+                lines.append(f"- {rel}: {label} references '{ref}' — NOT found in repo. "
+                             f"Closest existing file: {suggestion}")
+    hints = "\n".join(dict.fromkeys(lines))  # de-dupe, preserve order
+    if hints:
+        print(f"[DISCOVER] Static reference hints:\n{hints}")
+    return hints
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -341,11 +386,15 @@ HOW TO REASON (do this yourself — nothing is pre-solved for you):
 - Valid Python versions are 3.8 through 3.13. Tags like python:3.1, python:3.2, or python-version "3.1"/"3.2" are INVALID — replace with 3.12.
 - If the app's `app.run(port=N)` disagrees with the Dockerfile `EXPOSE M`, change the app to bind M.
 - If you change an `if __name__ == "__main__":` block, it MUST still start a long-running server (app.run(host="0.0.0.0", port=<EXPOSE port>)). Never leave it empty.
+- A "## Static reference check" section may be given, listing filenames a script references that a naive scan couldn't find in the repo. This is a HINT ONLY, not a diagnosis — verify each one yourself against "## Repo files", and IGNORE any hint that turns out to be a false positive (e.g. a build arg, a URL, or a file created earlier in the same Dockerfile).
+
+MULTIPLE BUGS IN ONE FILE — READ THIS CAREFULLY:
+A single file routinely has MORE THAN ONE unrelated bug (e.g. one line references a misspelled requirements file AND a separate line runs the wrong script name). Finding one bug and stopping is a FAILURE. After drafting a fix, go back and re-read the ENTIRE file one more time, line by line, treating it as if you had not looked at it yet — list every remaining line that references a file, a version, or a port, and check each one independently. Every distinct bug in a file goes into that SAME file's `edits` array as its own {{"find":...,"replace":...}} entry — do not open a second fixes[] entry for a file you already opened one for.
 
 RULES:
 - Pick ONE mode per file: "edits" (find/replace; `find` copied EXACTLY from the file, kept short — ideally the single wrong token) OR "fixed_content" (the COMPLETE corrected small file).
 - file = exact path from a ### header. You may ONLY edit files shown under "## File contents" — never name a file with no ### header, never create a new file.
-- Read the WHOLE file; fix EVERY error you can see in one pass, not just the first.
+- Every fixes[] entry MUST carry a non-empty "edits" or "fixed_content". If you decide a file doesn't need a change after all, omit it entirely — don't include an empty entry.
 - Preserve everything correct. Change only what is broken.
 - Set confidence below 0.5 if you are unsure, rather than guessing."""
 
@@ -357,7 +406,7 @@ USER_PROMPT = """\
 ```
 ## Repo files (these exist — anything referenced but NOT in this list is a typo):
 {repo_files}
-
+{hints_section}
 ## File contents (you may ONLY edit these):
 {context}"""
 
@@ -374,13 +423,15 @@ def repo_file_list(limit: int = 200) -> str:
     return ", ".join(files) if files else "(none found)"
 
 
-def build_prompt(signal, context, stacks):
+def build_prompt(signal, context, stacks, hints=""):
     repo_files = repo_file_list()
+    hints_section = f"## Static reference check (verify each — not authoritative):\n{hints}\n" if hints else ""
     def fmt(ctx):
         return USER_PROMPT.format(stacks=", ".join(sorted(stacks)) or "unknown",
-                                  signal=signal, repo_files=repo_files, context=ctx)
+                                  signal=signal, repo_files=repo_files,
+                                  hints_section=hints_section, context=ctx)
     user = fmt(context)
-    cap = 9000
+    cap = 9500
     if len(SYSTEM_PROMPT + "\n\n" + user) > cap:
         allowed = cap - len(SYSTEM_PROMPT) - len(fmt("")) - 100
         user = fmt(context[:max(allowed, 1000)] + "\n...(trimmed)")
@@ -413,15 +464,15 @@ def _extract_token(line: bytes, fmt: str) -> str:
         return ""
 
 
-def call_ai(signal, context, stacks) -> str:
-    prompt = f"{SYSTEM_PROMPT}\n\n{build_prompt(signal, context, stacks)}"
+def call_ai(signal, context, stacks, hints="") -> str:
+    prompt = f"{SYSTEM_PROMPT}\n\n{build_prompt(signal, context, stacks, hints)}"
     endpoint, fmt = _detect_endpoint()
     if fmt == "openai":
         payload = {"model": OLLAMA_MODEL, "prompt": prompt, "temperature": 0.05,
-                   "max_tokens": 2000, "stream": True}
+                   "max_tokens": 2800, "stream": True}
     else:
         payload = {"model": OLLAMA_MODEL, "prompt": prompt, "format": FIX_SCHEMA,
-                   "options": {"temperature": 0.05, "num_predict": 2000,
+                   "options": {"temperature": 0.05, "num_predict": 2800,
                                "num_ctx": 8192}, "stream": True}
     print(f"[AI] {endpoint} ({fmt}) | prompt {len(prompt)} chars | model {OLLAMA_MODEL}")
 
@@ -917,14 +968,15 @@ def main():
             print(f"[DISCOVER] No source file referenced in the log — falling back "
                   f"to the CI workflow as the prime suspect: {wf}")
             forced = wf
-    context, included = discover_context(signal, stacks, forced)
+    context, included, included_contents = discover_context(signal, stacks, forced)
     if not included:
         print("[DISCOVER] WARNING: no files resolved.")
+    hints = scan_reference_hints(included_contents)
 
     # ── STAGE 3: build prompt + send to AI + receive JSON ──
     print("\n━━━ SEND TO AI ━━━")
     try:
-        raw = call_ai(signal, context, stacks)
+        raw = call_ai(signal, context, stacks, hints)
         data = parse_ai_response(raw)
     except Exception as exc:
         print(f"[ERROR] AI failed: {exc}", file=sys.stderr)
