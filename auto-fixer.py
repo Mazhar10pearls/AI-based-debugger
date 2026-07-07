@@ -432,8 +432,7 @@ USER_PROMPT = """\
 ```
 ## Repo files (these exist — anything referenced but NOT in this list is a typo):
 {repo_files}
-{hints_section}
-## File contents (you may ONLY edit these):
+{hints_section}{focus_section}## File contents (you may ONLY edit these):
 {context}"""
 
 
@@ -449,13 +448,25 @@ def repo_file_list(limit: int = 200) -> str:
     return ", ".join(files) if files else "(none found)"
 
 
-def build_prompt(signal, context, stacks, hints=""):
+def build_prompt(signal, context, stacks, hints="", focus=""):
     repo_files = repo_file_list()
     hints_section = f"## Static reference check (verify each — not authoritative):\n{hints}\n" if hints else ""
+    focus_section = ""
+    if focus:
+        focus_section = (
+            "## FOCUS — this is a follow-up round.\n"
+            "Earlier fixes in this run have ALREADY been applied to the files below. "
+            "Do NOT re-quote or re-report any bug that is already fixed. Only report "
+            "issues that are STILL PRESENT in the file contents shown here. "
+            "The following is the specific remaining issue(s) to fix now — quote your "
+            "evidence from these exact lines in the shown files, not from anything "
+            "you might remember from an earlier round:\n" + focus + "\n\n"
+        )
     def fmt(ctx):
         return USER_PROMPT.format(stacks=", ".join(sorted(stacks)) or "unknown",
                                   signal=signal, repo_files=repo_files,
-                                  hints_section=hints_section, context=ctx)
+                                  hints_section=hints_section,
+                                  focus_section=focus_section, context=ctx)
     user = fmt(context)
     cap = 9500
     if len(SYSTEM_PROMPT + "\n\n" + user) > cap:
@@ -490,8 +501,8 @@ def _extract_token(line: bytes, fmt: str) -> str:
         return ""
 
 
-def call_ai(signal, context, stacks, hints="") -> str:
-    prompt = f"{SYSTEM_PROMPT}\n\n{build_prompt(signal, context, stacks, hints)}"
+def call_ai(signal, context, stacks, hints="", focus="") -> str:
+    prompt = f"{SYSTEM_PROMPT}\n\n{build_prompt(signal, context, stacks, hints, focus)}"
     endpoint, fmt = _detect_endpoint()
     if fmt == "openai":
         payload = {"model": OLLAMA_MODEL, "prompt": prompt, "temperature": 0.05,
@@ -1165,7 +1176,7 @@ def main():
 
         print(f"\n━━━ SEND TO AI (round {round_no}/{MAX_AI_ROUNDS}) ━━━")
         try:
-            raw_r = call_ai(signal, r_context, stacks, r_hints)
+            raw_r = call_ai(signal, r_context, stacks, r_hints, focus=r_hints)
             data_r = parse_ai_response(raw_r)
         except Exception as exc:
             print(f"[LOOP] round {round_no} AI call failed: {exc} — stopping.")
