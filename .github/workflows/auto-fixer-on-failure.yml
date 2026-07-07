@@ -31,7 +31,7 @@ jobs:
       github.event.workflow_run.head_commit.author.name != 'github-actions[bot]'
 
     name: Auto-Fix Failed Workflow
-    runs-on: [self-hosted, linux, ai-runner]
+    runs-on: self-hosted
     environment: prod
     # 30-min budget:
     #   ~2 min  checkout + pip + git setup + log download
