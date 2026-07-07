@@ -327,19 +327,33 @@ DOCKERFILE_REF_PATTERNS = [
 
 
 def scan_reference_hints(included_contents: dict) -> str:
+    """Human-readable summary, kept for logs and legacy prompt paths."""
+    return _scan_reference_details(included_contents)[1]
+
+
+def _scan_reference_details(included_contents: dict) -> tuple:
+    """
+    Returns (broken_lines, hint_summary).
+      broken_lines = [{file, line, wrong_token, closest_basename, closest_full}, ...]
+        — each carries the OFFENDING LINE VERBATIM from the file, plus the
+        wrong token and the closest real file, so the AI only has to write
+        the corrected line (a copy-and-swap task), never quote from memory.
+      hint_summary  = the human-readable string used for logs.
+    """
     all_repo = [_relstrip(str(p)) for p in Path(".").rglob("*")
                 if p.is_file() and not any(d in SKIP_DIRS for d in p.parts)]
     basenames = {}
     for f in all_repo:
         basenames.setdefault(Path(f).name.lower(), []).append(f)
     all_repo_set = set(all_repo)
-    lines = []
+
+    broken, summary = [], []
     for rel, content in included_contents.items():
         name = Path(rel).name.lower()
         if "dockerfile" not in name and "docker-compose" not in name and "compose.y" not in name:
             continue
-        docker_dir = Path(rel).parent  # COPY/ADD/-r paths resolve relative to the build
-        for pat, label in DOCKERFILE_REF_PATTERNS:              # context (the Dockerfile's own dir), not the repo root
+        docker_dir = Path(rel).parent
+        for pat, label in DOCKERFILE_REF_PATTERNS:
             for m in pat.finditer(content):
                 ref = m.group(1).strip().strip("'\"")
                 if not ref or ref in (".", "..") or ref.startswith("-") or ref.startswith("$"):
@@ -350,13 +364,26 @@ def scan_reference_hints(included_contents: dict) -> str:
                     continue
                 close = difflib.get_close_matches(Path(ref_clean).name.lower(),
                                                    basenames.keys(), n=1, cutoff=0.4)
-                suggestion = ", ".join(basenames[close[0]]) if close else "no close match in repo"
-                lines.append(f"- {rel}: {label} references '{ref}' — NOT found in repo. "
-                             f"Closest existing file: {suggestion}")
-    hints = "\n".join(dict.fromkeys(lines))  # de-dupe, preserve order
-    if hints:
-        print(f"[DISCOVER] Static reference hints:\n{hints}")
-    return hints
+                closest_full = basenames[close[0]][0] if close else ""
+                closest_base = close[0] if close else ""
+                # Find the exact line that contains this bad reference — the AI
+                # will only see this verbatim line and be asked to correct it.
+                line_start = content.rfind("\n", 0, m.start()) + 1
+                line_end = content.find("\n", m.end())
+                if line_end == -1:
+                    line_end = len(content)
+                bad_line = content[line_start:line_end]
+                broken.append({"file": rel, "line": bad_line,
+                               "wrong_token": ref,
+                               "closest_basename": closest_base,
+                               "closest_full": closest_full})
+                summary.append(f"- {rel}: {label} references '{ref}' — NOT found in repo. "
+                               f"Closest existing file: "
+                               f"{closest_full or 'no close match in repo'}")
+    hint = "\n".join(dict.fromkeys(summary))
+    if hint:
+        print(f"[DISCOVER] Static reference hints:\n{hint}")
+    return broken, hint
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -499,6 +526,117 @@ def _extract_token(line: bytes, fmt: str) -> str:
             else obj.get("response", "")
     except (json.JSONDecodeError, UnicodeDecodeError):
         return ""
+
+
+CORRECT_LINE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "corrections": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "id":             {"type": "integer"},
+                "corrected_line": {"type": "string"},
+            },
+            "required": ["id", "corrected_line"]}}
+    },
+    "required": ["corrections"],
+}
+
+
+def ai_correct_lines(broken: list) -> list:
+    """
+    Focused AI task, run ONLY for the reference-typo class the free-form
+    diagnosis prompt kept fumbling. Python gives the AI numbered broken lines
+    verbatim; the AI writes the corrected line for each. Nothing else — no file
+    enumeration, no quoting-from-memory, no reasoning chain.
+
+    Returns [{file, line_in_file, corrected_line}, ...] which the caller turns
+    into a find/replace fix. This never edits anything itself.
+    """
+    if not broken:
+        return []
+    items = []
+    for i, b in enumerate(broken, 1):
+        items.append(f'{i}. line: "{b["line"]}"\n'
+                     f'   contains the wrong filename "{b["wrong_token"]}"; '
+                     f'the real file is "{b["closest_full"]}" '
+                     f'(basename "{b["closest_basename"]}")')
+    system = ("Correct-the-line task. Output ONLY JSON: "
+              '{"corrections":[{"id":N,"corrected_line":"..."}]}. '
+              "For each numbered line below, return the line with the wrong "
+              "filename replaced by the real filename shown. Keep everything "
+              "else on the line IDENTICAL — same indentation, same directive, "
+              "same quoting, same trailing content. Do not add or remove lines.")
+    user = "Lines to correct:\n" + "\n".join(items)
+    prompt = f"{system}\n\n{user}"
+
+    endpoint, fmt = _detect_endpoint()
+    if fmt == "openai":
+        payload = {"model": OLLAMA_MODEL, "prompt": prompt, "temperature": 0.0,
+                   "max_tokens": 1200, "stream": True}
+    else:
+        payload = {"model": OLLAMA_MODEL, "prompt": prompt,
+                   "format": CORRECT_LINE_SCHEMA,
+                   "options": {"temperature": 0.0, "num_predict": 1200,
+                               "num_ctx": 4096}, "stream": True}
+    print(f"[AI-LINES] focused call: {len(broken)} broken line(s), "
+          f"prompt {len(prompt)} chars")
+
+    try:
+        t0, collected = time.time(), []
+        resp = requests.post(endpoint, json=payload,
+                             timeout=(10, AI_TIMEOUT), stream=True)
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            tok = _extract_token(line, fmt)
+            if tok:
+                collected.append(tok)
+        raw = "".join(collected).strip()
+        print(f"[AI-LINES] done in {time.time()-t0:.1f}s — {len(raw)} chars")
+        if not raw:
+            return []
+        cleaned = re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError:
+            # fall back to the widest brace-balanced object
+            m = re.search(r"\{.*\}", cleaned, re.S)
+            if not m:
+                return []
+            data = json.loads(m.group(0))
+    except Exception as exc:
+        print(f"[AI-LINES] failed: {exc}", file=sys.stderr)
+        return []
+
+    corrections = data.get("corrections", []) or []
+    out = []
+    for c in corrections:
+        try:
+            idx = int(c.get("id", 0)) - 1
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= idx < len(broken)):
+            continue
+        b = broken[idx]
+        new_line = c.get("corrected_line", "")
+        if not isinstance(new_line, str) or not new_line.strip():
+            continue
+        if b["line"] == new_line:
+            continue
+        # sanity: the corrected line must contain the closest_basename and NOT
+        # the wrong token (a 3B occasionally echoes the wrong line unchanged
+        # under a new number, or invents a still-wrong replacement)
+        if b["closest_basename"] and b["closest_basename"] not in new_line:
+            print(f"[AI-LINES] discarded id={idx+1}: correction doesn't contain "
+                  f"the real filename {b['closest_basename']!r}")
+            continue
+        if b["wrong_token"] in new_line:
+            print(f"[AI-LINES] discarded id={idx+1}: correction still contains "
+                  f"the wrong token {b['wrong_token']!r}")
+            continue
+        out.append({"file": b["file"], "line_in_file": b["line"],
+                    "corrected_line": new_line})
+    return out
 
 
 def call_ai(signal, context, stacks, hints="", focus="") -> str:
@@ -1076,9 +1214,32 @@ def main():
     context, included, included_contents = discover_context(signal, stacks, forced)
     if not included:
         print("[DISCOVER] WARNING: no files resolved.")
-    hints = scan_reference_hints(included_contents)
+    broken_lines, hints = _scan_reference_details(included_contents)
 
-    # ── STAGE 3: build prompt + send to AI + receive JSON ──
+    # ── STAGE 3a: focused AI pass — reference typos (the class the freeform
+    # prompt kept fumbling). Small task, higher hit-rate on a 3B: for each
+    # broken line Python found, the AI writes ONE corrected line. Nothing gets
+    # written to disk here — the corrections become normal find/replace fixes
+    # that flow through the same validation + write path as everything else.
+    prefilled_fixes = []
+    if broken_lines:
+        print("\n━━━ SEND TO AI (focused: correct-the-line) ━━━")
+        line_corrections = ai_correct_lines(broken_lines)
+        by_file = {}
+        for c in line_corrections:
+            entry = by_file.setdefault(
+                c["file"],
+                {"file": c["file"], "reason": "AI-corrected reference typo(s)",
+                 "edits": []})
+            edit = {"find": c["line_in_file"], "replace": c["corrected_line"]}
+            if edit not in entry["edits"]:
+                entry["edits"].append(edit)
+        prefilled_fixes = list(by_file.values())
+        print(f"[AI-LINES] produced {sum(len(f['edits']) for f in prefilled_fixes)} "
+              f"corrected line(s) across {len(prefilled_fixes)} file(s)")
+
+    # ── STAGE 3b: freeform diagnosis — the AI still owns overall root_cause
+    # and anything the focused call didn't cover (versions, ports, logic bugs).
     print("\n━━━ SEND TO AI ━━━")
     try:
         raw = call_ai(signal, context, stacks, hints)
@@ -1117,16 +1278,30 @@ def main():
                        f"AI confidence too low ({confidence:.0%}). Root cause: {root_cause}", run_url)
         sys.exit(0)
 
-    # ── STAGE 3b: pair + locate each issue by the AI's own quoted evidence ──
-    fixes, pair_rejects = issues_to_fixes(issues, included_contents)
+    # ── STAGE 3c: pair + locate each freeform issue by its quoted evidence,
+    # then merge with the focused correct-the-line fixes from Stage 3a.
+    freeform_fixes, pair_rejects = issues_to_fixes(issues, included_contents)
     for rej in pair_rejects:
         print(f"  ✗ {rej}", file=sys.stderr)
-    if not fixes and legacy_fixes:
-        # model ignored the issues contract; fall back to grounded legacy fixes
-        fixes = [f for f in legacy_fixes
-                 if (f.get("file") or "").strip() in included]
-        if fixes:
+    if not freeform_fixes and legacy_fixes:
+        freeform_fixes = [f for f in legacy_fixes
+                         if (f.get("file") or "").strip() in included]
+        if freeform_fixes:
             print("[PARSE] Model returned legacy fixes[] — using grounded entries.")
+
+    # Merge: prefilled first so its edits win when the freeform pass reports
+    # the same file. De-dupe edits within each file.
+    merged = {}
+    for f in prefilled_fixes + freeform_fixes:
+        entry = merged.setdefault(
+            f["file"], {"file": f["file"], "reason": f.get("reason", ""),
+                        "edits": []})
+        for e in f.get("edits", []) or []:
+            if e not in entry["edits"]:
+                entry["edits"].append(e)
+        if f.get("reason") and f["reason"] not in entry["reason"]:
+            entry["reason"] = (entry["reason"] + "; " + f["reason"]).lstrip("; ")[:300]
+    fixes = list(merged.values())
 
     if not fixes:
         detail = "; ".join(pair_rejects) or "model reported no locatable issues"
@@ -1164,7 +1339,7 @@ def main():
     prev_hints = None
     for round_no in range(2, MAX_AI_ROUNDS + 1):
         r_context, r_included, r_contents = discover_context(signal, stacks, forced)
-        r_hints = scan_reference_hints(r_contents)
+        r_broken, r_hints = _scan_reference_details(r_contents)
         if not r_hints:
             print(f"[LOOP] Static scan is clean after round {round_no - 1} — no more rounds needed.")
             break
@@ -1174,22 +1349,24 @@ def main():
             break
         prev_hints = r_hints
 
-        print(f"\n━━━ SEND TO AI (round {round_no}/{MAX_AI_ROUNDS}) ━━━")
-        try:
-            raw_r = call_ai(signal, r_context, stacks, r_hints, focus=r_hints)
-            data_r = parse_ai_response(raw_r)
-        except Exception as exc:
-            print(f"[LOOP] round {round_no} AI call failed: {exc} — stopping.")
-            break
-
-        issues_r = data_r.get("issues", []) or []
-        conf_r = float(data_r.get("confidence", 1.0))
-        fixes_r, rejects_r = issues_to_fixes(issues_r, r_contents)
-        for rej in rejects_r:
-            print(f"  ✗ {rej}", file=sys.stderr)
-        print(f"  round {round_no} confidence: {conf_r:.0%}, "
-              f"locatable fixes: {len(fixes_r)} file(s)")
-        if conf_r < 0.5 or not fixes_r:
+        # Round 2+ is always reference-typo leftovers by construction (that's
+        # what the static scan flags), so run the focused correct-the-line
+        # call — the freeform diagnosis prompt kept hallucinating on this.
+        print(f"\n━━━ SEND TO AI (round {round_no}/{MAX_AI_ROUNDS}: correct-the-line) ━━━")
+        line_corrections = ai_correct_lines(r_broken)
+        by_file = {}
+        for c in line_corrections:
+            entry = by_file.setdefault(
+                c["file"],
+                {"file": c["file"], "reason": "AI-corrected reference typo(s)",
+                 "edits": []})
+            edit = {"find": c["line_in_file"], "replace": c["corrected_line"]}
+            if edit not in entry["edits"]:
+                entry["edits"].append(edit)
+        fixes_r = list(by_file.values())
+        print(f"  round {round_no}: {sum(len(f['edits']) for f in fixes_r)} "
+              f"corrected line(s) across {len(fixes_r)} file(s)")
+        if not fixes_r:
             print(f"[LOOP] Nothing more to apply this round — stopping.")
             break
 
