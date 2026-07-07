@@ -8,13 +8,26 @@ Flow (matches the pipeline diagram, nothing more):
         → Detect tech stack (Python)
         → Discover files (Python)
         → Build prompt (Python)
-        → Send to Ollama  ══ AI MODEL reasons + generates code changes ══
-        → Receive JSON
+        → Send to Ollama  ══ AI MODEL diagnoses + quotes every bug + its fix ══
+        → Receive JSON (flat issues list: evidence → corrected)
+        → Pair + locate each issue by the AI's own quoted evidence (Python)
         → Apply files (Python)
         → Validate syntax (Python)
         → Run tests (Python)
             → Tests pass → Commit + Push + PR
             → Tests fail → Create Issue
+
+Why the flat issues list (the multi-bug fix):
+A small local model diagnoses failures well but reliably mangles a nested
+fixes[]/edits[] structure — it misfiles edits under the wrong file, fixes one
+bug and stops, and sometimes "fixes" innocent files. Enumerating bugs as a
+flat list — quote the offending text, quote the corrected text, one entry per
+bug — is a recognition-and-copy task a 3B does far better. Python then pairs
+each quote with its correction mechanically, and LOCATES each fix by searching
+for the AI's own quoted evidence in the shown files, so a misfiled entry is
+relocated to where the quote actually lives, and an invented fix (whose quote
+exists nowhere) is rejected. The AI authors every diagnosis and both sides of
+every change; Python never writes a fix of its own.
 
 Exit codes:
   0 success / nothing to do   2 AI failed        4 git failed
@@ -41,10 +54,9 @@ OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL",   "qwen2.5-coder:3b")
 AI_TIMEOUT     = 210
 MAX_RETRIES    = 2
 RETRY_BACKOFF  = [20, 20]
-# A small local model reliably fixes ONE bug per call, even when a file has
-# several and is told so explicitly. Rather than rely on a single shot being
-# exhaustive, re-ask up to this many times, re-scanning between rounds — each
-# round only has to do what the model already does reliably: fix one thing.
+# Even with the flat-issue contract a small model can under-enumerate. If the
+# static reference scan still flags something after a round's fixes were
+# applied, re-ask against the now-partially-fixed files, up to this many rounds.
 MAX_AI_ROUNDS  = 3
 
 # ── Prompt / context budget ───────────────────────────────────────────────────
@@ -350,8 +362,16 @@ def scan_reference_hints(included_contents: dict) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 # STAGE 3 — BUILD PROMPT + SEND TO OLLAMA (AI)
 # ══════════════════════════════════════════════════════════════════════════════
+# The AI's output contract is a FLAT list of issues. One entry per bug:
+#   evidence  = the exact offending text, copied verbatim from the shown file
+#   corrected = that same text with ONLY the bug fixed
+# Enumerate-quote-correct is the shape a 3B handles reliably. Python pairs the
+# two quotes into a find/replace and locates each fix by searching for the
+# evidence in the shown files — so the AI's own words, not its bookkeeping,
+# decide where a fix lands. Nested fixes[]/edits[] (which the model repeatedly
+# misfiled) is gone from the contract entirely.
 
-FIX_SCHEMA = {
+ANALYSIS_SCHEMA = {
     "type": "object",
     "properties": {
         "error_analysis": {"type": "string"},
@@ -359,51 +379,49 @@ FIX_SCHEMA = {
         "solution":       {"type": "string"},
         "confidence":     {"type": "number"},
         "commit_message": {"type": "string"},
-        "fixes": {"type": "array", "items": {
+        "issues": {"type": "array", "items": {
             "type": "object",
             "properties": {
-                "file":   {"type": "string"},
-                "reason": {"type": "string"},
-                "edits":  {"type": "array", "items": {
-                    "type": "object",
-                    "properties": {"find": {"type": "string"},
-                                   "replace": {"type": "string"}},
-                    "required": ["find", "replace"]}},
-                "fixed_content": {"type": "string"},
+                "file":      {"type": "string"},
+                "problem":   {"type": "string"},
+                "evidence":  {"type": "string"},
+                "corrected": {"type": "string"},
             },
-            "required": ["file", "reason"]}},
+            "required": ["file", "problem", "evidence", "corrected"]}},
     },
     "required": ["error_analysis", "root_cause", "solution",
-                 "confidence", "commit_message", "fixes"],
+                 "confidence", "commit_message", "issues"],
 }
 
 SYSTEM_PROMPT = """\
 You are a senior CI/CD debugging engineer. A pipeline failed. YOU diagnose it and YOU fix it. Output ONLY one JSON object. No markdown fences. Start with { end with }.
 
 Think in this exact order, then emit the JSON:
-1. error_analysis — state precisely WHAT the error is and WHERE it lives (which file, which line or token). Quote the offending text.
+1. error_analysis — state precisely WHAT is broken and WHERE. Quote the offending text.
 2. root_cause — one sentence: WHY it failed.
-3. solution — state in plain words WHAT must change to fix it.
-4. fixes — the concrete edits that implement your solution.
+3. solution — plain words: WHAT must change.
+4. issues — ONE ENTRY PER BUG. Each entry:
+   - "file": the ### header path of the file the bug is in
+   - "problem": one sentence describing this specific bug
+   - "evidence": the offending text COPIED EXACTLY, character-for-character, from the file contents shown below. Keep it SHORT — the single wrong token or the one wrong line. Never paraphrase, never re-type from memory: copy it.
+   - "corrected": the same text with ONLY the bug fixed. Everything else identical.
 
 Schema:
-{"error_analysis":"...","root_cause":"...","solution":"...","confidence":0.0-1.0,"commit_message":"fix: short","fixes":[{"file":"exact/path","reason":"what changed","edits":[{"find":"exact text from the file","replace":"corrected text"}]}]}
+{"error_analysis":"...","root_cause":"...","solution":"...","confidence":0.0-1.0,"commit_message":"fix: short","issues":[{"file":"exact/path","problem":"...","evidence":"exact text copied from the file","corrected":"same text, bug fixed"}]}
 
-HOW TO REASON (do this yourself — nothing is pre-solved for you):
-- A "## Repo files (these exist)" list is given. If a Dockerfile/workflow/script references a file whose exact name is NOT in that list, that reference is a TYPO — correct it to the closest real name from the list. NEVER create the missing file.
-- Valid Python versions are 3.8 through 3.13. Tags like python:3.1, python:3.2, or python-version "3.1"/"3.2" are INVALID — replace with 3.12.
-- If the app's `app.run(port=N)` disagrees with the Dockerfile `EXPOSE M`, change the app to bind M.
-- If you change an `if __name__ == "__main__":` block, it MUST still start a long-running server (app.run(host="0.0.0.0", port=<EXPOSE port>)). Never leave it empty.
-- A "## Static reference check" section may be given, listing filenames a script references that a naive scan couldn't find in the repo. This is a HINT ONLY, not a diagnosis — verify each one yourself against "## Repo files", and IGNORE any hint that turns out to be a false positive (e.g. a build arg, a URL, or a file created earlier in the same Dockerfile).
-
-MULTIPLE BUGS IN ONE FILE — READ THIS CAREFULLY:
-A single file routinely has MORE THAN ONE unrelated bug (e.g. one line references a misspelled requirements file AND a separate line runs the wrong script name). Finding one bug and stopping is a FAILURE. After drafting a fix, go back and re-read the ENTIRE file one more time, line by line, treating it as if you had not looked at it yet — list every remaining line that references a file, a version, or a port, and check each one independently. Every distinct bug in a file goes into that SAME file's `edits` array as its own {{"find":...,"replace":...}} entry — do not open a second fixes[] entry for a file you already opened one for.
+FINDING EVERY BUG — READ CAREFULLY:
+A file routinely contains MORE THAN ONE unrelated bug. Finding one and stopping is a FAILURE. After drafting your issues list, re-read EVERY shown file line by line as if for the first time. For each line that mentions a file name, a version, or a port, check it independently:
+- File names: the "## Repo files (these exist)" list is the truth. A referenced name NOT in that list is a typo — corrected = the closest real name from the list. NEVER create a missing file; fix the reference.
+- Python versions: valid versions are 3.8 through 3.13. python:3.1, python:3.2, python-version "3.1"/"3.2" are INVALID — corrected uses 3.12.
+- Ports: if app.run(port=N) disagrees with the Dockerfile EXPOSE M, correct the app to bind M.
+- If you change an `if __name__ == "__main__":` block, it must still start a long-running server (app.run(host="0.0.0.0", port=<EXPOSE port>)). Never leave it empty.
+Add one issues[] entry for EVERY bug found this way — two bugs in one file means two entries with the same "file".
+A "## Static reference check" section may list references a naive scan could not find. These are HINTS to verify, not diagnoses — confirm each against "## Repo files" and IGNORE false positives (build args, URLs, files created earlier in the same Dockerfile).
 
 RULES:
-- Pick ONE mode per file: "edits" (find/replace; `find` copied EXACTLY from the file, kept short — ideally the single wrong token) OR "fixed_content" (the COMPLETE corrected small file).
-- file = exact path from a ### header. You may ONLY edit files shown under "## File contents" — never name a file with no ### header, never create a new file.
-- Every fixes[] entry MUST carry a non-empty "edits" or "fixed_content". If you decide a file doesn't need a change after all, omit it entirely — don't include an empty entry.
-- Preserve everything correct. Change only what is broken.
+- evidence must be text that literally appears in the file contents shown under "## File contents". If you cannot find exact offending text to quote, do not emit that issue.
+- evidence and corrected must differ. Keep both as short as possible while unambiguous.
+- Only files with a ### header may be fixed. Never name any other file.
 - Set confidence below 0.5 if you are unsure, rather than guessing."""
 
 USER_PROMPT = """\
@@ -479,7 +497,7 @@ def call_ai(signal, context, stacks, hints="") -> str:
         payload = {"model": OLLAMA_MODEL, "prompt": prompt, "temperature": 0.05,
                    "max_tokens": 2800, "stream": True}
     else:
-        payload = {"model": OLLAMA_MODEL, "prompt": prompt, "format": FIX_SCHEMA,
+        payload = {"model": OLLAMA_MODEL, "prompt": prompt, "format": ANALYSIS_SCHEMA,
                    "options": {"temperature": 0.05, "num_predict": 2800,
                                "num_ctx": 8192}, "stream": True}
     print(f"[AI] {endpoint} ({fmt}) | prompt {len(prompt)} chars | model {OLLAMA_MODEL}")
@@ -525,21 +543,28 @@ def call_ai(signal, context, stacks, hints="") -> str:
 #   RECEIVE JSON
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _normalize_keys(fixes):
+def _normalize_issue_keys(issues):
     KF = ("file_path", "path", "filename", "filepath", "name")
-    KC = ("content", "new_content", "fixed", "updated_content", "code")
+    KE = ("find", "wrong", "offending", "original", "bad", "before")
+    KC = ("replace", "fix", "replacement", "correct", "fixed", "after")
     out = []
-    for f in fixes:
-        f = dict(f)
-        if "file" not in f:
+    for it in issues:
+        if not isinstance(it, dict):
+            continue
+        it = dict(it)
+        if "file" not in it:
             for a in KF:
-                if a in f:
-                    f["file"] = f.pop(a); break
-        if "fixed_content" not in f and "edits" not in f:
+                if a in it:
+                    it["file"] = it.pop(a); break
+        if "evidence" not in it:
+            for a in KE:
+                if a in it:
+                    it["evidence"] = it.pop(a); break
+        if "corrected" not in it:
             for a in KC:
-                if a in f:
-                    f["fixed_content"] = f.pop(a); break
-        out.append(f)
+                if a in it:
+                    it["corrected"] = it.pop(a); break
+        out.append(it)
     return out
 
 
@@ -573,9 +598,70 @@ def parse_ai_response(raw: str) -> dict:
                     pass
     if data is None:
         raise ValueError(f"No valid JSON in AI response:\n{raw[:500]}")
-    if isinstance(data.get("fixes"), list):
-        data["fixes"] = _normalize_keys(data["fixes"])
+    if isinstance(data.get("issues"), list):
+        data["issues"] = _normalize_issue_keys(data["issues"])
     return data
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 3b — PAIR + LOCATE (Python turns the AI's quotes into fixes)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def issues_to_fixes(issues: list, included_contents: dict) -> tuple:
+    """
+    Convert the AI's flat issues list into per-file fixes, locating each issue
+    by its own quoted evidence:
+      - evidence found in the file the AI named → keep it there.
+      - evidence found in exactly ONE OTHER shown file → relocate it there
+        (the AI diagnosed correctly but misfiled — its quote proves where the
+        bug really is).
+      - evidence found nowhere (or ambiguous across several files) → reject:
+        a fix whose offending text doesn't exist is a hallucination; a quote
+        appearing in several files can't be placed safely.
+    The AI authored both `evidence` and `corrected`; Python only pairs them.
+    """
+    fixes_by_file, rejects = {}, []
+    for n, it in enumerate(issues, 1):
+        file = (it.get("file") or "").strip()
+        ev   = it.get("evidence")
+        cor  = it.get("corrected")
+        prob = (it.get("problem") or "").strip()
+
+        if not isinstance(ev, str) or not ev.strip():
+            rejects.append(f"issue #{n} ({file or '?'}): empty evidence")
+            continue
+        if not isinstance(cor, str) or cor == ev:
+            rejects.append(f"issue #{n} ({file or '?'}): corrected text missing or "
+                           f"identical to evidence")
+            continue
+
+        holders = [f for f, c in included_contents.items() if ev in c]
+        if file in included_contents and ev in included_contents[file]:
+            target = file
+        elif len(holders) == 1:
+            target = holders[0]
+            print(f"[LOCATE] issue #{n}: AI filed it under '{file or '?'}' but its "
+                  f"quoted evidence only exists in '{target}' — relocating "
+                  f"(the AI's own quote pins the real location).")
+        elif len(holders) > 1:
+            rejects.append(f"issue #{n} ({file or '?'}): evidence appears in "
+                           f"{len(holders)} shown files — ambiguous, not applied")
+            continue
+        else:
+            rejects.append(f"issue #{n} ({file or '?'}): quoted evidence "
+                           f"{ev[:80]!r} not found in any shown file — rejected "
+                           f"(a fix whose offending text doesn't exist is invented)")
+            continue
+
+        entry = fixes_by_file.setdefault(
+            target, {"file": target, "reason": prob or "AI fix", "edits": []})
+        edit = {"find": ev, "replace": cor}
+        if edit not in entry["edits"]:
+            entry["edits"].append(edit)
+            if prob and prob not in entry["reason"]:
+                entry["reason"] = (entry["reason"] + "; " + prob).lstrip("; ")[:300]
+
+    return list(fixes_by_file.values()), rejects
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -697,11 +783,11 @@ def validate_fix(fix: dict) -> tuple:
     return True, "ok"
 
 
-
 def write_fixes(fixes: list) -> tuple:
-    """Apply the AI's fixes exactly as returned. Python rejects invalid fixes
-    (unknown file, bad syntax, unmatched find) but NEVER writes a fix of its
-    own — the model's JSON is the only source of any change."""
+    """Apply the AI's fixes exactly as paired from its own quotes. Python
+    rejects invalid fixes (unknown file, bad syntax, unmatched find) but NEVER
+    writes a fix of its own — the model's quoted text is the only source of
+    any change."""
     written, originals, reasons = [], {}, []
     for fix in fixes[:MAX_FILES_FIXED]:
         ok, reason = validate_fix(fix)
@@ -997,27 +1083,21 @@ def main():
     solution   = data.get("solution", "")
     commit_msg = data.get("commit_message", "fix: auto-fixer change")
     confidence = float(data.get("confidence", 1.0))
-    fixes = data.get("fixes", []) or []
-
-    # grounding gate: the model may ONLY touch files it was actually shown —
-    # a fix for any other path is by definition a hallucination (it never saw
-    # that file's contents), like the invented 'sample_app/Dockerfiless'.
-    grounded = []
-    for f in fixes:
-        fp = (f.get("file") or "").strip()
-        if fp in included:
-            grounded.append(f)
-        else:
-            print(f"  ✗ {fp or '?'} — rejected: model was never shown this file "
-                  f"(hallucination guard)", file=sys.stderr)
-    fixes = grounded
+    issues = data.get("issues", []) or []
+    # tolerate a model that drifts back to the old fixes[] shape
+    legacy_fixes = data.get("fixes", []) or []
 
     print("\n  ── AI diagnosis ──")
     print(f"  ERROR    : {error_analysis or '(none given)'}")
     print(f"  CAUSE    : {root_cause}")
     print(f"  SOLUTION : {solution or '(none given)'}")
     print(f"  confidence : {confidence:.0%}")
-    print(f"  fixes      : {len(fixes)} file(s)")
+    print(f"  issues     : {len(issues)} reported")
+    for n, it in enumerate(issues, 1):
+        ev  = (it.get("evidence") or "")[:60]
+        cor = (it.get("corrected") or "")[:60]
+        print(f"    {n}. {it.get('file','?')}: {it.get('problem','')[:80]}")
+        print(f"       {ev!r} → {cor!r}")
 
     if confidence < 0.5:
         print(f"[GATE] Confidence {confidence:.0%} too low — escalating instead of guessing.")
@@ -1026,10 +1106,24 @@ def main():
                        f"AI confidence too low ({confidence:.0%}). Root cause: {root_cause}", run_url)
         sys.exit(0)
 
+    # ── STAGE 3b: pair + locate each issue by the AI's own quoted evidence ──
+    fixes, pair_rejects = issues_to_fixes(issues, included_contents)
+    for rej in pair_rejects:
+        print(f"  ✗ {rej}", file=sys.stderr)
+    if not fixes and legacy_fixes:
+        # model ignored the issues contract; fall back to grounded legacy fixes
+        fixes = [f for f in legacy_fixes
+                 if (f.get("file") or "").strip() in included]
+        if fixes:
+            print("[PARSE] Model returned legacy fixes[] — using grounded entries.")
+
     if not fixes:
-        print("[ERROR] AI returned no grounded fixes.", file=sys.stderr)
+        detail = "; ".join(pair_rejects) or "model reported no locatable issues"
+        print(f"[ERROR] AI produced no usable fixes. {detail}", file=sys.stderr)
         if token and repo:
-            open_issue(token, repo, f"AI produced no usable fixes. Root cause: {root_cause}", run_url)
+            open_issue(token, repo,
+                       f"AI produced no usable fixes. Root cause: {root_cause}\n\n"
+                       f"Detail: {detail}", run_url)
         sys.exit(3)
 
     # ── STAGE 4: apply files + validate syntax ──
@@ -1052,11 +1146,10 @@ def main():
 
     # ── STAGE 4b: additional rounds — catch bugs round 1 missed ──
     # If the static scanner still finds an unresolved reference mismatch after
-    # round 1's fix was applied, there's proof more remains to fix, so ask the
-    # model again against the now-partially-fixed files. Stops the moment a
-    # round finds nothing left to flag, the model returns no new grounded fix,
-    # or a round repeats the exact same unresolved hints as the round before
-    # (model is stuck on it — escalating to another call won't help).
+    # round 1's fixes were applied, there's proof more remains, so re-ask the
+    # model against the now-partially-fixed files. Stops when a round finds
+    # nothing left to flag, the model returns no new locatable issue, or a
+    # round repeats the exact same unresolved hints as the round before.
     prev_hints = None
     for round_no in range(2, MAX_AI_ROUNDS + 1):
         r_context, r_included, r_contents = discover_context(signal, stacks, forced)
@@ -1078,31 +1171,26 @@ def main():
             print(f"[LOOP] round {round_no} AI call failed: {exc} — stopping.")
             break
 
-        fixes_r = data_r.get("fixes", []) or []
-        grounded_r = []
-        for f in fixes_r:
-            fp = (f.get("file") or "").strip()
-            if fp in r_included:
-                grounded_r.append(f)
-            else:
-                print(f"  ✗ {fp or '?'} — rejected: model was never shown this file "
-                      f"(hallucination guard)", file=sys.stderr)
-
+        issues_r = data_r.get("issues", []) or []
         conf_r = float(data_r.get("confidence", 1.0))
-        print(f"  round {round_no} confidence: {conf_r:.0%}, fixes: {len(grounded_r)} file(s)")
-        if conf_r < 0.5 or not grounded_r:
+        fixes_r, rejects_r = issues_to_fixes(issues_r, r_contents)
+        for rej in rejects_r:
+            print(f"  ✗ {rej}", file=sys.stderr)
+        print(f"  round {round_no} confidence: {conf_r:.0%}, "
+              f"locatable fixes: {len(fixes_r)} file(s)")
+        if conf_r < 0.5 or not fixes_r:
             print(f"[LOOP] Nothing more to apply this round — stopping.")
             break
 
         print(f"\n━━━ APPLY + VALIDATE (round {round_no}) ━━━")
-        written_r, originals_r, _ = write_fixes(grounded_r)
+        written_r, originals_r, _ = write_fixes(fixes_r)
         if not written_r:
             print(f"[LOOP] Round {round_no} produced no valid fix — stopping.")
             break
         for f in written_r:
             originals.setdefault(f, originals_r[f])
         written = list(dict.fromkeys(written + written_r))
-        fixes = fixes + grounded_r
+        fixes = fixes + fixes_r
 
     # ── STAGE 5: run tests ──
     print("\n━━━ RUN TESTS ━━━")
