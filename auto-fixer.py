@@ -293,105 +293,6 @@ def discover_context(signal: str, stacks: set, forced: list) -> tuple:
     return context, included
 
 
-def static_hints(included: list) -> list:
-    """
-    Facts Python can VERIFY about the included files: returns (file, wrong,
-    right, note) tuples. `note` is handed to the AI as ground truth in the
-    prompt; (file, wrong, right) is ALSO used as a guaranteed fallback
-    correction in write_fixes() if the model's own edit fails to apply verbatim
-    -- since these are computed facts (not guesses), they are safe to apply
-    directly rather than lost when the model's phrasing drifts.
-    """
-    import difflib
-    hints = []
-    SUPPORTED_PY = {"3.8", "3.9", "3.10", "3.11", "3.12", "3.13"}
-
-    names = {}
-    for p in Path(".").rglob("*"):
-        if p.is_file() and not any(d in SKIP_DIRS for d in p.parts):
-            names.setdefault(p.name, []).append(_relstrip(str(p)))
-
-    expose = None
-    for p in Path(".").rglob("Dockerfile*"):
-        if p.is_file() and not any(d in SKIP_DIRS for d in p.parts):
-            m = re.search(r"(?im)^\s*EXPOSE\s+(\d{2,5})",
-                          p.read_text(encoding="utf-8", errors="replace"))
-            if m:
-                expose = int(m.group(1))
-
-    for rel in included:
-        p = Path(rel)
-        if not p.is_file():
-            continue
-        try:
-            text = p.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            continue
-
-        for m in re.finditer(r"python:(\d[\w.]*)", text):
-            tag = m.group(1)
-            core = tag.split("-")[0]
-            minor = ".".join(core.split(".")[:2])
-            if core not in ("3", "latest") and minor not in SUPPORTED_PY:
-                if text.count(f"python:{tag}") == 1:
-                    hints.append((rel, f"python:{tag}", "python:3.12",
-                                 f"`python:{tag}` is NOT a valid image tag. "
-                                 f"The correct fix is `python:3.12`."))
-
-        for m in re.finditer(r'python-version:\s*["\']?([\d][\w.]*)', text):
-            v = m.group(1)
-            minor = ".".join(v.split(".")[:2])
-            if v != "3" and minor not in SUPPORTED_PY and text.count(v) == 1:
-                hints.append((rel, v, "3.12",
-                             f"python-version \"{v}\" is NOT valid. "
-                             f"The correct fix is \"3.12\"."))
-
-        # Generic "does this referenced file actually exist" check. Not
-        # hardcoded to any directive or filename — it scans every place a
-        # Dockerfile/script names a local file (pip -r/--file, COPY/ADD
-        # sources, and CMD/ENTRYPOINT in both exec-array and shell form) and
-        # checks the BASENAME against every file that actually exists in the
-        # repo. Any directive naming a file that isn't there is caught the
-        # same way, regardless of which directive it was.
-        ref_tokens = []
-        for m in re.finditer(r"(?:(?:-r|--requirement|--file|-f)\s+|(?:COPY|ADD)\s+)([\w./\-]+)",
-                             text):
-            ref_tokens.append(m.group(1).strip())
-        for m in re.finditer(r"(?im)^\s*(?:CMD|ENTRYPOINT)\s*(.*)$", text):
-            line = m.group(1)
-            quoted = re.findall(r'"([^"]+)"', line)
-            tokens = quoted if quoted else line.split()
-            for tok in tokens:
-                tok = tok.strip().strip(",")
-                if tok and not tok.startswith("-") and "." in Path(tok).name:
-                    ref_tokens.append(tok)
-
-        for tok in ref_tokens:
-            base = Path(tok).name
-            if (not base or base in names or "$" in tok or ":" in tok
-                    or tok in (".", "..")):
-                continue
-            close = difflib.get_close_matches(base, list(names.keys()), n=1, cutoff=0.6)
-            if close and text.count(base) == 1:
-                hints.append((rel, base, close[0],
-                             f"references `{base}` which does NOT exist. "
-                             f"The real file is `{close[0]}` -- change `{base}` to "
-                             f"`{close[0]}`, do NOT create a new file."))
-
-        if expose and rel.endswith(".py"):
-            pm = re.search(r"\.run\([^)]*\bport\s*=\s*(\d{2,5})", text)
-            if pm and int(pm.group(1)) != expose and text.count(f"port={pm.group(1)}") == 1:
-                hints.append((rel, f"port={pm.group(1)}", f"port={expose}",
-                             f"the app listens on port {pm.group(1)} but the "
-                             f"Dockerfile EXPOSEs {expose} -- change the app's port "
-                             f"to {expose}."))
-
-    if hints:
-        print(f"[HINTS] {len(hints)} verified fact(s) added to the prompt:")
-        for rel, _, _, note in hints:
-            print(f"[HINTS]   - {rel}: {note}")
-    return hints
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STAGE 3 — BUILD PROMPT + SEND TO OLLAMA (AI)
@@ -400,7 +301,9 @@ def static_hints(included: list) -> list:
 FIX_SCHEMA = {
     "type": "object",
     "properties": {
+        "error_analysis": {"type": "string"},
         "root_cause":     {"type": "string"},
+        "solution":       {"type": "string"},
         "confidence":     {"type": "number"},
         "commit_message": {"type": "string"},
         "fixes": {"type": "array", "items": {
@@ -417,23 +320,34 @@ FIX_SCHEMA = {
             },
             "required": ["file", "reason"]}},
     },
-    "required": ["root_cause", "confidence", "commit_message", "fixes"],
+    "required": ["error_analysis", "root_cause", "solution",
+                 "confidence", "commit_message", "fixes"],
 }
 
 SYSTEM_PROMPT = """\
-You are a CI/CD repair agent. Output ONLY valid JSON. No markdown fences. Start with { end with }.
+You are a senior CI/CD debugging engineer. A pipeline failed. YOU diagnose it and YOU fix it. Output ONLY one JSON object. No markdown fences. Start with { end with }.
+
+Think in this exact order, then emit the JSON:
+1. error_analysis — state precisely WHAT the error is and WHERE it lives (which file, which line or token). Quote the offending text.
+2. root_cause — one sentence: WHY it failed.
+3. solution — state in plain words WHAT must change to fix it.
+4. fixes — the concrete edits that implement your solution.
 
 Schema:
-{"root_cause":"one sentence","confidence":0.0-1.0,"commit_message":"fix: short","fixes":[{"file":"exact/path","reason":"what changed","edits":[{"find":"exact text from the file","replace":"corrected text"}]}]}
+{"error_analysis":"...","root_cause":"...","solution":"...","confidence":0.0-1.0,"commit_message":"fix: short","fixes":[{"file":"exact/path","reason":"what changed","edits":[{"find":"exact text from the file","replace":"corrected text"}]}]}
+
+HOW TO REASON (do this yourself — nothing is pre-solved for you):
+- A "## Repo files (these exist)" list is given. If a Dockerfile/workflow/script references a file whose exact name is NOT in that list, that reference is a TYPO — correct it to the closest real name from the list. NEVER create the missing file.
+- Valid Python versions are 3.8 through 3.13. Tags like python:3.1, python:3.2, or python-version "3.1"/"3.2" are INVALID — replace with 3.12.
+- If the app's `app.run(port=N)` disagrees with the Dockerfile `EXPOSE M`, change the app to bind M.
+- If you change an `if __name__ == "__main__":` block, it MUST still start a long-running server (app.run(host="0.0.0.0", port=<EXPOSE port>)). Never leave it empty.
 
 RULES:
-- Pick ONE mode per file: "edits" (list of find/replace; `find` copied EXACTLY from the file — keep it short, ideally the single wrong token) OR "fixed_content" (the COMPLETE corrected small file).
-- file = exact path from the ### header. You may ONLY fix files shown below — never name a file that has no ### header, and never propose creating a new file.
-- If a "## Verified facts" section is present, those facts are TRUE — base your fix on them exactly. Do not invent a different cause.
-- If you remove or change code in a `if __name__ == "__main__":` block, the block MUST still start the application server (e.g. app.run(host="0.0.0.0", port=<EXPOSE port>)). Never leave it empty.
-- Read the whole file; fix every clear error you can see in one pass.
+- Pick ONE mode per file: "edits" (find/replace; `find` copied EXACTLY from the file, kept short — ideally the single wrong token) OR "fixed_content" (the COMPLETE corrected small file).
+- file = exact path from a ### header. You may ONLY edit files shown under "## File contents" — never name a file with no ### header, never create a new file.
+- Read the WHOLE file; fix EVERY error you can see in one pass, not just the first.
 - Preserve everything correct. Change only what is broken.
-- Only include files that actually need changes."""
+- Set confidence below 0.5 if you are unsure, rather than guessing."""
 
 USER_PROMPT = """\
 ## Tech stack: {stacks}
@@ -441,20 +355,30 @@ USER_PROMPT = """\
 ```
 {signal}
 ```
-{hints_block}## File contents (base your fix on these):
+## Repo files (these exist — anything referenced but NOT in this list is a typo):
+{repo_files}
+
+## File contents (you may ONLY edit these):
 {context}"""
 
 
-def build_prompt(signal, context, stacks, hints=None):
-    hints_block = ""
-    if hints:
-        hints_block = ("## Verified facts (computed from the actual repo — these "
-                       "are TRUE, fix exactly these):\n"
-                       + "\n".join(f"- {rel}: {note}" for rel, _, _, note in hints)
-                       + "\n\n")
+def repo_file_list(limit: int = 200) -> str:
+    files = []
+    for p in sorted(Path(".").rglob("*")):
+        if p.is_file() and not any(d in SKIP_DIRS for d in p.parts):
+            rel = _relstrip(str(p))
+            if not _is_blocked(rel):
+                files.append(rel)
+        if len(files) >= limit:
+            break
+    return ", ".join(files) if files else "(none found)"
+
+
+def build_prompt(signal, context, stacks):
+    repo_files = repo_file_list()
     def fmt(ctx):
         return USER_PROMPT.format(stacks=", ".join(sorted(stacks)) or "unknown",
-                                  signal=signal, hints_block=hints_block, context=ctx)
+                                  signal=signal, repo_files=repo_files, context=ctx)
     user = fmt(context)
     cap = 9000
     if len(SYSTEM_PROMPT + "\n\n" + user) > cap:
@@ -489,8 +413,8 @@ def _extract_token(line: bytes, fmt: str) -> str:
         return ""
 
 
-def call_ai(signal, context, stacks, hints=None) -> str:
-    prompt = f"{SYSTEM_PROMPT}\n\n{build_prompt(signal, context, stacks, hints)}"
+def call_ai(signal, context, stacks) -> str:
+    prompt = f"{SYSTEM_PROMPT}\n\n{build_prompt(signal, context, stacks)}"
     endpoint, fmt = _detect_endpoint()
     if fmt == "openai":
         payload = {"model": OLLAMA_MODEL, "prompt": prompt, "temperature": 0.05,
@@ -714,65 +638,17 @@ def validate_fix(fix: dict) -> tuple:
     return True, "ok"
 
 
-def _safe_fact_replace(text: str, wrong: str, right: str):
-    """
-    Apply a known (wrong -> right) fact fix safely: replace `wrong` only when
-    it matches as a COMPLETE token (not immediately followed by another word/
-    dot character) and matches exactly once. The boundary check alone is what
-    makes this safe both ways:
-      - Already fixed (python:3.1 -> python:3.12): 'python:3.1' no longer
-        matches as a complete token inside 'python:3.12' (the lookahead sees
-        the trailing '2'), so it correctly reports nothing left to fix —
-        instead of matching the substring and corrupting it into 'python:3.122'.
-      - Filename facts (requirement.txt -> requirements.txt): the CORRECT name
-        may legitimately already appear elsewhere in the file for an unrelated
-        line (e.g. a correct COPY next to a still-broken RUN) — that must NOT
-        be mistaken for "already resolved". Matching the WRONG token directly,
-        rather than checking whether `right` exists anywhere, gets this right.
-    Returns the patched text, or None if not found / not uniquely matchable.
-    """
-    pattern = re.escape(wrong) + r"(?![\w.])"
-    matches = list(re.finditer(pattern, text))
-    if len(matches) != 1:
-        return None
-    m = matches[0]
-    return text[:m.start()] + right + text[m.end():]
 
-
-def write_fixes(fixes: list, hints: list = None) -> tuple:
-    hints = hints or []
+def write_fixes(fixes: list) -> tuple:
+    """Apply the AI's fixes exactly as returned. Python rejects invalid fixes
+    (unknown file, bad syntax, unmatched find) but NEVER writes a fix of its
+    own — the model's JSON is the only source of any change."""
     written, originals, reasons = [], {}, []
     for fix in fixes[:MAX_FILES_FIXED]:
         ok, reason = validate_fix(fix)
         file = fix.get("file", "").strip()
 
         if not ok:
-            # The model's own edit didn't apply. Before giving up, check whether
-            # a VERIFIED fact (static_hints) exists for this exact file — if so,
-            # apply that known-correct (wrong -> right) swap directly instead of
-            # the model's possibly-imperfect find/replace. This is not a guess:
-            # it's the same fact already shown to the model in the prompt.
-            file_hints = [(w, r) for (hf, w, r, _) in hints if hf == file]
-            if file_hints and Path(file).is_file():
-                try:
-                    original = Path(file).read_text(encoding="utf-8", errors="replace")
-                except Exception:
-                    original = None
-                if original is not None:
-                    patched, applied_any = original, False
-                    for wrong, right in file_hints:
-                        result = _safe_fact_replace(patched, wrong, right)
-                        if result is not None:
-                            patched = result
-                            applied_any = True
-                    if applied_any and patched != original:
-                        print(f"  ✓ {file} — recovered via verified-fact fallback "
-                              f"(model's edit did not apply verbatim)")
-                        originals[file] = original
-                        Path(file).write_text(patched, encoding="utf-8")
-                        written.append(file)
-                        continue
-
             print(f"  ✗ {file or '?'} — {reason}")          # stdout: always visible in Action logs
             print(f"  ✗ {file or '?'} — {reason}", file=sys.stderr)
             reasons.append(f"{file or '?'}: {reason}")
@@ -788,33 +664,6 @@ def write_fixes(fixes: list, hints: list = None) -> tuple:
         tmp.replace(p)
         print(f"  ✓ {file} — {fix.get('reason','')[:100]}")
         written.append(file)
-
-    # ── Independent fact reconciliation ──────────────────────────────────────
-    # The per-fix fallback above only fires if the model's OWN file choice
-    # matches the fact's file. That misses the real failure mode: the model
-    # applies a known fact's fix to the WRONG file (e.g. the 'requirement.txt'
-    # typo fact belongs to sample_app/Dockerfile, but the model wrote its edit
-    # under plain 'requirements.txt'). So after all AI fixes are processed,
-    # check every fact against ITS OWN correct file — independent of whatever
-    # file the model tried — and apply it if still unresolved. This is not a
-    # guess: it's the same computed fact already shown to the model verbatim.
-    for hf, wrong, right, _note in hints:
-        try:
-            if not Path(hf).is_file():
-                continue
-            current = Path(hf).read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            continue
-        patched = _safe_fact_replace(current, wrong, right)
-        if patched is None:
-            continue
-        if hf not in originals:
-            originals[hf] = current
-        Path(hf).write_text(patched, encoding="utf-8")
-        if hf not in written:
-            written.append(hf)
-        print(f"  ✓ {hf} — recovered via fact reconciliation "
-              f"(model applied this fact to the wrong file)")
 
     written = list(dict.fromkeys(written))   # same file can be fixed by >1 entry
     return written, originals, reasons
@@ -962,9 +811,16 @@ def _gh(token):
             "X-GitHub-Api-Version": "2022-11-28"}
 
 
-def open_pr(token, repo, branch, commit_msg, root_cause, written, fixes) -> str:
+def open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
+            error_analysis="", solution="") -> str:
     details = "".join(f"\n**`{f.get('file','?')}`** — {f.get('reason','')}\n" for f in fixes)
-    body = (f"## 🤖 AI Auto-Fix\n\n**Root cause:** {root_cause}\n\n"
+    diag = ""
+    if error_analysis or solution:
+        diag = (f"### AI diagnosis\n"
+                f"**Error:** {error_analysis or 'n/a'}\n\n"
+                f"**Solution:** {solution or 'n/a'}\n\n")
+    body = (f"## 🤖 AI Auto-Fix\n\n{diag}"
+            f"**Root cause:** {root_cause}\n\n"
             f"**Files changed:** {', '.join(f'`{f}`' for f in written)}\n\n"
             f"## What changed{details}\n\n> Auto-generated — review before merge.")
     r = requests.post(f"https://api.github.com/repos/{repo}/pulls",
@@ -1064,12 +920,11 @@ def main():
     context, included = discover_context(signal, stacks, forced)
     if not included:
         print("[DISCOVER] WARNING: no files resolved.")
-    hints = static_hints(included)
 
     # ── STAGE 3: build prompt + send to AI + receive JSON ──
     print("\n━━━ SEND TO AI ━━━")
     try:
-        raw = call_ai(signal, context, stacks, hints)
+        raw = call_ai(signal, context, stacks)
         data = parse_ai_response(raw)
     except Exception as exc:
         print(f"[ERROR] AI failed: {exc}", file=sys.stderr)
@@ -1077,7 +932,9 @@ def main():
             open_issue(token, repo, f"AI analysis failed: {exc}", run_url)
         sys.exit(2)
 
+    error_analysis = data.get("error_analysis", "")
     root_cause = data.get("root_cause", "unknown")
+    solution   = data.get("solution", "")
     commit_msg = data.get("commit_message", "fix: auto-fixer change")
     confidence = float(data.get("confidence", 1.0))
     fixes = data.get("fixes", []) or []
@@ -1095,7 +952,10 @@ def main():
                   f"(hallucination guard)", file=sys.stderr)
     fixes = grounded
 
-    print(f"  root_cause : {root_cause}")
+    print("\n  ── AI diagnosis ──")
+    print(f"  ERROR    : {error_analysis or '(none given)'}")
+    print(f"  CAUSE    : {root_cause}")
+    print(f"  SOLUTION : {solution or '(none given)'}")
     print(f"  confidence : {confidence:.0%}")
     print(f"  fixes      : {len(fixes)} file(s)")
 
@@ -1120,7 +980,7 @@ def main():
             print(f"  {'would write' if ok else 'reject'} {fix.get('file','?')} — {reason}")
         sys.exit(0)
 
-    written, originals, reject_reasons = write_fixes(fixes, hints)
+    written, originals, reject_reasons = write_fixes(fixes)
     if not written:
         detail = "; ".join(reject_reasons) or "no detail captured"
         print(f"[ERROR] No valid fix applied. {detail}", file=sys.stderr)
@@ -1147,7 +1007,8 @@ def main():
     if not branch:
         sys.exit(4)
     if token and repo:
-        open_pr(token, repo, branch, commit_msg, root_cause, written, fixes)
+        open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
+                error_analysis, solution)
     else:
         print(f"[PR] No token — merge {branch} manually.")
 
