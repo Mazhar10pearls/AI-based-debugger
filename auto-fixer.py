@@ -61,6 +61,10 @@ from pathlib import Path
 import requests
 import yaml
 
+# security layer lives beside this script
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import security
+
 # ── Ollama ────────────────────────────────────────────────────────────────────
 OLLAMA_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/api/generate")
 OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL",   "qwen2.5-coder:3b")
@@ -304,6 +308,9 @@ def discover_context(signal: str, stacks: set, forced: list) -> tuple:
     for rel in forced:
         if len(included) >= MAX_CONTEXT_FILES:
             break
+        if not security.PathPolicy.is_readable_into_context(rel):
+            print(f"[SEC] excluding secret-bearing file from context: {rel}", file=sys.stderr)
+            continue
         p = Path(rel)
         if p.is_file() and _is_text_file(p):
             c = read_whole(p, cap=8000)
@@ -319,6 +326,8 @@ def discover_context(signal: str, stacks: set, forced: list) -> tuple:
                 continue
             rel = _relstrip(str(p))
             if rel in included or _is_blocked(rel):
+                continue
+            if not security.PathPolicy.is_readable_into_context(rel):
                 continue
             sc = _score_file(p, signal, stacks)
             if sc > 0:
@@ -1215,9 +1224,12 @@ def run_tests(stacks: set) -> bool:
         print("[TEST] No test runner detected — skipping")
         return True
     ok_all = True
+    safe_env = security.harden_test_env()
+    preexec = security.resource_limits_preexec()
     for cmd in cmds:
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=180,
+                               env=safe_env, preexec_fn=preexec)
             for line in (r.stdout + r.stderr).splitlines()[-15:]:
                 print(f"  {line}")
             passed = r.returncode == 0
@@ -1383,6 +1395,16 @@ def main():
         print(f"[ERROR] Log not found: {args.input}", file=sys.stderr)
         sys.exit(1)
 
+    # ── security: kill switch, trust boundary, token hygiene ──
+    if security.kill_switch():
+        sys.exit(0)
+    trust = security.assess_trust()
+    print(f"[SEC] origin trust: {trust['level']} ({trust['reason']})")
+    for w in security.check_token_scopes(token):
+        print(f"[SEC] token warning: {w}", file=sys.stderr)
+    security.audit({"phase": "start", "repo": repo, "trust": trust["level"],
+                    "trust_reason": trust["reason"], "input": args.input})
+
     # loop guards
     if last_commit_was_bot():
         sys.exit(0)
@@ -1415,6 +1437,18 @@ def main():
     context, included, included_contents = discover_context(signal, stacks, forced)
     if not included:
         print("[DISCOVER] WARNING: no files resolved.")
+
+    # ── security: redact secrets before ANYTHING leaves for the model / store ──
+    signal, sig_findings = security.redact_secrets(signal)
+    included_contents, ctx_findings = security.scrub_context(included_contents)
+    included = [f for f in included if f in included_contents]
+    # rebuild the prompt context from the redacted contents (same block format)
+    context = "\n\n".join(f"### {rel}\n```\n{c}\n```" for rel, c in included_contents.items())
+    if sig_findings or ctx_findings:
+        security.audit({"phase": "redaction",
+                        "signal_secrets": sorted(set(sig_findings)),
+                        "context_secrets": sorted(set(ctx_findings))})
+
     broken_lines, hints = _scan_reference_details(included_contents)
 
     # ── RAG RETRIEVE ──
@@ -1523,6 +1557,46 @@ def main():
                        run_url)
         sys.exit(3)
 
+    # ── SECURITY VETTING: path review + supply-chain, before writing anything ──
+    print("\n━━━ SECURITY VETTING ━━━")
+    vetted, held = [], []
+    for fix in fixes:
+        file = (fix.get("file") or "").strip()
+        ok, reason = validate_fix(fix)                 # populates fix['fixed_content']
+        if not ok:
+            held.append((file, f"invalid ({reason})")); continue
+        try:
+            original = Path(file).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            original = ""
+        sc_verdict, sc_reason = security.vet_supplychain(fix, original)
+        if sc_verdict == "reject":
+            held.append((file, f"supply-chain reject — {sc_reason}")); continue
+        if sc_verdict == "review":
+            held.append((file, f"needs review — {sc_reason}")); continue
+        needs_review, rr = security.PathPolicy.review_reason(file)
+        if needs_review:
+            held.append((file, f"needs review — {rr}")); continue
+        vetted.append(fix)
+
+    for file, why in held:
+        print(f"  ⚠ held: {file} — {why}", file=sys.stderr)
+    security.audit({"phase": "vetting",
+                    "vetted": [f.get("file") for f in vetted],
+                    "held": [{"file": f, "why": w} for f, w in held]})
+
+    if not vetted:
+        detail = "; ".join(f"{f}: {w}" for f, w in held) or "all fixes held"
+        print("[SEC] no fix passed vetting — escalating to humans.", file=sys.stderr)
+        if token and repo:
+            open_issue(token, repo,
+                       f"AI proposed fixes but security policy withheld all of them.\n\n"
+                       f"Root cause: {root_cause}\n\nHeld: {detail}", run_url)
+        sys.exit(0)
+    if held:
+        print(f"[SEC] applying {len(vetted)} vetted fix(es); {len(held)} held for review.")
+    fixes = vetted
+
     # ── APPLY + VALIDATE ──
     print("\n━━━ APPLY + VALIDATE ━━━")
     if args.dry_run:
@@ -1575,9 +1649,9 @@ def main():
         written = list(dict.fromkeys(written + written_r))
         fixes = fixes + fixes_r
 
-    # ── RUN TESTS ──
+    # ── RUN TESTS (trust-gated; untrusted code is never executed here) ──
     print("\n━━━ RUN TESTS ━━━")
-    if not args.skip_tests:
+    if not args.skip_tests and security.should_run_tests(trust):
         if not run_tests(stacks):
             revert_files(originals)
             if token and repo:
@@ -1586,9 +1660,21 @@ def main():
                            run_url)
             sys.exit(5)
     else:
-        print("[TEST] Skipped (--skip-tests)")
+        print("[TEST] Skipped (--skip-tests or untrusted origin)")
 
-    # ── COMMIT + PR ──
+    # ── COMMIT + PR (untrusted origins never auto-push) ──
+    if not security.should_auto_pr(trust):
+        print(f"[SEC] untrusted origin ({trust['reason']}) — withholding auto-PR.")
+        revert_files(originals)
+        if token and repo:
+            open_issue(token, repo,
+                       f"Fix computed for an UNTRUSTED origin ({trust['reason']}). "
+                       f"Auto-PR withheld pending human review.\n\n"
+                       f"Proposed files: {', '.join(written)}\nRoot cause: {root_cause}",
+                       run_url)
+        security.audit({"phase": "withheld_untrusted", "files": written})
+        sys.exit(0)
+
     print("\n━━━ COMMIT + PR ━━━")
     branch = commit_to_branch(commit_msg, written)
     if not branch:
@@ -1596,16 +1682,20 @@ def main():
     if token and repo:
         open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
                 facts.get("summary", ""), solution)
+        security.audit({"phase": "pr_opened", "branch": branch, "files": written})
     else:
         print(f"[PR] No token — merge {branch} manually.")
 
     # ── STORE SUCCESSFUL CASE (RAG write-back) ──
-    if store is not None and query_vec is not None:
+    # Poisoning guard: only trusted origins may write to the shared memory, so a
+    # fork PR can't seed the store with content that primes future prompts.
+    # Signal + evidence were already redacted upstream, so nothing secret lands here.
+    if store is not None and query_vec is not None and trust.get("level") == "trusted":
         print("\n━━━ STORE CASE IN RAG MEMORY ━━━")
         stored_issues = [{"file": it.get("file", ""),
-                          "problem": (it.get("problem") or "")[:200],
-                          "evidence": (it.get("evidence") or "")[:200],
-                          "corrected": (it.get("corrected") or "")[:200]}
+                          "problem": security.redact_secrets(it.get("problem") or "")[0][:200],
+                          "evidence": security.redact_secrets(it.get("evidence") or "")[0][:200],
+                          "corrected": security.redact_secrets(it.get("corrected") or "")[0][:200]}
                          for it in issues if it.get("evidence") and it.get("corrected")]
         store.add({
             "sig": norm_sig,
@@ -1619,6 +1709,11 @@ def main():
             "confidence": combined,
             "ts": int(time.time()),
         })
+        security.secure_file(MEMORY_PATH)
+    elif store is not None and trust.get("level") != "trusted":
+        print("[SEC] not storing case — origin not trusted (RAG poisoning guard).")
+
+    security.audit({"phase": "done", "root_cause": root_cause, "files": written})
 
     print("\n━━━ ✅ DONE ━━━")
     print(f"  root cause : {root_cause}")
