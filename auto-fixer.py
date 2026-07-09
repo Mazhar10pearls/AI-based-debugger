@@ -933,6 +933,22 @@ def _salvage_fragment(content: str, find: str, replace: str):
 
 def _apply_edits(original: str, edits: list) -> tuple:
     content = original
+    # Collapse duplicate edits that target the SAME 'find' text. Two AI passes
+    # (correct-the-line + freeform) routinely both fix the same line, and their
+    # 'replace' values can differ slightly (whitespace/quoting). You cannot apply
+    # two replacements to one source string — once the first replaces it, it's
+    # gone — so keep only the FIRST edit per 'find' and drop the rest. The first
+    # is the correct-the-line pass, which is the more reliable one for typos.
+    seen_finds, deduped = set(), []
+    for ed in edits:
+        key = ed.get("find", "")
+        if key in seen_finds:
+            print("[EDIT] dropping duplicate edit targeting the same text "
+                  f"(already fixed by an earlier edit): {key[:80]!r}")
+            continue
+        seen_finds.add(key)
+        deduped.append(ed)
+    edits = deduped
     for i, ed in enumerate(edits):
         find, repl = ed.get("find", ""), ed.get("replace", "")
         if not isinstance(find, str) or find == "":
