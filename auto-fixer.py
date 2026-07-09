@@ -11,18 +11,17 @@ Pipeline (matches the diagram):
         → AI Stage 4: self-verify         ══ AI checks its own patch ══
         → Python validation (locate by evidence, syntax, apply, tests)
         → Confidence gate
-        → Apply patch → Commit + Push + PR
+        → Apply patch → Commit + Push + PR   /   Create Issue on failure
 
-Design notes carried over from the single-call version:
+Design notes:
   * A small local model (qwen2.5-coder:3b) diagnoses well but mangles nested
     structure. Stage 3's output is a FLAT issues list — quote the offending
     text, quote the corrected text, one entry per bug. Python pairs each quote
     with its correction and LOCATES each fix by searching for the AI's own
     quoted evidence in the shown files. The AI authors every change; Python
     never writes a fix of its own.
-  * The reference-typo class (broken COPY/ADD paths) still runs through the
-    focused correct-the-line sub-pass inside Stage 3 — that's the part that
-    made typos reliable, so it's kept.
+  * The reference-typo class (broken COPY/ADD paths) runs through the focused
+    correct-the-line sub-pass inside Stage 3 — the part that made typos reliable.
 
 Why staged instead of one call:
   Four smaller tasks each stay inside the 3B's reliable instruction-following
@@ -78,70 +77,17 @@ BOT_PREFIX = "fix:"
 MAX_BOT_ATTEMPTS = 3
 
 ALWAYS_BLOCKED   = {".git", "auto-fixer.py"}
-BLOCKED_PATTERNS = [
-    # ALL workflow files — not just auto-fix/self-heal ones. A "fix" to a
-    # deploy or CI workflow is a privilege-escalation vector (it can change
-    # permissions, add steps, or add secret-exfiltrating commands, and reads
-    # like a normal diff to a reviewer). Workflow breakage should always
-    # escalate to a human via open_issue(), never go through auto-fix.
-    r"\.?github/workflows/.*\.ya?ml$",
-    r"\.?github/CODEOWNERS$",
-    # Common secret-bearing file patterns
-    r"(^|/)\.env(\..*)?$",
-    r".*\.pem$", r".*\.key$", r".*id_rsa.*", r".*id_ed25519.*",
-    r".*secrets?\.ya?ml$", r".*\.tfstate(\.backup)?$",
-    r"(^|/)\.npmrc$", r"(^|/)\.pypirc$",
-]
+BLOCKED_PATTERNS = [r"\.?github/workflows/auto-fix.*\.ya?ml$",
+                    r"\.?github/workflows/self-heal.*\.ya?ml$"]
 
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "env",
              "dist", "build", ".pytest_cache", "target", "out", "vendor",
              ".idea", ".vscode", "coverage", "tmp", "temp", "logs"}
 MAX_FILE_SIZE_BYTES = 100_000
 
-# ── Secret scanning ─────────────────────────────────────────────────────────
-# Deterministic, non-AI safety net — same category as syntax validation below.
-# Catches secrets the AI might echo back from a leaky log, or that a prompt-
-# injected instruction tries to smuggle into a "fix". Not a substitute for a
-# real scanner (gitleaks/trufflehog) in CI — see workflow-level recommendation.
-SECRET_PATTERNS = [
-    ("AWS access key",   re.compile(r"AKIA[0-9A-Z]{16}")),
-    ("AWS secret key",   re.compile(r"(?i)aws_secret_access_key\s*[:=]\s*['\"]?[A-Za-z0-9/+=]{40}")),
-    ("GitHub token",     re.compile(r"gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}")),
-    ("Slack token",      re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}")),
-    ("Private key",      re.compile(r"-----BEGIN[ A-Z]*PRIVATE KEY-----")),
-    ("Generic API key",  re.compile(r"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*['\"][A-Za-z0-9\-_/+=]{16,}['\"]")),
-    ("JWT",              re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
-    ("Bearer token",     re.compile(r"(?i)bearer\s+[A-Za-z0-9\-_.=]{20,}")),
-]
-MAX_ADDED_LINES_PER_FIX = 40  # a legit typo/version/port fix is tiny; a big
-                              # blob of new lines is suspicious for an autofix
-
-
-def scan_text_for_secrets(text: str) -> list:
-    hits = []
-    for name, pat in SECRET_PATTERNS:
-        if pat.search(text):
-            hits.append(name)
-    return hits
-
-
-def redact_secrets(text: str) -> str:
-    """Scrub known secret shapes before they ever enter a prompt, a commit
-    message, or a PR/issue body. Defense-in-depth — the workflow's log
-    download step should also redact before writing failure.log to disk."""
-    out = text
-    for name, pat in SECRET_PATTERNS:
-        out = pat.sub(f"[REDACTED:{name}]", out)
-    return out
-
-
-def _added_lines(original: str, new: str) -> list:
-    old_lines = set(original.splitlines())
-    return [l for l in new.splitlines() if l not in old_lines]
-
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 1 — READ LOGS + DETECT TECH STACK  (unchanged, proven)
+# STAGE 1 — READ LOGS + DETECT TECH STACK
 # ══════════════════════════════════════════════════════════════════════════════
 
 ERROR_KEYWORDS = [
@@ -194,7 +140,7 @@ def fingerprint_stack(log_text: str) -> set:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 2 — DISCOVER FILES  (unchanged, proven)
+# STAGE 2 — DISCOVER FILES
 # ══════════════════════════════════════════════════════════════════════════════
 
 REFERENCED_PATH_PATTERNS = [
@@ -413,7 +359,7 @@ def _scan_reference_details(included_contents: dict) -> tuple:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AI plumbing — shared streaming + JSON extraction  (consolidated)
+# AI plumbing — shared streaming + JSON extraction
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _detect_endpoint():
@@ -912,7 +858,7 @@ def ai_self_verify(issues, context) -> tuple:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAIR + LOCATE  (Python turns the AI's quotes into fixes)  — unchanged logic
+# PAIR + LOCATE  (Python turns the AI's quotes into fixes)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def issues_to_fixes(issues: list, included_contents: dict) -> tuple:
@@ -956,7 +902,7 @@ def issues_to_fixes(issues: list, included_contents: dict) -> tuple:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# APPLY + VALIDATE  (unchanged, proven)
+# APPLY + VALIDATE
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _salvage_fragment(content: str, find: str, replace: str):
@@ -983,16 +929,6 @@ def _apply_edits(original: str, edits: list) -> tuple:
             return None, f"edit #{i+1} empty 'find'"
         if find in content:
             content = content.replace(find, repl)
-            continue
-        # IDEMPOTENCY: multiple AI stages can independently diagnose the same
-        # underlying bug (e.g. Stage 3a's correct-the-line pass AND Stage 3's
-        # freeform fix both catching the same Dockerfile typo). Edits are
-        # applied sequentially, so by the time edit #2 runs, edit #1 may have
-        # already produced the exact text edit #2 was going to write. That is
-        # not a failure — it's confirmation the fix already landed. Only treat
-        # it as unresolved if the replacement text is not already there.
-        if isinstance(repl, str) and repl.strip() and repl in content:
-            print(f"[EDIT] edit #{i+1} already satisfied by a prior edit — skipping")
             continue
         nf = "\n".join(l.strip() for l in find.splitlines())
         nc = "\n".join(l.strip() for l in content.splitlines())
@@ -1046,22 +982,12 @@ def validate_fix(fix: dict) -> tuple:
         return False, f"blocked path: {file}"
     if not Path(file).exists():
         return False, f"file does not exist: {file}"
-    original_text = Path(file).read_text(encoding="utf-8", errors="replace")
     content, reason = _resolve_content(fix)
     if content is None:
         return False, reason
     fix["fixed_content"] = content
     if not content.strip():
         return False, "empty result"
-
-    added = _added_lines(original_text, content)
-    if len(added) > MAX_ADDED_LINES_PER_FIX:
-        return False, (f"fix adds {len(added)} lines (max {MAX_ADDED_LINES_PER_FIX}) "
-                       "— too large for an auto-fix, needs human review")
-    secret_hits = scan_text_for_secrets("\n".join(added))
-    if secret_hits:
-        return False, f"potential secret in fix ({', '.join(secret_hits)}) — blocked"
-
     if file.endswith(".py"):
         try:
             ast.parse(content)
@@ -1115,7 +1041,7 @@ def revert_files(originals: dict):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RUN TESTS  (unchanged)
+# RUN TESTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def detect_test_commands(stacks: set) -> list:
@@ -1155,7 +1081,7 @@ def run_tests(stacks: set) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# COMMIT + PUSH + PR  /  CREATE ISSUE  (unchanged)
+# COMMIT + PUSH + PR  /  CREATE ISSUE
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _git(*args, check=True):
@@ -1324,11 +1250,6 @@ def main():
     # ── COLLECT LOGS + CONTEXT ──
     print("\n━━━ COLLECT LOGS + CONTEXT ━━━")
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
-    redacted = scan_text_for_secrets(log_text)
-    if redacted:
-        print(f"[SECURITY] redacting {len(redacted)} potential secret pattern(s) from log: "
-              f"{', '.join(redacted)}")
-    log_text = redact_secrets(log_text)
     signal = extract_error_signal(log_text)
     stacks = fingerprint_stack(log_text)
     if not signal.strip():

@@ -68,11 +68,11 @@ jobs:
           set -e
           SMOKE=smoke-${{ github.sha }}
           docker rm -f "$SMOKE" >/dev/null 2>&1 || true
-          docker run -d --name "$SMOKE" -p 5001:5000 ai-devops-sample-app:${{ github.sha }}
+          docker run -d --name "$SMOKE" -p 5000:5000 ai-devops-sample-app:${{ github.sha }}
 
           ok=0
           for i in {1..15}; do
-            if curl -fs http://127.0.0.1:5001 > /dev/null; then ok=1; break; fi
+            if curl -fs http://127.0.0.1:500 > /dev/null; then ok=1; break; fi
             if [ "$(docker inspect -f '{{.State.Running}}' "$SMOKE" 2>/dev/null)" != "true" ]; then
               echo "Smoke test: container exited early — likely a runtime/CMD error"
               break
