@@ -922,13 +922,22 @@ def _salvage_fragment(content: str, find: str, replace: str):
 
 
 def _apply_edits(original: str, edits: list) -> tuple:
+    """Apply edits best-effort. An edit whose `find` can't be located is SKIPPED,
+    not fatal — this is the common case when two stages (the correct-the-line pass
+    and the freeform pass) both target the same line: the first edit makes the
+    change, so the second edit's `find` is already gone. The batch succeeds as
+    long as at least one edit applied and the content actually changed; it only
+    fails if nothing landed (a genuine no-op / all-hallucinated batch)."""
     content = original
+    applied, skipped = 0, []
     for i, ed in enumerate(edits):
         find, repl = ed.get("find", ""), ed.get("replace", "")
         if not isinstance(find, str) or find == "":
-            return None, f"edit #{i+1} empty 'find'"
+            skipped.append(f"edit #{i+1} empty 'find'")
+            continue
         if find in content:
             content = content.replace(find, repl)
+            applied += 1
             continue
         nf = "\n".join(l.strip() for l in find.splitlines())
         nc = "\n".join(l.strip() for l in content.splitlines())
@@ -947,15 +956,22 @@ def _apply_edits(original: str, edits: list) -> tuple:
                     matched = True
                     break
         if matched:
+            applied += 1
             continue
         salvaged = _salvage_fragment(content, find, repl)
         if salvaged is not None and salvaged != content:
             print(f"[EDIT] Salvaged edit #{i+1} via unique-fragment match")
             content = salvaged
+            applied += 1
             continue
-        return None, (f"edit #{i+1} 'find' text not present — find: {find[:120]!r}")
+        skipped.append(f"edit #{i+1} 'find' not present — {find[:80]!r}")
+    if applied == 0:
+        return None, ("; ".join(skipped) or "no edits applied")
     if content == original:
         return None, "edits produced no change"
+    if skipped:
+        print(f"[EDIT] applied {applied}, skipped {len(skipped)} redundant/unmatched: "
+              f"{'; '.join(skipped)}")
     return content, "ok"
 
 
