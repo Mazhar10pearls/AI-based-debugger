@@ -1,33 +1,45 @@
 #!/usr/bin/env python3
 """
-Self-Healing CI/CD Auto-Fixer — straight AI flow.
+Self-Healing CI/CD Auto-Fixer — RAG + staged-AI flow.
 
-Flow (matches the pipeline diagram, nothing more):
+Pipeline (matches the diagram):
 
-    Read logs (Python)
-        → Detect tech stack (Python)
-        → Discover files (Python)
-        → Build prompt (Python)
-        → Send to Ollama  ══ AI MODEL diagnoses + quotes every bug + its fix ══
-        → Receive JSON (flat issues list: evidence → corrected)
-        → Pair + locate each issue by the AI's own quoted evidence (Python)
-        → Apply files (Python)
-        → Validate syntax (Python)
-        → Run tests (Python)
-            → Tests pass → Commit + Push + PR
-            → Tests fail → Create Issue
+    Collect logs + repo context (Python)
+        → Retrieve similar historical failures  ══ RAG: embed signal, top-k ══
+        → AI Stage 1: extract facts
+        → AI Stage 2: determine root cause (+ confidence)
+        → AI Stage 3: generate fix        ══ flat issues: evidence → corrected ══
+        → AI Stage 4: self-verify         ══ AI checks its own patch ══
+        → Python validation (locate by evidence, syntax, apply, tests)
+        → Confidence gate
+        → Apply patch → Commit + Push + PR
+        → Store the successful case for future retrieval
 
-Why the flat issues list (the multi-bug fix):
-A small local model diagnoses failures well but reliably mangles a nested
-fixes[]/edits[] structure — it misfiles edits under the wrong file, fixes one
-bug and stops, and sometimes "fixes" innocent files. Enumerating bugs as a
-flat list — quote the offending text, quote the corrected text, one entry per
-bug — is a recognition-and-copy task a 3B does far better. Python then pairs
-each quote with its correction mechanically, and LOCATES each fix by searching
-for the AI's own quoted evidence in the shown files, so a misfiled entry is
-relocated to where the quote actually lives, and an invented fix (whose quote
-exists nowhere) is rejected. The AI authors every diagnosis and both sides of
-every change; Python never writes a fix of its own.
+Design notes carried over from the single-call version:
+  * A small local model (qwen2.5-coder:3b) diagnoses well but mangles nested
+    structure. Stage 3's output is a FLAT issues list — quote the offending
+    text, quote the corrected text, one entry per bug. Python pairs each quote
+    with its correction and LOCATES each fix by searching for the AI's own
+    quoted evidence in the shown files. The AI authors every change; Python
+    never writes a fix of its own.
+  * The reference-typo class (broken COPY/ADD paths) still runs through the
+    focused correct-the-line sub-pass inside Stage 3 — that's the part that
+    made typos reliable, so it's kept.
+
+Why staged instead of one call:
+  Four smaller tasks each stay inside the 3B's reliable instruction-following
+  window better than one big task. The cost is latency (four sequential calls
+  on CPU). Two escape hatches:
+    FAST_MODE=1        → collapse Stage 1+2 into one call
+    SKIP_SELF_VERIFY=1 → drop Stage 4 (Python validation is still the hard gate)
+
+Why RAG:
+  Priming Stage 2/3 with concrete past (root_cause, evidence→corrected) pairs
+  for a similar signal measurably steadies a 3B on failures it has seen before.
+  Memory lives OUTSIDE the checked-out repo so it survives across runs on a
+  self-hosted runner (default ~/.ai-fixer/memory.jsonl, override AI_FIXER_HOME).
+  If the embedding model is unavailable, retrieval degrades to "no context"
+  and the pipeline runs exactly as the non-RAG version did.
 
 Exit codes:
   0 success / nothing to do   2 AI failed        4 git failed
@@ -38,6 +50,7 @@ import argparse
 import ast
 import difflib
 import json
+import math
 import os
 import re
 import subprocess
@@ -51,13 +64,23 @@ import yaml
 # ── Ollama ────────────────────────────────────────────────────────────────────
 OLLAMA_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/api/generate")
 OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL",   "qwen2.5-coder:3b")
+EMBED_MODEL    = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 AI_TIMEOUT     = 210
 MAX_RETRIES    = 2
 RETRY_BACKOFF  = [20, 20]
-# Even with the flat-issue contract a small model can under-enumerate. If the
-# static reference scan still flags something after a round's fixes were
-# applied, re-ask against the now-partially-fixed files, up to this many rounds.
 MAX_AI_ROUNDS  = 3
+
+# staged-flow toggles
+FAST_MODE        = os.environ.get("FAST_MODE", "").lower() in ("1", "true", "yes")
+SKIP_SELF_VERIFY = os.environ.get("SKIP_SELF_VERIFY", "").lower() in ("1", "true", "yes")
+
+# ── RAG memory ────────────────────────────────────────────────────────────────
+AI_FIXER_HOME = Path(os.environ.get("AI_FIXER_HOME", os.path.expanduser("~/.ai-fixer")))
+MEMORY_PATH   = AI_FIXER_HOME / "memory.jsonl"
+RAG_TOP_K     = int(os.environ.get("RAG_TOP_K", "3"))
+RAG_MIN_SIM   = float(os.environ.get("RAG_MIN_SIM", "0.72"))
+RAG_MAX_CASES = int(os.environ.get("RAG_MAX_CASES", "500"))   # cap store growth
+RAG_ENABLED   = os.environ.get("RAG_ENABLED", "1").lower() not in ("0", "false", "no")
 
 # ── Prompt / context budget ───────────────────────────────────────────────────
 MAX_ERROR_LINES   = 14
@@ -72,9 +95,8 @@ GIT_TARGET_BRANCH = os.environ.get("GIT_TARGET_BRANCH", "develop")
 BOT_NAME   = "github-actions[bot]"
 BOT_EMAIL  = "github-actions[bot]@users.noreply.github.com"
 BOT_PREFIX = "fix:"
-MAX_BOT_ATTEMPTS = 3          # stop the bot fixing its own commits forever
+MAX_BOT_ATTEMPTS = 3
 
-# Never let the AI touch its own tooling.
 ALWAYS_BLOCKED   = {".git", "auto-fixer.py"}
 BLOCKED_PATTERNS = [r"\.?github/workflows/auto-fix.*\.ya?ml$",
                     r"\.?github/workflows/self-heal.*\.ya?ml$"]
@@ -86,7 +108,7 @@ MAX_FILE_SIZE_BYTES = 100_000
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 1 — READ LOGS + DETECT TECH STACK
+# STAGE 1 — READ LOGS + DETECT TECH STACK  (unchanged, proven)
 # ══════════════════════════════════════════════════════════════════════════════
 
 ERROR_KEYWORDS = [
@@ -138,8 +160,25 @@ def fingerprint_stack(log_text: str) -> set:
     return stacks
 
 
+def normalize_signal(signal: str) -> str:
+    """
+    Canonicalize an error signal for RAG: strip volatile bits (timestamps,
+    line/column numbers, hex ids, temp paths) so the SAME class of failure
+    embeds close together regardless of run-specific noise. Used both as the
+    embedding input and as the dedup key when storing a case.
+    """
+    s = signal.lower()
+    s = re.sub(r'\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2}:\d{2}\S*', ' ', s)  # timestamps
+    s = re.sub(r'0x[0-9a-f]+', ' ', s)                                # hex ids
+    s = re.sub(r':\d+(?::\d+)?', ':', s)                              # :line:col
+    s = re.sub(r'/tmp/\S+', ' ', s)                                   # temp paths
+    s = re.sub(r'\b[0-9a-f]{7,40}\b', ' ', s)                         # sha-ish
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s[:1200]
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 2 — DISCOVER FILES
+# STAGE 2 — DISCOVER FILES  (unchanged, proven)
 # ══════════════════════════════════════════════════════════════════════════════
 
 REFERENCED_PATH_PATTERNS = [
@@ -223,18 +262,6 @@ def _score_file(path: Path, signal: str, stacks: set) -> int:
 
 
 def find_ci_workflow_files(root: Path = Path(".")) -> list:
-    """
-    Fallback candidate source for failures that name NO real source file in
-    the log — e.g. a fast setup-action failure (bad python-version) that dies
-    before pip/build/test ever runs, so nothing in the log points at app code.
-    By elimination, a failure with no file trace is a workflow-configuration
-    problem, so the repo's own CI workflow YAML(s) become the prime suspect.
-    Not tied to any specific bug or filename — this is a general "when nothing
-    else is referenced, check the thing that defines the pipeline" rule.
-
-    Excludes the self-heal workflow itself (detected generically by content,
-    not by a hardcoded filename) so the fixer never targets its own definition.
-    """
     found = []
     wf_dir = root / ".github" / "workflows"
     if not wf_dir.is_dir():
@@ -250,7 +277,7 @@ def find_ci_workflow_files(root: Path = Path(".")) -> list:
         except Exception:
             continue
         if "auto-fixer.py" in text or "auto_fixer.py" in text:
-            continue  # this IS the workflow that runs us — never a fix target
+            continue
         found.append(rel)
     return found
 
@@ -310,13 +337,7 @@ def discover_context(signal: str, stacks: set, forced: list) -> tuple:
     return context, included, contents
 
 
-# ── static reference scan (hints only — AI still decides what's real) ──────────
-# A small local model reliably finds the FIRST bug in a file and then stops.
-# This does not diagnose or fix anything itself; it just extracts every file
-# path a Dockerfile/compose file references and checks whether that exact path
-# exists in the repo, so a second (or third) broken reference in the same file
-# can't slip past the model unnoticed. The AI still verifies each candidate,
-# decides if it's a real problem, and writes the actual fix.
+# ── static reference scan (hints only) ─────────────────────────────────────────
 DOCKERFILE_REF_PATTERNS = [
     (re.compile(r'^\s*COPY\s+(?:--from=\S+\s+)?(\S+)\s+\S+', re.I | re.M), "COPY"),
     (re.compile(r'^\s*ADD\s+(?:--from=\S+\s+)?(\S+)\s+\S+', re.I | re.M), "ADD"),
@@ -327,19 +348,10 @@ DOCKERFILE_REF_PATTERNS = [
 
 
 def scan_reference_hints(included_contents: dict) -> str:
-    """Human-readable summary, kept for logs and legacy prompt paths."""
     return _scan_reference_details(included_contents)[1]
 
 
 def _scan_reference_details(included_contents: dict) -> tuple:
-    """
-    Returns (broken_lines, hint_summary).
-      broken_lines = [{file, line, wrong_token, closest_basename, closest_full}, ...]
-        — each carries the OFFENDING LINE VERBATIM from the file, plus the
-        wrong token and the closest real file, so the AI only has to write
-        the corrected line (a copy-and-swap task), never quote from memory.
-      hint_summary  = the human-readable string used for logs.
-    """
     all_repo = [_relstrip(str(p)) for p in Path(".").rglob("*")
                 if p.is_file() and not any(d in SKIP_DIRS for d in p.parts)]
     basenames = {}
@@ -366,8 +378,6 @@ def _scan_reference_details(included_contents: dict) -> tuple:
                                                    basenames.keys(), n=1, cutoff=0.4)
                 closest_full = basenames[close[0]][0] if close else ""
                 closest_base = close[0] if close else ""
-                # Find the exact line that contains this bad reference — the AI
-                # will only see this verbatim line and be asked to correct it.
                 line_start = content.rfind("\n", 0, m.start()) + 1
                 line_end = content.find("\n", m.end())
                 if line_end == -1:
@@ -387,120 +397,118 @@ def _scan_reference_details(included_contents: dict) -> tuple:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 3 — BUILD PROMPT + SEND TO OLLAMA (AI)
+# RAG — embed + memory store  (new)
 # ══════════════════════════════════════════════════════════════════════════════
-# The AI's output contract is a FLAT list of issues. One entry per bug:
-#   evidence  = the exact offending text, copied verbatim from the shown file
-#   corrected = that same text with ONLY the bug fixed
-# Enumerate-quote-correct is the shape a 3B handles reliably. Python pairs the
-# two quotes into a find/replace and locates each fix by searching for the
-# evidence in the shown files — so the AI's own words, not its bookkeeping,
-# decide where a fix lands. Nested fixes[]/edits[] (which the model repeatedly
-# misfiled) is gone from the contract entirely.
 
-ANALYSIS_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "error_analysis": {"type": "string"},
-        "root_cause":     {"type": "string"},
-        "solution":       {"type": "string"},
-        "confidence":     {"type": "number"},
-        "commit_message": {"type": "string"},
-        "issues": {"type": "array", "items": {
-            "type": "object",
-            "properties": {
-                "file":      {"type": "string"},
-                "problem":   {"type": "string"},
-                "evidence":  {"type": "string"},
-                "corrected": {"type": "string"},
-            },
-            "required": ["file", "problem", "evidence", "corrected"]}},
-    },
-    "required": ["error_analysis", "root_cause", "solution",
-                 "confidence", "commit_message", "issues"],
-}
-
-SYSTEM_PROMPT = """\
-You are a senior CI/CD debugging engineer. A pipeline failed. YOU diagnose it and YOU fix it. Output ONLY one JSON object. No markdown fences. Start with { end with }.
-
-Think in this exact order, then emit the JSON:
-1. error_analysis — state precisely WHAT is broken and WHERE. Quote the offending text.
-2. root_cause — one sentence: WHY it failed.
-3. solution — plain words: WHAT must change.
-4. issues — ONE ENTRY PER BUG. Each entry:
-   - "file": the ### header path of the file the bug is in
-   - "problem": one sentence describing this specific bug
-   - "evidence": the offending text COPIED EXACTLY, character-for-character, from the file contents shown below. Keep it SHORT — the single wrong token or the one wrong line. Never paraphrase, never re-type from memory: copy it.
-   - "corrected": the same text with ONLY the bug fixed. Everything else identical.
-
-Schema:
-{"error_analysis":"...","root_cause":"...","solution":"...","confidence":0.0-1.0,"commit_message":"fix: short","issues":[{"file":"exact/path","problem":"...","evidence":"exact text copied from the file","corrected":"same text, bug fixed"}]}
-
-FINDING EVERY BUG — READ CAREFULLY:
-A file routinely contains MORE THAN ONE unrelated bug. Finding one and stopping is a FAILURE. After drafting your issues list, re-read EVERY shown file line by line as if for the first time. For each line that mentions a file name, a version, or a port, check it independently:
-- File names: the "## Repo files (these exist)" list is the truth. A referenced name NOT in that list is a typo — corrected = the closest real name from the list. NEVER create a missing file; fix the reference.
-- Python versions: valid versions are 3.8 through 3.13. python:3.1, python:3.2, python-version "3.1"/"3.2" are INVALID — corrected uses 3.12.
-- Ports: if app.run(port=N) disagrees with the Dockerfile EXPOSE M, correct the app to bind M.
-- If you change an `if __name__ == "__main__":` block, it must still start a long-running server (app.run(host="0.0.0.0", port=<EXPOSE port>)). Never leave it empty.
-Add one issues[] entry for EVERY bug found this way — two bugs in one file means two entries with the same "file".
-A "## Static reference check" section may list references a naive scan could not find. These are HINTS to verify, not diagnoses — confirm each against "## Repo files" and IGNORE false positives (build args, URLs, files created earlier in the same Dockerfile).
-
-RULES:
-- evidence must be text that literally appears in the file contents shown under "## File contents". If you cannot find exact offending text to quote, do not emit that issue.
-- evidence and corrected must differ. Keep both as short as possible while unambiguous.
-- Only files with a ### header may be fixed. Never name any other file.
-- Set confidence below 0.5 if you are unsure, rather than guessing."""
-
-USER_PROMPT = """\
-## Tech stack: {stacks}
-## CI failure (key lines):
-```
-{signal}
-```
-## Repo files (these exist — anything referenced but NOT in this list is a typo):
-{repo_files}
-{hints_section}{focus_section}## File contents (you may ONLY edit these):
-{context}"""
+def _embed_endpoint():
+    base = re.sub(r"/(v1|api)/.*$", "", OLLAMA_API_URL.rstrip("/"))
+    return f"{base}/api/embeddings", f"{base}/api/embed"
 
 
-def repo_file_list(limit: int = 200) -> str:
-    files = []
-    for p in sorted(Path(".").rglob("*")):
-        if p.is_file() and not any(d in SKIP_DIRS for d in p.parts):
-            rel = _relstrip(str(p))
-            if not _is_blocked(rel):
-                files.append(rel)
-        if len(files) >= limit:
-            break
-    return ", ".join(files) if files else "(none found)"
+def embed_text(text: str):
+    """Return an embedding vector for `text`, or None if embeddings are off/unavailable.
+    Handles both the legacy /api/embeddings ({'embedding': [...]}) and the newer
+    /api/embed ({'embeddings': [[...]]}) Ollama shapes."""
+    if not RAG_ENABLED or not text.strip():
+        return None
+    legacy, modern = _embed_endpoint()
+    for url, key in ((legacy, "embedding"), (modern, "embeddings")):
+        try:
+            r = requests.post(url, json={"model": EMBED_MODEL, "prompt": text,
+                                         "input": text}, timeout=(10, 60))
+            if r.status_code != 200:
+                continue
+            body = r.json()
+            vec = body.get(key)
+            if key == "embeddings" and isinstance(vec, list) and vec and isinstance(vec[0], list):
+                vec = vec[0]
+            if isinstance(vec, list) and vec and all(isinstance(x, (int, float)) for x in vec):
+                return [float(x) for x in vec]
+        except Exception:
+            continue
+    print("[RAG] embedding unavailable — running without retrieved context", file=sys.stderr)
+    return None
 
 
-def build_prompt(signal, context, stacks, hints="", focus=""):
-    repo_files = repo_file_list()
-    hints_section = f"## Static reference check (verify each — not authoritative):\n{hints}\n" if hints else ""
-    focus_section = ""
-    if focus:
-        focus_section = (
-            "## FOCUS — this is a follow-up round.\n"
-            "Earlier fixes in this run have ALREADY been applied to the files below. "
-            "Do NOT re-quote or re-report any bug that is already fixed. Only report "
-            "issues that are STILL PRESENT in the file contents shown here. "
-            "The following is the specific remaining issue(s) to fix now — quote your "
-            "evidence from these exact lines in the shown files, not from anything "
-            "you might remember from an earlier round:\n" + focus + "\n\n"
-        )
-    def fmt(ctx):
-        return USER_PROMPT.format(stacks=", ".join(sorted(stacks)) or "unknown",
-                                  signal=signal, repo_files=repo_files,
-                                  hints_section=hints_section,
-                                  focus_section=focus_section, context=ctx)
-    user = fmt(context)
-    cap = 9500
-    if len(SYSTEM_PROMPT + "\n\n" + user) > cap:
-        allowed = cap - len(SYSTEM_PROMPT) - len(fmt("")) - 100
-        user = fmt(context[:max(allowed, 1000)] + "\n...(trimmed)")
-    return user
+def _cosine(a, b) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    return dot / (na * nb) if na and nb else 0.0
 
+
+class MemoryStore:
+    """Append-only JSONL of solved cases with embeddings. Cosine search in pure
+    Python — fine for the small corpora a single repo accumulates."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.records = []
+        if path.is_file():
+            try:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line:
+                        self.records.append(json.loads(line))
+            except Exception as exc:
+                print(f"[RAG] could not read memory ({exc}) — starting empty", file=sys.stderr)
+        print(f"[RAG] memory: {len(self.records)} stored case(s) at {path}")
+
+    def search(self, query_vec, k=RAG_TOP_K, threshold=RAG_MIN_SIM):
+        if not query_vec:
+            return []
+        scored = []
+        for rec in self.records:
+            sim = _cosine(query_vec, rec.get("embedding", []))
+            if sim >= threshold:
+                scored.append((sim, rec))
+        scored.sort(key=lambda x: -x[0])
+        return scored[:k]
+
+    def add(self, record: dict):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # dedup: same normalized signature already stored → skip
+            sig = record.get("sig", "")
+            if sig and any(r.get("sig") == sig for r in self.records):
+                print("[RAG] case already stored — not duplicating")
+                return
+            with self.path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            self.records.append(record)
+            # trim oldest if we exceed the cap (rewrite tail)
+            if len(self.records) > RAG_MAX_CASES:
+                self.records = self.records[-RAG_MAX_CASES:]
+                self.path.write_text(
+                    "\n".join(json.dumps(r, ensure_ascii=False) for r in self.records) + "\n",
+                    encoding="utf-8")
+            print(f"[RAG] stored case (memory now {len(self.records)})")
+        except Exception as exc:
+            print(f"[RAG] failed to store case: {exc}", file=sys.stderr)
+
+
+def format_retrieved(matches) -> str:
+    """Render top-k matches into a compact prompt block of concrete past fixes."""
+    if not matches:
+        return ""
+    out = []
+    for i, (sim, rec) in enumerate(matches, 1):
+        rc = (rec.get("root_cause") or "").strip()
+        line = f"{i}. (similarity {sim:.2f}) root cause: {rc[:160]}"
+        for iss in (rec.get("issues") or [])[:2]:
+            ev = (iss.get("evidence") or "")[:70]
+            co = (iss.get("corrected") or "")[:70]
+            if ev and co:
+                line += f"\n   fix: {ev!r} → {co!r}"
+        out.append(line)
+    return "\n".join(out)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AI plumbing — shared streaming + JSON extraction  (consolidated)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _detect_endpoint():
     url = OLLAMA_API_URL.rstrip("/")
@@ -528,6 +536,316 @@ def _extract_token(line: bytes, fmt: str) -> str:
         return ""
 
 
+def _stream_ollama(prompt, schema=None, num_predict=2000, temperature=0.05,
+                   num_ctx=8192, tag="AI", retries=MAX_RETRIES) -> str:
+    """Single entry point for every AI stage. Streams the response, returns raw
+    text. Retries on timeout only (connection errors are terminal)."""
+    endpoint, fmt = _detect_endpoint()
+    if fmt == "openai":
+        payload = {"model": OLLAMA_MODEL, "prompt": prompt, "temperature": temperature,
+                   "max_tokens": num_predict, "stream": True}
+    else:
+        payload = {"model": OLLAMA_MODEL, "prompt": prompt,
+                   "options": {"temperature": temperature, "num_predict": num_predict,
+                               "num_ctx": num_ctx}, "stream": True}
+        if schema:
+            payload["format"] = schema
+    print(f"[{tag}] {endpoint} ({fmt}) | prompt {len(prompt)} chars | model {OLLAMA_MODEL}")
+
+    last = None
+    for attempt in range(retries):
+        try:
+            t0, collected = time.time(), []
+            resp = requests.post(endpoint, json=payload, timeout=(10, AI_TIMEOUT), stream=True)
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                tok = _extract_token(line, fmt)
+                if tok:
+                    collected.append(tok)
+            raw = "".join(collected).strip()
+            print(f"[{tag}] done in {time.time()-t0:.1f}s — {len(raw)} chars")
+            if not raw:
+                try:
+                    body = resp.json()
+                    raw = (body.get("choices", [{}])[0].get("text", "")
+                           if fmt == "openai" else body.get("response", "")).strip()
+                except Exception:
+                    pass
+            if not raw:
+                raise RuntimeError("Ollama returned an empty response.")
+            return raw
+        except requests.exceptions.Timeout as exc:
+            last = exc
+            wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF)-1)]
+            print(f"[{tag}] timeout; waiting {wait}s...")
+            if attempt < retries - 1:
+                time.sleep(wait)
+        except requests.exceptions.ConnectionError as exc:
+            raise RuntimeError(f"Cannot connect to Ollama at {endpoint}: {exc}")
+        except requests.exceptions.RequestException as exc:
+            raise RuntimeError(f"Ollama request failed: {exc}")
+    raise RuntimeError(f"Ollama did not respond after {retries} attempts: {last}")
+
+
+def _json_from(raw: str):
+    """Best-effort JSON extraction: direct parse, then widest brace-balanced
+    object, then brace-completion."""
+    cleaned = re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+    best = None
+    for start in [i for i, c in enumerate(cleaned) if c == "{"]:
+        depth = 0
+        for i in range(start, len(cleaned)):
+            if cleaned[i] == "{":
+                depth += 1
+            elif cleaned[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    cand = cleaned[start:i+1]
+                    best = cand if best is None or len(cand) > len(best) else best
+                    break
+    if best:
+        try:
+            return json.loads(best)
+        except json.JSONDecodeError:
+            try:
+                return json.loads(best + "}" * (best.count("{") - best.count("}")))
+            except json.JSONDecodeError:
+                pass
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Repo-file listing + shared prompt fragments
+# ══════════════════════════════════════════════════════════════════════════════
+
+def repo_file_list(limit: int = 200) -> str:
+    files = []
+    for p in sorted(Path(".").rglob("*")):
+        if p.is_file() and not any(d in SKIP_DIRS for d in p.parts):
+            rel = _relstrip(str(p))
+            if not _is_blocked(rel):
+                files.append(rel)
+        if len(files) >= limit:
+            break
+    return ", ".join(files) if files else "(none found)"
+
+
+def _context_block(signal, context, stacks, hints, retrieved):
+    repo_files = repo_file_list()
+    hints_section = (f"## Static reference check (verify each — not authoritative):\n{hints}\n"
+                     if hints else "")
+    rag_section = (f"## Similar past failures (for reference — verify against THIS repo):\n"
+                   f"{retrieved}\n" if retrieved else "")
+    return (
+        f"## Tech stack: {', '.join(sorted(stacks)) or 'unknown'}\n"
+        f"## CI failure (key lines):\n```\n{signal}\n```\n"
+        f"## Repo files (these exist — anything referenced but NOT here is a typo):\n{repo_files}\n"
+        f"{rag_section}{hints_section}"
+        f"## File contents (you may ONLY edit these):\n{context}"
+    )
+
+
+def _cap_prompt(system: str, body: str, context: str, rebuild, cap=9500) -> str:
+    """Trim the file-contents portion if the whole prompt is too long."""
+    full = f"{system}\n\n{body}"
+    if len(full) <= cap:
+        return full
+    allowed = cap - len(system) - len(rebuild("")) - 100
+    trimmed = context[:max(allowed, 1000)] + "\n...(trimmed)"
+    return f"{system}\n\n{rebuild(trimmed)}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 1 — EXTRACT FACTS  (AI)
+# ══════════════════════════════════════════════════════════════════════════════
+
+FACTS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "error_type":    {"type": "string"},
+        "failing_files": {"type": "array", "items": {"type": "string"}},
+        "key_symbols":   {"type": "array", "items": {"type": "string"}},
+        "summary":       {"type": "string"},
+    },
+    "required": ["error_type", "failing_files", "summary"],
+}
+
+FACTS_SYSTEM = """\
+You are a CI/CD triage engineer. Extract FACTS ONLY — do not diagnose or fix yet.
+Output ONLY one JSON object. No markdown fences. Start with { end with }.
+{"error_type":"short category e.g. missing_file / bad_version / port_mismatch / import_error","failing_files":["exact/path from a ### header, if any"],"key_symbols":["the literal tokens the error names — filenames, versions, ports"],"summary":"one sentence of what the log shows"}
+Copy tokens EXACTLY from the log and file contents. Do not invent files or symbols."""
+
+
+def ai_extract_facts(signal, context, stacks, hints, retrieved) -> dict:
+    def rebuild(ctx):
+        return _context_block(signal, ctx, stacks, hints, retrieved) + \
+               "\n\nExtract the facts as JSON."
+    prompt = _cap_prompt(FACTS_SYSTEM, rebuild(context), context, rebuild)
+    raw = _stream_ollama(prompt, FACTS_SCHEMA, num_predict=800,
+                         temperature=0.0, tag="S1-FACTS")
+    data = _json_from(raw) or {}
+    data.setdefault("error_type", "unknown")
+    data.setdefault("failing_files", [])
+    data.setdefault("key_symbols", [])
+    data.setdefault("summary", "")
+    print(f"[S1-FACTS] {data.get('error_type')} | files={data.get('failing_files')} "
+          f"| symbols={data.get('key_symbols')}")
+    return data
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 2 — ROOT CAUSE  (AI)
+# ══════════════════════════════════════════════════════════════════════════════
+
+CAUSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "root_cause":     {"type": "string"},
+        "solution":       {"type": "string"},
+        "confidence":     {"type": "number"},
+        "commit_message": {"type": "string"},
+    },
+    "required": ["root_cause", "solution", "confidence", "commit_message"],
+}
+
+CAUSE_SYSTEM = """\
+You are a senior CI/CD debugging engineer. Given the extracted facts and the file
+contents, state the ROOT CAUSE. Do NOT write the fix yet. Output ONLY one JSON object.
+{"root_cause":"one sentence: WHY it failed","solution":"plain words: WHAT must change","confidence":0.0-1.0,"commit_message":"fix: short"}
+Set confidence below 0.5 if the facts do not clearly pin a single cause."""
+
+
+def ai_root_cause(facts, signal, context, stacks, hints, retrieved) -> dict:
+    facts_line = (f"## Extracted facts:\nerror_type={facts.get('error_type')}; "
+                  f"failing_files={facts.get('failing_files')}; "
+                  f"key_symbols={facts.get('key_symbols')}; "
+                  f"summary={facts.get('summary')}\n")
+    def rebuild(ctx):
+        return facts_line + _context_block(signal, ctx, stacks, hints, retrieved) + \
+               "\n\nGive root cause as JSON."
+    prompt = _cap_prompt(CAUSE_SYSTEM, rebuild(context), context, rebuild)
+    raw = _stream_ollama(prompt, CAUSE_SCHEMA, num_predict=700,
+                         temperature=0.05, tag="S2-CAUSE")
+    data = _json_from(raw) or {}
+    data.setdefault("root_cause", "unknown")
+    data.setdefault("solution", "")
+    data.setdefault("commit_message", "fix: auto-fixer change")
+    try:
+        data["confidence"] = float(data.get("confidence", 0.5))
+    except (TypeError, ValueError):
+        data["confidence"] = 0.5
+    print(f"[S2-CAUSE] {data['root_cause']} (confidence {data['confidence']:.0%})")
+    return data
+
+
+def ai_facts_and_cause(signal, context, stacks, hints, retrieved) -> tuple:
+    """FAST_MODE: one call producing facts + cause together."""
+    schema = {"type": "object", "properties": {
+        **FACTS_SCHEMA["properties"], **CAUSE_SCHEMA["properties"]},
+        "required": ["error_type", "failing_files", "summary",
+                     "root_cause", "solution", "confidence", "commit_message"]}
+    system = (FACTS_SYSTEM.split("Output ONLY")[0] +
+              "Extract facts AND state the root cause in one JSON object. "
+              "Output ONLY one JSON object.\n"
+              '{"error_type":"...","failing_files":[...],"key_symbols":[...],'
+              '"summary":"...","root_cause":"...","solution":"...",'
+              '"confidence":0.0-1.0,"commit_message":"fix: short"}')
+    def rebuild(ctx):
+        return _context_block(signal, ctx, stacks, hints, retrieved) + \
+               "\n\nRespond with the combined JSON."
+    prompt = _cap_prompt(system, rebuild(context), context, rebuild)
+    raw = _stream_ollama(prompt, schema, num_predict=1000, temperature=0.05, tag="S1S2")
+    data = _json_from(raw) or {}
+    facts = {"error_type": data.get("error_type", "unknown"),
+             "failing_files": data.get("failing_files", []) or [],
+             "key_symbols": data.get("key_symbols", []) or [],
+             "summary": data.get("summary", "")}
+    try:
+        conf = float(data.get("confidence", 0.5))
+    except (TypeError, ValueError):
+        conf = 0.5
+    cause = {"root_cause": data.get("root_cause", "unknown"),
+             "solution": data.get("solution", ""),
+             "confidence": conf,
+             "commit_message": data.get("commit_message", "fix: auto-fixer change")}
+    print(f"[S1S2] {facts['error_type']} → {cause['root_cause']} "
+          f"(confidence {conf:.0%})")
+    return facts, cause
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 3 — GENERATE FIX  (AI)  — flat issues contract + focused correct-the-line
+# ══════════════════════════════════════════════════════════════════════════════
+
+FIX_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "issues": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "file":      {"type": "string"},
+                "problem":   {"type": "string"},
+                "evidence":  {"type": "string"},
+                "corrected": {"type": "string"},
+            },
+            "required": ["file", "problem", "evidence", "corrected"]}},
+    },
+    "required": ["issues"],
+}
+
+FIX_SYSTEM = """\
+You are a senior CI/CD debugging engineer. You know the root cause. Now emit the FIX.
+Output ONLY one JSON object. No markdown fences. Start with { end with }.
+
+"issues" = ONE ENTRY PER BUG. Each entry:
+  - "file": the ### header path of the file the bug is in
+  - "problem": one sentence describing this specific bug
+  - "evidence": the offending text COPIED EXACTLY, character-for-character, from the file contents. SHORT — the single wrong token or one wrong line. Never paraphrase; copy it.
+  - "corrected": the same text with ONLY the bug fixed. Everything else identical.
+
+Schema:
+{"issues":[{"file":"exact/path","problem":"...","evidence":"exact text copied from the file","corrected":"same text, bug fixed"}]}
+
+FINDING EVERY BUG:
+A file routinely contains MORE THAN ONE unrelated bug. Finding one and stopping is a FAILURE. Re-read EVERY shown file line by line. For each line naming a file, a version, or a port, check it independently:
+- File names: the "## Repo files" list is the truth. A referenced name NOT in it is a typo — corrected = the closest real name. NEVER create a missing file; fix the reference.
+- Python versions: valid 3.8–3.13. python:3.1 / python:3.2 / python-version "3.1"/"3.2" are INVALID — corrected uses 3.12.
+- Ports: if app.run(port=N) disagrees with Dockerfile EXPOSE M, correct the app to bind M.
+- If you change `if __name__ == "__main__":`, it must still start a long-running server.
+Add one issues[] entry for EVERY bug — two bugs in one file = two entries with the same "file".
+
+RULES:
+- evidence must literally appear in the file contents. If you cannot quote exact offending text, omit that issue.
+- evidence and corrected must differ, and be as short as unambiguous allows.
+- Only files with a ### header may be fixed."""
+
+
+def ai_generate_fix(facts, cause, signal, context, stacks, hints, retrieved) -> list:
+    ctx_line = (f"## Root cause (already determined): {cause.get('root_cause')}\n"
+                f"## Solution direction: {cause.get('solution')}\n"
+                f"## Facts: error_type={facts.get('error_type')}, "
+                f"symbols={facts.get('key_symbols')}\n")
+    def rebuild(ctx):
+        return ctx_line + _context_block(signal, ctx, stacks, hints, retrieved) + \
+               "\n\nEmit the issues JSON."
+    prompt = _cap_prompt(FIX_SYSTEM, rebuild(context), context, rebuild)
+    raw = _stream_ollama(prompt, FIX_SCHEMA, num_predict=2800,
+                         temperature=0.05, tag="S3-FIX")
+    data = _json_from(raw)
+    if data is None:
+        raise ValueError(f"No valid JSON in Stage 3 response:\n{raw[:400]}")
+    issues = data.get("issues", []) or []
+    # tolerate a model that drifts to fixes[] shape
+    if not issues and isinstance(data.get("fixes"), list):
+        issues = data["fixes"]
+    return _normalize_issue_keys(issues)
+
+
 CORRECT_LINE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -544,15 +862,8 @@ CORRECT_LINE_SCHEMA = {
 
 
 def ai_correct_lines(broken: list) -> list:
-    """
-    Focused AI task, run ONLY for the reference-typo class the free-form
-    diagnosis prompt kept fumbling. Python gives the AI numbered broken lines
-    verbatim; the AI writes the corrected line for each. Nothing else — no file
-    enumeration, no quoting-from-memory, no reasoning chain.
-
-    Returns [{file, line_in_file, corrected_line}, ...] which the caller turns
-    into a find/replace fix. This never edits anything itself.
-    """
+    """Focused correct-the-line pass for reference typos. Returns
+    [{file, line_in_file, corrected_line}, ...]. Never edits anything itself."""
     if not broken:
         return []
     items = []
@@ -565,52 +876,23 @@ def ai_correct_lines(broken: list) -> list:
               '{"corrections":[{"id":N,"corrected_line":"..."}]}. '
               "For each numbered line below, return the line with the wrong "
               "filename replaced by the real filename shown. Keep everything "
-              "else on the line IDENTICAL — same indentation, same directive, "
-              "same quoting, same trailing content. Do not add or remove lines.")
-    user = "Lines to correct:\n" + "\n".join(items)
-    prompt = f"{system}\n\n{user}"
-
-    endpoint, fmt = _detect_endpoint()
-    if fmt == "openai":
-        payload = {"model": OLLAMA_MODEL, "prompt": prompt, "temperature": 0.0,
-                   "max_tokens": 1200, "stream": True}
-    else:
-        payload = {"model": OLLAMA_MODEL, "prompt": prompt,
-                   "format": CORRECT_LINE_SCHEMA,
-                   "options": {"temperature": 0.0, "num_predict": 1200,
-                               "num_ctx": 4096}, "stream": True}
-    print(f"[AI-LINES] focused call: {len(broken)} broken line(s), "
-          f"prompt {len(prompt)} chars")
+              "else on the line IDENTICAL — same indentation, directive, quoting, "
+              "trailing content. Do not add or remove lines.")
+    prompt = f"{system}\n\nLines to correct:\n" + "\n".join(items)
+    print(f"[AI-LINES] focused call: {len(broken)} broken line(s)")
 
     try:
-        t0, collected = time.time(), []
-        resp = requests.post(endpoint, json=payload,
-                             timeout=(10, AI_TIMEOUT), stream=True)
-        resp.raise_for_status()
-        for line in resp.iter_lines():
-            tok = _extract_token(line, fmt)
-            if tok:
-                collected.append(tok)
-        raw = "".join(collected).strip()
-        print(f"[AI-LINES] done in {time.time()-t0:.1f}s — {len(raw)} chars")
-        if not raw:
-            return []
-        cleaned = re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
-        try:
-            data = json.loads(cleaned)
-        except json.JSONDecodeError:
-            # fall back to the widest brace-balanced object
-            m = re.search(r"\{.*\}", cleaned, re.S)
-            if not m:
-                return []
-            data = json.loads(m.group(0))
+        raw = _stream_ollama(prompt, CORRECT_LINE_SCHEMA, num_predict=1200,
+                             temperature=0.0, num_ctx=4096, tag="AI-LINES", retries=1)
     except Exception as exc:
         print(f"[AI-LINES] failed: {exc}", file=sys.stderr)
         return []
+    data = _json_from(raw)
+    if not data:
+        return []
 
-    corrections = data.get("corrections", []) or []
     out = []
-    for c in corrections:
+    for c in data.get("corrections", []) or []:
         try:
             idx = int(c.get("id", 0)) - 1
         except (TypeError, ValueError):
@@ -619,78 +901,18 @@ def ai_correct_lines(broken: list) -> list:
             continue
         b = broken[idx]
         new_line = c.get("corrected_line", "")
-        if not isinstance(new_line, str) or not new_line.strip():
+        if not isinstance(new_line, str) or not new_line.strip() or b["line"] == new_line:
             continue
-        if b["line"] == new_line:
-            continue
-        # sanity: the corrected line must contain the closest_basename and NOT
-        # the wrong token (a 3B occasionally echoes the wrong line unchanged
-        # under a new number, or invents a still-wrong replacement)
         if b["closest_basename"] and b["closest_basename"] not in new_line:
-            print(f"[AI-LINES] discarded id={idx+1}: correction doesn't contain "
-                  f"the real filename {b['closest_basename']!r}")
+            print(f"[AI-LINES] discarded id={idx+1}: missing real filename")
             continue
         if b["wrong_token"] in new_line:
-            print(f"[AI-LINES] discarded id={idx+1}: correction still contains "
-                  f"the wrong token {b['wrong_token']!r}")
+            print(f"[AI-LINES] discarded id={idx+1}: still contains wrong token")
             continue
         out.append({"file": b["file"], "line_in_file": b["line"],
                     "corrected_line": new_line})
     return out
 
-
-def call_ai(signal, context, stacks, hints="", focus="") -> str:
-    prompt = f"{SYSTEM_PROMPT}\n\n{build_prompt(signal, context, stacks, hints, focus)}"
-    endpoint, fmt = _detect_endpoint()
-    if fmt == "openai":
-        payload = {"model": OLLAMA_MODEL, "prompt": prompt, "temperature": 0.05,
-                   "max_tokens": 2800, "stream": True}
-    else:
-        payload = {"model": OLLAMA_MODEL, "prompt": prompt, "format": ANALYSIS_SCHEMA,
-                   "options": {"temperature": 0.05, "num_predict": 2800,
-                               "num_ctx": 8192}, "stream": True}
-    print(f"[AI] {endpoint} ({fmt}) | prompt {len(prompt)} chars | model {OLLAMA_MODEL}")
-
-    last = None
-    for attempt in range(MAX_RETRIES):
-        try:
-            t0, collected = time.time(), []
-            resp = requests.post(endpoint, json=payload,
-                                 timeout=(10, AI_TIMEOUT), stream=True)
-            resp.raise_for_status()
-            for line in resp.iter_lines():
-                tok = _extract_token(line, fmt)
-                if tok:
-                    collected.append(tok)
-            raw = "".join(collected).strip()
-            print(f"[AI] Done in {time.time()-t0:.1f}s — {len(raw)} chars")
-            if not raw:
-                try:
-                    body = resp.json()
-                    raw = (body.get("choices", [{}])[0].get("text", "")
-                           if fmt == "openai" else body.get("response", "")).strip()
-                except Exception:
-                    pass
-            if not raw:
-                raise RuntimeError("Ollama returned an empty response.")
-            print(f"[AI] Preview: {raw[:300]}")
-            return raw
-        except requests.exceptions.Timeout as exc:
-            last = exc
-            wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF)-1)]
-            print(f"[AI] Timeout; waiting {wait}s...")
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(wait)
-        except requests.exceptions.ConnectionError as exc:
-            raise RuntimeError(f"Cannot connect to Ollama at {endpoint}: {exc}")
-        except requests.exceptions.RequestException as exc:
-            raise RuntimeError(f"Ollama request failed: {exc}")
-    raise RuntimeError(f"Ollama did not respond after {MAX_RETRIES} attempts: {last}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#   RECEIVE JSON
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _normalize_issue_keys(issues):
     KF = ("file_path", "path", "filename", "filepath", "name")
@@ -701,74 +923,95 @@ def _normalize_issue_keys(issues):
         if not isinstance(it, dict):
             continue
         it = dict(it)
-        if "file" not in it:
-            for a in KF:
-                if a in it:
-                    it["file"] = it.pop(a); break
-        if "evidence" not in it:
-            for a in KE:
-                if a in it:
-                    it["evidence"] = it.pop(a); break
-        if "corrected" not in it:
-            for a in KC:
-                if a in it:
-                    it["corrected"] = it.pop(a); break
+        for want, alts in (("file", KF), ("evidence", KE), ("corrected", KC)):
+            if want not in it:
+                for a in alts:
+                    if a in it:
+                        it[want] = it.pop(a); break
         out.append(it)
     return out
 
 
-def parse_ai_response(raw: str) -> dict:
-    cleaned = re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
-    data = None
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 4 — SELF-VERIFY  (AI)
+# ══════════════════════════════════════════════════════════════════════════════
+
+VERIFY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdicts": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "id":     {"type": "integer"},
+                "keep":   {"type": "boolean"},
+                "reason": {"type": "string"},
+            },
+            "required": ["id", "keep"]}},
+        "confidence": {"type": "number"},
+    },
+    "required": ["verdicts"],
+}
+
+VERIFY_SYSTEM = """\
+You are reviewing proposed fixes before they are applied. For each numbered issue, decide keep=true only if:
+  - the "evidence" text actually appears in the shown file contents, AND
+  - "corrected" is a genuine fix of a real bug (not a no-op, not a new bug).
+If evidence is not present, or the change looks wrong or invented, keep=false.
+Output ONLY one JSON object:
+{"verdicts":[{"id":N,"keep":true,"reason":"short"}],"confidence":0.0-1.0}"""
+
+
+def ai_self_verify(issues, context) -> tuple:
+    """Return (kept_issues, verify_confidence). On any failure, keep all (Python
+    validation remains the hard gate)."""
+    if SKIP_SELF_VERIFY or not issues:
+        return issues, None
+    listing = []
+    for i, it in enumerate(issues, 1):
+        listing.append(f'{i}. file="{it.get("file","")}"\n'
+                       f'   evidence: {(it.get("evidence") or "")[:160]!r}\n'
+                       f'   corrected: {(it.get("corrected") or "")[:160]!r}')
+    prompt = (f"{VERIFY_SYSTEM}\n\n## File contents:\n{context}\n\n"
+              f"## Proposed fixes:\n" + "\n".join(listing) +
+              "\n\nReturn the verdicts JSON.")
+    if len(prompt) > 11000:
+        prompt = prompt[:11000]
     try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-    if data is None:
-        best = None
-        for start in [i for i, c in enumerate(cleaned) if c == "{"]:
-            depth = 0
-            for i in range(start, len(cleaned)):
-                if cleaned[i] == "{":
-                    depth += 1
-                elif cleaned[i] == "}":
-                    depth -= 1
-                    if depth == 0:
-                        cand = cleaned[start:i+1]
-                        best = cand if best is None or len(cand) > len(best) else best
-                        break
-        if best:
-            try:
-                data = json.loads(best)
-            except json.JSONDecodeError:
-                try:
-                    data = json.loads(best + "}" * (best.count("{") - best.count("}")))
-                except json.JSONDecodeError:
-                    pass
-    if data is None:
-        raise ValueError(f"No valid JSON in AI response:\n{raw[:500]}")
-    if isinstance(data.get("issues"), list):
-        data["issues"] = _normalize_issue_keys(data["issues"])
-    return data
+        raw = _stream_ollama(prompt, VERIFY_SCHEMA, num_predict=900,
+                             temperature=0.0, tag="S4-VERIFY", retries=1)
+    except Exception as exc:
+        print(f"[S4-VERIFY] failed ({exc}) — keeping all issues", file=sys.stderr)
+        return issues, None
+    data = _json_from(raw)
+    if not data:
+        return issues, None
+    drop = set()
+    for v in data.get("verdicts", []) or []:
+        try:
+            idx = int(v.get("id", 0)) - 1
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx < len(issues) and v.get("keep") is False:
+            drop.add(idx)
+            print(f"[S4-VERIFY] dropped #{idx+1}: {v.get('reason','')[:80]}")
+    kept = [it for i, it in enumerate(issues) if i not in drop]
+    try:
+        vc = float(data.get("confidence")) if data.get("confidence") is not None else None
+    except (TypeError, ValueError):
+        vc = None
+    if not kept and issues:
+        # verifier rejected everything — distrust the verifier, not Stage 3
+        print("[S4-VERIFY] verifier rejected all issues — keeping Stage 3 output "
+              "for Python validation to judge")
+        return issues, vc
+    return kept, vc
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 3b — PAIR + LOCATE (Python turns the AI's quotes into fixes)
+# PAIR + LOCATE  (Python turns the AI's quotes into fixes)  — unchanged logic
 # ══════════════════════════════════════════════════════════════════════════════
 
 def issues_to_fixes(issues: list, included_contents: dict) -> tuple:
-    """
-    Convert the AI's flat issues list into per-file fixes, locating each issue
-    by its own quoted evidence:
-      - evidence found in the file the AI named → keep it there.
-      - evidence found in exactly ONE OTHER shown file → relocate it there
-        (the AI diagnosed correctly but misfiled — its quote proves where the
-        bug really is).
-      - evidence found nowhere (or ambiguous across several files) → reject:
-        a fix whose offending text doesn't exist is a hallucination; a quote
-        appearing in several files can't be placed safely.
-    The AI authored both `evidence` and `corrected`; Python only pairs them.
-    """
     fixes_by_file, rejects = {}, []
     for n, it in enumerate(issues, 1):
         file = (it.get("file") or "").strip()
@@ -780,8 +1023,7 @@ def issues_to_fixes(issues: list, included_contents: dict) -> tuple:
             rejects.append(f"issue #{n} ({file or '?'}): empty evidence")
             continue
         if not isinstance(cor, str) or cor == ev:
-            rejects.append(f"issue #{n} ({file or '?'}): corrected text missing or "
-                           f"identical to evidence")
+            rejects.append(f"issue #{n} ({file or '?'}): corrected missing or identical")
             continue
 
         holders = [f for f, c in included_contents.items() if ev in c]
@@ -789,17 +1031,13 @@ def issues_to_fixes(issues: list, included_contents: dict) -> tuple:
             target = file
         elif len(holders) == 1:
             target = holders[0]
-            print(f"[LOCATE] issue #{n}: AI filed it under '{file or '?'}' but its "
-                  f"quoted evidence only exists in '{target}' — relocating "
-                  f"(the AI's own quote pins the real location).")
+            print(f"[LOCATE] issue #{n}: filed under '{file or '?'}' but evidence only "
+                  f"exists in '{target}' — relocating.")
         elif len(holders) > 1:
-            rejects.append(f"issue #{n} ({file or '?'}): evidence appears in "
-                           f"{len(holders)} shown files — ambiguous, not applied")
+            rejects.append(f"issue #{n} ({file or '?'}): evidence in {len(holders)} files — ambiguous")
             continue
         else:
-            rejects.append(f"issue #{n} ({file or '?'}): quoted evidence "
-                           f"{ev[:80]!r} not found in any shown file — rejected "
-                           f"(a fix whose offending text doesn't exist is invented)")
+            rejects.append(f"issue #{n} ({file or '?'}): evidence {ev[:80]!r} not found — rejected")
             continue
 
         entry = fixes_by_file.setdefault(
@@ -814,17 +1052,10 @@ def issues_to_fixes(issues: list, included_contents: dict) -> tuple:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 4 — APPLY FILES + VALIDATE SYNTAX
+# APPLY + VALIDATE  (unchanged, proven)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _salvage_fragment(content: str, find: str, replace: str) -> str | None:
-    """
-    Last-resort recovery when `find` doesn't match verbatim. The model often
-    paraphrases the surrounding line/quotes but gets the actual changed TOKEN
-    right. Strip the longest common prefix/suffix of find vs replace to isolate
-    just the changed fragment; apply it ONLY if that fragment occurs exactly
-    once in the file (never ambiguous, never a guess).
-    """
+def _salvage_fragment(content: str, find: str, replace: str):
     if not find or not replace or find == replace:
         return None
     i = 0
@@ -849,7 +1080,6 @@ def _apply_edits(original: str, edits: list) -> tuple:
         if find in content:
             content = content.replace(find, repl)
             continue
-        # whitespace-tolerant fallback
         nf = "\n".join(l.strip() for l in find.splitlines())
         nc = "\n".join(l.strip() for l in content.splitlines())
         matched = False
@@ -868,15 +1098,12 @@ def _apply_edits(original: str, edits: list) -> tuple:
                     break
         if matched:
             continue
-        # final salvage: isolate the actual changed fragment, apply only if unique
         salvaged = _salvage_fragment(content, find, repl)
         if salvaged is not None and salvaged != content:
-            print(f"[EDIT] Salvaged edit #{i+1} via unique-fragment match "
-                  f"(model's 'find' did not match the file verbatim)")
+            print(f"[EDIT] Salvaged edit #{i+1} via unique-fragment match")
             content = salvaged
             continue
-        return None, (f"edit #{i+1} 'find' text not present in file — "
-                      f"model's find: {find[:120]!r}")
+        return None, (f"edit #{i+1} 'find' text not present — find: {find[:120]!r}")
     if content == original:
         return None, "edits produced no change"
     return content, "ok"
@@ -888,8 +1115,7 @@ def _resolve_content(fix: dict) -> tuple:
         p = Path(file)
         if not p.is_file():
             return None, f"file does not exist: {file}"
-        return _apply_edits(p.read_text(encoding="utf-8", errors="replace"),
-                            fix["edits"])
+        return _apply_edits(p.read_text(encoding="utf-8", errors="replace"), fix["edits"])
     fc = fix.get("fixed_content")
     if isinstance(fc, str) and fc.strip():
         return fc, "ok"
@@ -912,7 +1138,6 @@ def validate_fix(fix: dict) -> tuple:
     fix["fixed_content"] = content
     if not content.strip():
         return False, "empty result"
-    # ── validate syntax ──
     if file.endswith(".py"):
         try:
             ast.parse(content)
@@ -933,21 +1158,15 @@ def validate_fix(fix: dict) -> tuple:
 
 
 def write_fixes(fixes: list) -> tuple:
-    """Apply the AI's fixes exactly as paired from its own quotes. Python
-    rejects invalid fixes (unknown file, bad syntax, unmatched find) but NEVER
-    writes a fix of its own — the model's quoted text is the only source of
-    any change."""
     written, originals, reasons = [], {}, []
     for fix in fixes[:MAX_FILES_FIXED]:
         ok, reason = validate_fix(fix)
         file = fix.get("file", "").strip()
-
         if not ok:
-            print(f"  ✗ {file or '?'} — {reason}")          # stdout: always visible in Action logs
+            print(f"  ✗ {file or '?'} — {reason}")
             print(f"  ✗ {file or '?'} — {reason}", file=sys.stderr)
             reasons.append(f"{file or '?'}: {reason}")
             continue
-
         originals[file] = Path(file).read_text(encoding="utf-8", errors="replace")
         content = fix["fixed_content"]
         if not content.endswith("\n"):
@@ -958,8 +1177,7 @@ def write_fixes(fixes: list) -> tuple:
         tmp.replace(p)
         print(f"  ✓ {file} — {fix.get('reason','')[:100]}")
         written.append(file)
-
-    written = list(dict.fromkeys(written))   # same file can be fixed by >1 entry
+    written = list(dict.fromkeys(written))
     return written, originals, reasons
 
 
@@ -973,7 +1191,7 @@ def revert_files(originals: dict):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 5 — RUN TESTS
+# RUN TESTS  (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def detect_test_commands(stacks: set) -> list:
@@ -1013,7 +1231,7 @@ def run_tests(stacks: set) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 6 — COMMIT + PUSH + PR  /  CREATE ISSUE
+# COMMIT + PUSH + PR  /  CREATE ISSUE  (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _git(*args, check=True):
@@ -1024,7 +1242,7 @@ def last_commit_was_bot() -> bool:
     try:
         author, subject = _git("log", "-1", "--pretty=%an|||%s").stdout.strip().split("|||", 1)
         if author == BOT_NAME and subject.startswith(BOT_PREFIX):
-            print(f"[GUARD] Last commit was bot — stopping.")
+            print("[GUARD] Last commit was bot — stopping.")
             return True
     except Exception:
         pass
@@ -1032,15 +1250,6 @@ def last_commit_was_bot() -> bool:
 
 
 def count_recent_bot_commits(n=10) -> int:
-    """
-    Count a CONSECUTIVE run of bot commits walking back from HEAD — stops at the
-    first human commit. This distinguishes a genuine stuck loop (bot fixes →
-    fails → bot fixes → fails, back to back with nothing in between) from a
-    healthy history where 3+ PAST bot fixes were reviewed and merged by a human
-    at various points. Counting "any N bot commits in recent history" (the old
-    behavior) permanently blocks the fixer forever once enough fixes have
-    accumulated and been merged — that's not a loop, that's the system working.
-    """
     try:
         lines = _git("log", f"-{n}", "--pretty=%an").stdout.splitlines()
         count = 0
@@ -1048,7 +1257,7 @@ def count_recent_bot_commits(n=10) -> int:
             if author.strip() == BOT_NAME:
                 count += 1
             else:
-                break  # a human commit breaks the streak — not a loop
+                break
         return count
     except Exception:
         return 0
@@ -1110,8 +1319,7 @@ def open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
     details = "".join(f"\n**`{f.get('file','?')}`** — {f.get('reason','')}\n" for f in fixes)
     diag = ""
     if error_analysis or solution:
-        diag = (f"### AI diagnosis\n"
-                f"**Error:** {error_analysis or 'n/a'}\n\n"
+        diag = (f"### AI diagnosis\n**Error:** {error_analysis or 'n/a'}\n\n"
                 f"**Solution:** {solution or 'n/a'}\n\n")
     body = (f"## 🤖 AI Auto-Fix\n\n{diag}"
             f"**Root cause:** {root_cause}\n\n"
@@ -1130,8 +1338,6 @@ def open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
 
 
 def pending_bot_pr(token, repo) -> str:
-    """URL of an already-open bot fix PR, or ''. If a fix is awaiting review,
-    calling the LLM again just stacks duplicate PRs — skip the call entirely."""
     try:
         r = requests.get(f"https://api.github.com/repos/{repo}/pulls?state=open&per_page=50",
                          headers=_gh(token), timeout=15)
@@ -1158,11 +1364,11 @@ def open_issue(token, repo, reason, run_url=""):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN — the straight flow
+# MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    ap = argparse.ArgumentParser(description="AI CI/CD auto-fixer")
+    ap = argparse.ArgumentParser(description="AI CI/CD auto-fixer (RAG + staged)")
     ap.add_argument("--input", required=True, help="Path to CI failure log")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--skip-tests", action="store_true")
@@ -1177,7 +1383,7 @@ def main():
         print(f"[ERROR] Log not found: {args.input}", file=sys.stderr)
         sys.exit(1)
 
-    # loop guard
+    # loop guards
     if last_commit_was_bot():
         sys.exit(0)
     if count_recent_bot_commits() >= MAX_BOT_ATTEMPTS:
@@ -1185,16 +1391,14 @@ def main():
         if token and repo:
             open_issue(token, repo, "Auto-fixer attempted too many fixes without success.", run_url)
         sys.exit(0)
-    # minimum-LLM-call guard: a fix is already awaiting review — don't stack another
     if token and repo:
         url = pending_bot_pr(token, repo)
         if url:
-            print(f"[GUARD] A fix PR is already open awaiting review: {url}")
-            print("[GUARD] Skipping the model call — merge or close that PR first.")
+            print(f"[GUARD] A fix PR is already open: {url} — skipping model call.")
             sys.exit(0)
 
-    # ── STAGE 1: read logs + detect ──
-    print("\n━━━ READ LOGS + DETECT ━━━")
+    # ── COLLECT LOGS + CONTEXT ──
+    print("\n━━━ COLLECT LOGS + CONTEXT ━━━")
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
     signal = extract_error_signal(log_text)
     stacks = fingerprint_stack(log_text)
@@ -1202,100 +1406,107 @@ def main():
         print("[DETECT] No error signal — nothing to fix.")
         sys.exit(0)
 
-    # ── STAGE 2: discover files ──
-    print("\n━━━ DISCOVER FILES ━━━")
     forced = extract_referenced_paths(log_text)
     if not forced:
         wf = find_ci_workflow_files()
         if wf:
-            print(f"[DISCOVER] No source file referenced in the log — falling back "
-                  f"to the CI workflow as the prime suspect: {wf}")
+            print(f"[DISCOVER] No source file referenced — falling back to CI workflow: {wf}")
             forced = wf
     context, included, included_contents = discover_context(signal, stacks, forced)
     if not included:
         print("[DISCOVER] WARNING: no files resolved.")
     broken_lines, hints = _scan_reference_details(included_contents)
 
-    # ── STAGE 3a: focused AI pass — reference typos (the class the freeform
-    # prompt kept fumbling). Small task, higher hit-rate on a 3B: for each
-    # broken line Python found, the AI writes ONE corrected line. Nothing gets
-    # written to disk here — the corrections become normal find/replace fixes
-    # that flow through the same validation + write path as everything else.
+    # ── RAG RETRIEVE ──
+    print("\n━━━ RAG RETRIEVE ━━━")
+    norm_sig = normalize_signal(signal)
+    query_vec = embed_text(norm_sig)
+    store = MemoryStore(MEMORY_PATH) if RAG_ENABLED else None
+    matches = store.search(query_vec) if store else []
+    retrieved = format_retrieved(matches)
+    if retrieved:
+        print(f"[RAG] {len(matches)} similar case(s) retrieved")
+
+    # ── AI STAGE 1 + 2 ──
+    print("\n━━━ AI STAGE 1: FACTS / STAGE 2: ROOT CAUSE ━━━")
+    try:
+        if FAST_MODE:
+            facts, cause = ai_facts_and_cause(signal, context, stacks, hints, retrieved)
+        else:
+            facts = ai_extract_facts(signal, context, stacks, hints, retrieved)
+            cause = ai_root_cause(facts, signal, context, stacks, hints, retrieved)
+    except Exception as exc:
+        print(f"[ERROR] AI stage 1/2 failed: {exc}", file=sys.stderr)
+        if token and repo:
+            open_issue(token, repo, f"AI diagnosis failed: {exc}", run_url)
+        sys.exit(2)
+
+    root_cause = cause["root_cause"]
+    solution   = cause["solution"]
+    commit_msg = cause["commit_message"]
+    confidence = cause["confidence"]
+
+    print("\n  ── diagnosis ──")
+    print(f"  CAUSE      : {root_cause}")
+    print(f"  SOLUTION   : {solution or '(none)'}")
+    print(f"  confidence : {confidence:.0%}")
+
+    # ── AI STAGE 3a: focused correct-the-line for reference typos ──
     prefilled_fixes = []
     if broken_lines:
-        print("\n━━━ SEND TO AI (focused: correct-the-line) ━━━")
-        line_corrections = ai_correct_lines(broken_lines)
+        print("\n━━━ AI STAGE 3a: CORRECT-THE-LINE ━━━")
+        corrections = ai_correct_lines(broken_lines)
         by_file = {}
-        for c in line_corrections:
-            entry = by_file.setdefault(
-                c["file"],
-                {"file": c["file"], "reason": "AI-corrected reference typo(s)",
-                 "edits": []})
+        for c in corrections:
+            entry = by_file.setdefault(c["file"], {"file": c["file"],
+                     "reason": "AI-corrected reference typo(s)", "edits": []})
             edit = {"find": c["line_in_file"], "replace": c["corrected_line"]}
             if edit not in entry["edits"]:
                 entry["edits"].append(edit)
         prefilled_fixes = list(by_file.values())
-        print(f"[AI-LINES] produced {sum(len(f['edits']) for f in prefilled_fixes)} "
-              f"corrected line(s) across {len(prefilled_fixes)} file(s)")
+        print(f"[AI-LINES] {sum(len(f['edits']) for f in prefilled_fixes)} corrected line(s)")
 
-    # ── STAGE 3b: freeform diagnosis — the AI still owns overall root_cause
-    # and anything the focused call didn't cover (versions, ports, logic bugs).
-    print("\n━━━ SEND TO AI ━━━")
+    # ── AI STAGE 3b: freeform diagnosis fix ──
+    print("\n━━━ AI STAGE 3: GENERATE FIX ━━━")
     try:
-        raw = call_ai(signal, context, stacks, hints)
-        data = parse_ai_response(raw)
+        issues = ai_generate_fix(facts, cause, signal, context, stacks, hints, retrieved)
     except Exception as exc:
-        print(f"[ERROR] AI failed: {exc}", file=sys.stderr)
+        print(f"[ERROR] AI stage 3 failed: {exc}", file=sys.stderr)
         if token and repo:
-            open_issue(token, repo, f"AI analysis failed: {exc}", run_url)
+            open_issue(token, repo, f"AI fix generation failed: {exc}", run_url)
         sys.exit(2)
 
-    error_analysis = data.get("error_analysis", "")
-    root_cause = data.get("root_cause", "unknown")
-    solution   = data.get("solution", "")
-    commit_msg = data.get("commit_message", "fix: auto-fixer change")
-    confidence = float(data.get("confidence", 1.0))
-    issues = data.get("issues", []) or []
-    # tolerate a model that drifts back to the old fixes[] shape
-    legacy_fixes = data.get("fixes", []) or []
-
-    print("\n  ── AI diagnosis ──")
-    print(f"  ERROR    : {error_analysis or '(none given)'}")
-    print(f"  CAUSE    : {root_cause}")
-    print(f"  SOLUTION : {solution or '(none given)'}")
-    print(f"  confidence : {confidence:.0%}")
-    print(f"  issues     : {len(issues)} reported")
+    print(f"  issues reported: {len(issues)}")
     for n, it in enumerate(issues, 1):
-        ev  = (it.get("evidence") or "")[:60]
-        cor = (it.get("corrected") or "")[:60]
         print(f"    {n}. {it.get('file','?')}: {it.get('problem','')[:80]}")
-        print(f"       {ev!r} → {cor!r}")
+        print(f"       {(it.get('evidence') or '')[:60]!r} → {(it.get('corrected') or '')[:60]!r}")
 
-    if confidence < 0.5:
-        print(f"[GATE] Confidence {confidence:.0%} too low — escalating instead of guessing.")
+    # ── AI STAGE 4: self-verify ──
+    verify_conf = None
+    if issues and not SKIP_SELF_VERIFY:
+        print("\n━━━ AI STAGE 4: SELF-VERIFY ━━━")
+        issues, verify_conf = ai_self_verify(issues, context)
+        print(f"  issues after verify: {len(issues)}"
+              + (f" | verify confidence {verify_conf:.0%}" if verify_conf is not None else ""))
+
+    # ── CONFIDENCE GATE ──
+    combined = confidence if verify_conf is None else (confidence + verify_conf) / 2
+    if combined < 0.5:
+        print(f"[GATE] Confidence {combined:.0%} too low — escalating instead of guessing.")
         if token and repo:
             open_issue(token, repo,
-                       f"AI confidence too low ({confidence:.0%}). Root cause: {root_cause}", run_url)
+                       f"AI confidence too low ({combined:.0%}). Root cause: {root_cause}", run_url)
         sys.exit(0)
 
-    # ── STAGE 3c: pair + locate each freeform issue by its quoted evidence,
-    # then merge with the focused correct-the-line fixes from Stage 3a.
+    # ── PAIR + LOCATE, merge with prefilled ──
     freeform_fixes, pair_rejects = issues_to_fixes(issues, included_contents)
     for rej in pair_rejects:
         print(f"  ✗ {rej}", file=sys.stderr)
-    if not freeform_fixes and legacy_fixes:
-        freeform_fixes = [f for f in legacy_fixes
-                         if (f.get("file") or "").strip() in included]
-        if freeform_fixes:
-            print("[PARSE] Model returned legacy fixes[] — using grounded entries.")
 
-    # Merge: prefilled first so its edits win when the freeform pass reports
-    # the same file. De-dupe edits within each file.
     merged = {}
     for f in prefilled_fixes + freeform_fixes:
-        entry = merged.setdefault(
-            f["file"], {"file": f["file"], "reason": f.get("reason", ""),
-                        "edits": []})
+        entry = merged.setdefault(f["file"], {"file": f["file"],
+                 "reason": f.get("reason", ""), "edits": []})
         for e in f.get("edits", []) or []:
             if e not in entry["edits"]:
                 entry["edits"].append(e)
@@ -1308,11 +1519,11 @@ def main():
         print(f"[ERROR] AI produced no usable fixes. {detail}", file=sys.stderr)
         if token and repo:
             open_issue(token, repo,
-                       f"AI produced no usable fixes. Root cause: {root_cause}\n\n"
-                       f"Detail: {detail}", run_url)
+                       f"AI produced no usable fixes. Root cause: {root_cause}\n\nDetail: {detail}",
+                       run_url)
         sys.exit(3)
 
-    # ── STAGE 4: apply files + validate syntax ──
+    # ── APPLY + VALIDATE ──
     print("\n━━━ APPLY + VALIDATE ━━━")
     if args.dry_run:
         for fix in fixes:
@@ -1326,51 +1537,35 @@ def main():
         print(f"[ERROR] No valid fix applied. {detail}", file=sys.stderr)
         if token and repo:
             open_issue(token, repo,
-                       f"AI fix failed validation. Root cause: {root_cause}\n\n"
-                       f"Rejection detail: {detail}", run_url)
+                       f"AI fix failed validation. Root cause: {root_cause}\n\nDetail: {detail}",
+                       run_url)
         sys.exit(3)
 
-    # ── STAGE 4b: additional rounds — catch bugs round 1 missed ──
-    # If the static scanner still finds an unresolved reference mismatch after
-    # round 1's fixes were applied, there's proof more remains, so re-ask the
-    # model against the now-partially-fixed files. Stops when a round finds
-    # nothing left to flag, the model returns no new locatable issue, or a
-    # round repeats the exact same unresolved hints as the round before.
+    # ── ADDITIONAL ROUNDS (static rescan) ──
     prev_hints = None
     for round_no in range(2, MAX_AI_ROUNDS + 1):
-        r_context, r_included, r_contents = discover_context(signal, stacks, forced)
+        _, r_included, r_contents = discover_context(signal, stacks, forced)
         r_broken, r_hints = _scan_reference_details(r_contents)
         if not r_hints:
-            print(f"[LOOP] Static scan is clean after round {round_no - 1} — no more rounds needed.")
+            print(f"[LOOP] Static scan clean after round {round_no-1}.")
             break
         if r_hints == prev_hints:
-            print(f"[LOOP] Round {round_no - 1} left the same issue(s) flagged — "
-                  f"model isn't resolving it, stopping.")
+            print(f"[LOOP] Round {round_no-1} left the same issue(s) — stopping.")
             break
         prev_hints = r_hints
-
-        # Round 2+ is always reference-typo leftovers by construction (that's
-        # what the static scan flags), so run the focused correct-the-line
-        # call — the freeform diagnosis prompt kept hallucinating on this.
-        print(f"\n━━━ SEND TO AI (round {round_no}/{MAX_AI_ROUNDS}: correct-the-line) ━━━")
-        line_corrections = ai_correct_lines(r_broken)
+        print(f"\n━━━ AI ROUND {round_no}/{MAX_AI_ROUNDS}: CORRECT-THE-LINE ━━━")
+        corrections = ai_correct_lines(r_broken)
         by_file = {}
-        for c in line_corrections:
-            entry = by_file.setdefault(
-                c["file"],
-                {"file": c["file"], "reason": "AI-corrected reference typo(s)",
-                 "edits": []})
+        for c in corrections:
+            entry = by_file.setdefault(c["file"], {"file": c["file"],
+                     "reason": "AI-corrected reference typo(s)", "edits": []})
             edit = {"find": c["line_in_file"], "replace": c["corrected_line"]}
             if edit not in entry["edits"]:
                 entry["edits"].append(edit)
         fixes_r = list(by_file.values())
-        print(f"  round {round_no}: {sum(len(f['edits']) for f in fixes_r)} "
-              f"corrected line(s) across {len(fixes_r)} file(s)")
         if not fixes_r:
-            print(f"[LOOP] Nothing more to apply this round — stopping.")
+            print(f"[LOOP] Nothing more to apply — stopping.")
             break
-
-        print(f"\n━━━ APPLY + VALIDATE (round {round_no}) ━━━")
         written_r, originals_r, _ = write_fixes(fixes_r)
         if not written_r:
             print(f"[LOOP] Round {round_no} produced no valid fix — stopping.")
@@ -1380,27 +1575,50 @@ def main():
         written = list(dict.fromkeys(written + written_r))
         fixes = fixes + fixes_r
 
-    # ── STAGE 5: run tests ──
+    # ── RUN TESTS ──
     print("\n━━━ RUN TESTS ━━━")
     if not args.skip_tests:
         if not run_tests(stacks):
             revert_files(originals)
             if token and repo:
-                open_issue(token, repo, f"Fix applied but tests failed — reverted. Root cause: {root_cause}", run_url)
+                open_issue(token, repo,
+                           f"Fix applied but tests failed — reverted. Root cause: {root_cause}",
+                           run_url)
             sys.exit(5)
     else:
         print("[TEST] Skipped (--skip-tests)")
 
-    # ── STAGE 6: commit + push + PR  /  issue ──
+    # ── COMMIT + PR ──
     print("\n━━━ COMMIT + PR ━━━")
     branch = commit_to_branch(commit_msg, written)
     if not branch:
         sys.exit(4)
     if token and repo:
         open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
-                error_analysis, solution)
+                facts.get("summary", ""), solution)
     else:
         print(f"[PR] No token — merge {branch} manually.")
+
+    # ── STORE SUCCESSFUL CASE (RAG write-back) ──
+    if store is not None and query_vec is not None:
+        print("\n━━━ STORE CASE IN RAG MEMORY ━━━")
+        stored_issues = [{"file": it.get("file", ""),
+                          "problem": (it.get("problem") or "")[:200],
+                          "evidence": (it.get("evidence") or "")[:200],
+                          "corrected": (it.get("corrected") or "")[:200]}
+                         for it in issues if it.get("evidence") and it.get("corrected")]
+        store.add({
+            "sig": norm_sig,
+            "embedding": query_vec,
+            "stacks": sorted(stacks),
+            "error_type": facts.get("error_type", ""),
+            "root_cause": root_cause,
+            "solution": solution,
+            "issues": stored_issues,
+            "files_changed": written,
+            "confidence": combined,
+            "ts": int(time.time()),
+        })
 
     print("\n━━━ ✅ DONE ━━━")
     print(f"  root cause : {root_cause}")
