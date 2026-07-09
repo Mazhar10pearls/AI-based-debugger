@@ -569,3 +569,132 @@ def check_token_scopes(token: str):
     except Exception:
         pass
     return warnings
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7. OUTBOUND SECRET GATE — never let the fixer COMMIT a secret
+# ══════════════════════════════════════════════════════════════════════════════
+# redact_secrets() cleans text on the way IN (logs, prompts, RAG store). This is
+# the way OUT: right before the bot commits, scan the STAGED diff for secrets the
+# fix would introduce, and abort the commit if any are found.
+#
+# Only ADDED lines (diff '+' lines) are inspected, so a secret that already lived
+# in the file is NOT the bot's doing and does not block its unrelated fix — but
+# any secret the fix ADDS aborts the commit. This is the control that prevents a
+# "secret commit": the model's diagnosis ("failing because API key is missing")
+# must never turn into a hardcoded key pushed to the repo.
+#
+# This is a fail-CLOSED gate: if the staged diff cannot be read (git error), the
+# caller is told the scan did not complete and must not commit. A best-effort
+# built-in scanner always runs; if the `gitleaks` binary is present it is used as
+# a stronger second pass. For the strongest guarantee, also enable GitHub secret
+# scanning with push protection at the repo level as a server-side backstop.
+
+import shutil
+import subprocess
+
+
+def detect_secrets(text: str):
+    """Findings-only: the list of secret KINDS present in `text` (never values).
+    Shares the exact rule set used by redact_secrets."""
+    _, findings = redact_secrets(text)
+    return findings
+
+
+def _staged_diff(repo_root: str = "."):
+    """(diff_text, scan_ran). scan_ran is False if git could not produce a diff,
+    so the caller can fail closed instead of assuming 'clean'."""
+    try:
+        r = subprocess.run(
+            ["git", "diff", "--cached", "--unified=0", "--no-color"],
+            cwd=repo_root, capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            print(f"[SEC] staged-diff read failed (git rc={r.returncode}): "
+                  f"{r.stderr.strip()[:160]}", file=sys.stderr)
+            return "", False
+        return r.stdout, True
+    except Exception as exc:
+        print(f"[SEC] staged-diff read error: {exc}", file=sys.stderr)
+        return "", False
+
+
+def _gitleaks_findings(repo_root: str):
+    """Optional stronger pass. Runs `gitleaks` over staged changes if the binary
+    exists. Returns a list of {file, kinds:['GITLEAKS:<rule>']}. Version-tolerant:
+    tries the modern `git --staged` subcommand, then the legacy `protect`."""
+    if not shutil.which("gitleaks"):
+        return []
+    import json as _json
+    import tempfile
+    for argv in (["gitleaks", "git", "--staged"],
+                 ["gitleaks", "protect", "--staged"]):
+        rep = tempfile.NamedTemporaryFile(prefix="gl_", suffix=".json", delete=False)
+        rep.close()
+        try:
+            r = subprocess.run(
+                argv + ["--no-banner", "--redact", "--exit-code", "0",
+                        "--report-format", "json", "--report-path", rep.name],
+                cwd=repo_root, capture_output=True, text=True, timeout=120)
+            # unknown subcommand → try the next invocation form
+            if r.returncode != 0 and ("unknown command" in (r.stderr or "").lower()
+                                      or "unknown command" in (r.stdout or "").lower()):
+                continue
+            data = _json.loads(Path(rep.name).read_text() or "[]")
+            out = {}
+            for f in data:
+                path = f.get("File") or f.get("file") or "(unknown)"
+                rule = f.get("RuleID") or f.get("Description") or "secret"
+                out.setdefault(path, set()).add(f"GITLEAKS:{rule}")
+            return [{"file": p, "kinds": sorted(k)} for p, k in out.items()]
+        except Exception:
+            continue
+        finally:
+            try:
+                os.unlink(rep.name)
+            except Exception:
+                pass
+    return []
+
+
+def scan_staged_secrets(repo_root: str = "."):
+    """
+    Scan the git STAGED diff for secrets the pending commit would introduce.
+
+    Returns (clean, findings):
+      clean=True,  findings=[]   → staged changes are safe to commit
+      clean=False, findings=[…]  → secrets found, OR the scan could not run
+                                    (git error). Either way: DO NOT COMMIT.
+
+    findings entries are {file, kinds} — kinds name the detector, never a value.
+    Caller must stage its changes (git add) before calling this.
+    """
+    diff, scan_ran = _staged_diff(repo_root)
+    if not scan_ran:
+        # fail closed: we could not verify the diff, so we must not vouch for it
+        return False, [{"file": "(staged diff)", "kinds": ["SCAN_FAILED"]}]
+    if not diff.strip():
+        return True, []            # nothing staged → nothing to leak
+
+    by_file = {}
+    current = "(unknown)"
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            path = line[4:].strip()
+            current = path[2:] if path.startswith("b/") else path
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            kinds = detect_secrets(line[1:])
+            if kinds:
+                by_file.setdefault(current, set()).update(kinds)
+
+    findings = [{"file": f, "kinds": sorted(k)} for f, k in by_file.items()]
+
+    # stronger optional pass; merge any extra findings it surfaces
+    for gl in _gitleaks_findings(repo_root):
+        match = next((x for x in findings if x["file"] == gl["file"]), None)
+        if match:
+            match["kinds"] = sorted(set(match["kinds"]) | set(gl["kinds"]))
+        else:
+            findings.append(gl)
+
+    return (len(findings) == 0), findings

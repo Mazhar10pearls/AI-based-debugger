@@ -1309,6 +1309,16 @@ def commit_to_branch(commit_msg: str, written: list) -> str:
             print("[COMMIT] Nothing to commit.")
             _git("checkout", GIT_BASE_BRANCH, check=False)
             return ""
+        # ── outbound secret gate: never commit a secret the fix introduced ──
+        clean, leaks = security.scan_staged_secrets(".")
+        if not clean:
+            detail = "; ".join(f"{l['file']} [{','.join(l['kinds'])}]" for l in leaks)
+            print(f"[SEC] BLOCKING COMMIT — staged changes contain secret-like "
+                  f"content: {detail}", file=sys.stderr)
+            security.audit({"phase": "secret_commit_blocked", "findings": leaks})
+            _git("reset", check=False)                       # unstage everything
+            _git("checkout", GIT_BASE_BRANCH, check=False)
+            return ""
         _git("commit", "-m", commit_msg)
         _git("push", "-u", "origin", branch)
         print(f"[GIT] Pushed {branch}")
