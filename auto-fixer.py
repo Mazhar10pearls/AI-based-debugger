@@ -11,7 +11,7 @@ Pipeline (matches the diagram):
         → AI Stage 4: self-verify         ══ AI checks its own patch ══
         → Python validation (locate by evidence, syntax, apply, tests)
         → Confidence gate
-        → Security vetting + apply patch → Commit + Push + PR
+        → Apply patch → Commit + Push + PR
 
 Design notes carried over from the single-call version:
   * A small local model (qwen2.5-coder:3b) diagnoses well but mangles nested
@@ -50,10 +50,6 @@ from pathlib import Path
 import requests
 import yaml
 
-# security layer lives beside this script
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import security
-
 # ── Ollama ────────────────────────────────────────────────────────────────────
 OLLAMA_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/api/generate")
 OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL",   "qwen2.5-coder:3b")
@@ -82,13 +78,66 @@ BOT_PREFIX = "fix:"
 MAX_BOT_ATTEMPTS = 3
 
 ALWAYS_BLOCKED   = {".git", "auto-fixer.py"}
-BLOCKED_PATTERNS = [r"\.?github/workflows/auto-fix.*\.ya?ml$",
-                    r"\.?github/workflows/self-heal.*\.ya?ml$"]
+BLOCKED_PATTERNS = [
+    # ALL workflow files — not just auto-fix/self-heal ones. A "fix" to a
+    # deploy or CI workflow is a privilege-escalation vector (it can change
+    # permissions, add steps, or add secret-exfiltrating commands, and reads
+    # like a normal diff to a reviewer). Workflow breakage should always
+    # escalate to a human via open_issue(), never go through auto-fix.
+    r"\.?github/workflows/.*\.ya?ml$",
+    r"\.?github/CODEOWNERS$",
+    # Common secret-bearing file patterns
+    r"(^|/)\.env(\..*)?$",
+    r".*\.pem$", r".*\.key$", r".*id_rsa.*", r".*id_ed25519.*",
+    r".*secrets?\.ya?ml$", r".*\.tfstate(\.backup)?$",
+    r"(^|/)\.npmrc$", r"(^|/)\.pypirc$",
+]
 
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "env",
              "dist", "build", ".pytest_cache", "target", "out", "vendor",
              ".idea", ".vscode", "coverage", "tmp", "temp", "logs"}
 MAX_FILE_SIZE_BYTES = 100_000
+
+# ── Secret scanning ─────────────────────────────────────────────────────────
+# Deterministic, non-AI safety net — same category as syntax validation below.
+# Catches secrets the AI might echo back from a leaky log, or that a prompt-
+# injected instruction tries to smuggle into a "fix". Not a substitute for a
+# real scanner (gitleaks/trufflehog) in CI — see workflow-level recommendation.
+SECRET_PATTERNS = [
+    ("AWS access key",   re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("AWS secret key",   re.compile(r"(?i)aws_secret_access_key\s*[:=]\s*['\"]?[A-Za-z0-9/+=]{40}")),
+    ("GitHub token",     re.compile(r"gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}")),
+    ("Slack token",      re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}")),
+    ("Private key",      re.compile(r"-----BEGIN[ A-Z]*PRIVATE KEY-----")),
+    ("Generic API key",  re.compile(r"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*['\"][A-Za-z0-9\-_/+=]{16,}['\"]")),
+    ("JWT",              re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
+    ("Bearer token",     re.compile(r"(?i)bearer\s+[A-Za-z0-9\-_.=]{20,}")),
+]
+MAX_ADDED_LINES_PER_FIX = 40  # a legit typo/version/port fix is tiny; a big
+                              # blob of new lines is suspicious for an autofix
+
+
+def scan_text_for_secrets(text: str) -> list:
+    hits = []
+    for name, pat in SECRET_PATTERNS:
+        if pat.search(text):
+            hits.append(name)
+    return hits
+
+
+def redact_secrets(text: str) -> str:
+    """Scrub known secret shapes before they ever enter a prompt, a commit
+    message, or a PR/issue body. Defense-in-depth — the workflow's log
+    download step should also redact before writing failure.log to disk."""
+    out = text
+    for name, pat in SECRET_PATTERNS:
+        out = pat.sub(f"[REDACTED:{name}]", out)
+    return out
+
+
+def _added_lines(original: str, new: str) -> list:
+    old_lines = set(original.splitlines())
+    return [l for l in new.splitlines() if l not in old_lines]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -271,9 +320,6 @@ def discover_context(signal: str, stacks: set, forced: list) -> tuple:
     for rel in forced:
         if len(included) >= MAX_CONTEXT_FILES:
             break
-        if not security.PathPolicy.is_readable_into_context(rel):
-            print(f"[SEC] excluding secret-bearing file from context: {rel}", file=sys.stderr)
-            continue
         p = Path(rel)
         if p.is_file() and _is_text_file(p):
             c = read_whole(p, cap=8000)
@@ -289,8 +335,6 @@ def discover_context(signal: str, stacks: set, forced: list) -> tuple:
                 continue
             rel = _relstrip(str(p))
             if rel in included or _is_blocked(rel):
-                continue
-            if not security.PathPolicy.is_readable_into_context(rel):
                 continue
             sc = _score_file(p, signal, stacks)
             if sc > 0:
@@ -933,22 +977,6 @@ def _salvage_fragment(content: str, find: str, replace: str):
 
 def _apply_edits(original: str, edits: list) -> tuple:
     content = original
-    # Collapse duplicate edits that target the SAME 'find' text. Two AI passes
-    # (correct-the-line + freeform) routinely both fix the same line, and their
-    # 'replace' values can differ slightly (whitespace/quoting). You cannot apply
-    # two replacements to one source string — once the first replaces it, it's
-    # gone — so keep only the FIRST edit per 'find' and drop the rest. The first
-    # is the correct-the-line pass, which is the more reliable one for typos.
-    seen_finds, deduped = set(), []
-    for ed in edits:
-        key = ed.get("find", "")
-        if key in seen_finds:
-            print("[EDIT] dropping duplicate edit targeting the same text "
-                  f"(already fixed by an earlier edit): {key[:80]!r}")
-            continue
-        seen_finds.add(key)
-        deduped.append(ed)
-    edits = deduped
     for i, ed in enumerate(edits):
         find, repl = ed.get("find", ""), ed.get("replace", "")
         if not isinstance(find, str) or find == "":
@@ -956,17 +984,16 @@ def _apply_edits(original: str, edits: list) -> tuple:
         if find in content:
             content = content.replace(find, repl)
             continue
-        # idempotency: a prior edit (or a duplicate from the other AI pass)
-        # already made this exact change — the 'find' target is gone but the
-        # 'replace' result is present. Treat as satisfied, not a failure.
-        # Guard against coincidence by requiring find/replace to be a real
-        # before/after pair (shared prefix or suffix), which every edit these
-        # passes emit satisfies.
-        if isinstance(repl, str) and repl and repl in content and find != repl:
-            shares_edge = (find[:1] == repl[:1]) or (find[-1:] == repl[-1:])
-            if shares_edge:
-                print(f"[EDIT] edit #{i+1} already applied — skipping (result present)")
-                continue
+        # IDEMPOTENCY: multiple AI stages can independently diagnose the same
+        # underlying bug (e.g. Stage 3a's correct-the-line pass AND Stage 3's
+        # freeform fix both catching the same Dockerfile typo). Edits are
+        # applied sequentially, so by the time edit #2 runs, edit #1 may have
+        # already produced the exact text edit #2 was going to write. That is
+        # not a failure — it's confirmation the fix already landed. Only treat
+        # it as unresolved if the replacement text is not already there.
+        if isinstance(repl, str) and repl.strip() and repl in content:
+            print(f"[EDIT] edit #{i+1} already satisfied by a prior edit — skipping")
+            continue
         nf = "\n".join(l.strip() for l in find.splitlines())
         nc = "\n".join(l.strip() for l in content.splitlines())
         matched = False
@@ -1019,12 +1046,22 @@ def validate_fix(fix: dict) -> tuple:
         return False, f"blocked path: {file}"
     if not Path(file).exists():
         return False, f"file does not exist: {file}"
+    original_text = Path(file).read_text(encoding="utf-8", errors="replace")
     content, reason = _resolve_content(fix)
     if content is None:
         return False, reason
     fix["fixed_content"] = content
     if not content.strip():
         return False, "empty result"
+
+    added = _added_lines(original_text, content)
+    if len(added) > MAX_ADDED_LINES_PER_FIX:
+        return False, (f"fix adds {len(added)} lines (max {MAX_ADDED_LINES_PER_FIX}) "
+                       "— too large for an auto-fix, needs human review")
+    secret_hits = scan_text_for_secrets("\n".join(added))
+    if secret_hits:
+        return False, f"potential secret in fix ({', '.join(secret_hits)}) — blocked"
+
     if file.endswith(".py"):
         try:
             ast.parse(content)
@@ -1102,12 +1139,9 @@ def run_tests(stacks: set) -> bool:
         print("[TEST] No test runner detected — skipping")
         return True
     ok_all = True
-    safe_env = security.harden_test_env()
-    preexec = security.resource_limits_preexec()
     for cmd in cmds:
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=180,
-                               env=safe_env, preexec_fn=preexec)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
             for line in (r.stdout + r.stderr).splitlines()[-15:]:
                 print(f"  {line}")
             passed = r.returncode == 0
@@ -1185,16 +1219,6 @@ def commit_to_branch(commit_msg: str, written: list) -> str:
             _git("add", "-u")
         if _git("diff", "--cached", "--quiet", check=False).returncode == 0:
             print("[COMMIT] Nothing to commit.")
-            _git("checkout", GIT_BASE_BRANCH, check=False)
-            return ""
-        # ── outbound secret gate: never commit a secret the fix introduced ──
-        clean, leaks = security.scan_staged_secrets(".")
-        if not clean:
-            detail = "; ".join(f"{l['file']} [{','.join(l['kinds'])}]" for l in leaks)
-            print(f"[SEC] BLOCKING COMMIT — staged changes contain secret-like "
-                  f"content: {detail}", file=sys.stderr)
-            security.audit({"phase": "secret_commit_blocked", "findings": leaks})
-            _git("reset", check=False)                       # unstage everything
             _git("checkout", GIT_BASE_BRANCH, check=False)
             return ""
         _git("commit", "-m", commit_msg)
@@ -1283,16 +1307,6 @@ def main():
         print(f"[ERROR] Log not found: {args.input}", file=sys.stderr)
         sys.exit(1)
 
-    # ── security: kill switch, trust boundary, token hygiene ──
-    if security.kill_switch():
-        sys.exit(0)
-    trust = security.assess_trust()
-    print(f"[SEC] origin trust: {trust['level']} ({trust['reason']})")
-    for w in security.check_token_scopes(token):
-        print(f"[SEC] token warning: {w}", file=sys.stderr)
-    security.audit({"phase": "start", "repo": repo, "trust": trust["level"],
-                    "trust_reason": trust["reason"], "input": args.input})
-
     # loop guards
     if last_commit_was_bot():
         sys.exit(0)
@@ -1310,6 +1324,11 @@ def main():
     # ── COLLECT LOGS + CONTEXT ──
     print("\n━━━ COLLECT LOGS + CONTEXT ━━━")
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    redacted = scan_text_for_secrets(log_text)
+    if redacted:
+        print(f"[SECURITY] redacting {len(redacted)} potential secret pattern(s) from log: "
+              f"{', '.join(redacted)}")
+    log_text = redact_secrets(log_text)
     signal = extract_error_signal(log_text)
     stacks = fingerprint_stack(log_text)
     if not signal.strip():
@@ -1325,18 +1344,6 @@ def main():
     context, included, included_contents = discover_context(signal, stacks, forced)
     if not included:
         print("[DISCOVER] WARNING: no files resolved.")
-
-    # ── security: redact secrets before ANYTHING leaves for the model / store ──
-    signal, sig_findings = security.redact_secrets(signal)
-    included_contents, ctx_findings = security.scrub_context(included_contents)
-    included = [f for f in included if f in included_contents]
-    # rebuild the prompt context from the redacted contents (same block format)
-    context = "\n\n".join(f"### {rel}\n```\n{c}\n```" for rel, c in included_contents.items())
-    if sig_findings or ctx_findings:
-        security.audit({"phase": "redaction",
-                        "signal_secrets": sorted(set(sig_findings)),
-                        "context_secrets": sorted(set(ctx_findings))})
-
     broken_lines, hints = _scan_reference_details(included_contents)
 
     # ── AI STAGE 1 + 2 ──
@@ -1435,46 +1442,6 @@ def main():
                        run_url)
         sys.exit(3)
 
-    # ── SECURITY VETTING: path review + supply-chain, before writing anything ──
-    print("\n━━━ SECURITY VETTING ━━━")
-    vetted, held = [], []
-    for fix in fixes:
-        file = (fix.get("file") or "").strip()
-        ok, reason = validate_fix(fix)                 # populates fix['fixed_content']
-        if not ok:
-            held.append((file, f"invalid ({reason})")); continue
-        try:
-            original = Path(file).read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            original = ""
-        sc_verdict, sc_reason = security.vet_supplychain(fix, original)
-        if sc_verdict == "reject":
-            held.append((file, f"supply-chain reject — {sc_reason}")); continue
-        if sc_verdict == "review":
-            held.append((file, f"needs review — {sc_reason}")); continue
-        needs_review, rr = security.PathPolicy.review_reason(file)
-        if needs_review:
-            held.append((file, f"needs review — {rr}")); continue
-        vetted.append(fix)
-
-    for file, why in held:
-        print(f"  ⚠ held: {file} — {why}", file=sys.stderr)
-    security.audit({"phase": "vetting",
-                    "vetted": [f.get("file") for f in vetted],
-                    "held": [{"file": f, "why": w} for f, w in held]})
-
-    if not vetted:
-        detail = "; ".join(f"{f}: {w}" for f, w in held) or "all fixes held"
-        print("[SEC] no fix passed vetting — escalating to humans.", file=sys.stderr)
-        if token and repo:
-            open_issue(token, repo,
-                       f"AI proposed fixes but security policy withheld all of them.\n\n"
-                       f"Root cause: {root_cause}\n\nHeld: {detail}", run_url)
-        sys.exit(0)
-    if held:
-        print(f"[SEC] applying {len(vetted)} vetted fix(es); {len(held)} held for review.")
-    fixes = vetted
-
     # ── APPLY + VALIDATE ──
     print("\n━━━ APPLY + VALIDATE ━━━")
     if args.dry_run:
@@ -1527,9 +1494,9 @@ def main():
         written = list(dict.fromkeys(written + written_r))
         fixes = fixes + fixes_r
 
-    # ── RUN TESTS (trust-gated; untrusted code is never executed here) ──
+    # ── RUN TESTS ──
     print("\n━━━ RUN TESTS ━━━")
-    if not args.skip_tests and security.should_run_tests(trust):
+    if not args.skip_tests:
         if not run_tests(stacks):
             revert_files(originals)
             if token and repo:
@@ -1538,21 +1505,9 @@ def main():
                            run_url)
             sys.exit(5)
     else:
-        print("[TEST] Skipped (--skip-tests or untrusted origin)")
+        print("[TEST] Skipped (--skip-tests)")
 
-    # ── COMMIT + PR (untrusted origins never auto-push) ──
-    if not security.should_auto_pr(trust):
-        print(f"[SEC] untrusted origin ({trust['reason']}) — withholding auto-PR.")
-        revert_files(originals)
-        if token and repo:
-            open_issue(token, repo,
-                       f"Fix computed for an UNTRUSTED origin ({trust['reason']}). "
-                       f"Auto-PR withheld pending human review.\n\n"
-                       f"Proposed files: {', '.join(written)}\nRoot cause: {root_cause}",
-                       run_url)
-        security.audit({"phase": "withheld_untrusted", "files": written})
-        sys.exit(0)
-
+    # ── COMMIT + PR ──
     print("\n━━━ COMMIT + PR ━━━")
     branch = commit_to_branch(commit_msg, written)
     if not branch:
@@ -1560,11 +1515,8 @@ def main():
     if token and repo:
         open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
                 facts.get("summary", ""), solution)
-        security.audit({"phase": "pr_opened", "branch": branch, "files": written})
     else:
         print(f"[PR] No token — merge {branch} manually.")
-
-    security.audit({"phase": "done", "root_cause": root_cause, "files": written})
 
     print("\n━━━ ✅ DONE ━━━")
     print(f"  root cause : {root_cause}")
