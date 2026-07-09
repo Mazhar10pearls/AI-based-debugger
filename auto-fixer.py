@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
-Self-Healing CI/CD Auto-Fixer — RAG + staged-AI flow.
+Self-Healing CI/CD Auto-Fixer — staged-AI flow.
 
 Pipeline (matches the diagram):
 
     Collect logs + repo context (Python)
-        → Retrieve similar historical failures  ══ RAG: embed signal, top-k ══
         → AI Stage 1: extract facts
         → AI Stage 2: determine root cause (+ confidence)
         → AI Stage 3: generate fix        ══ flat issues: evidence → corrected ══
         → AI Stage 4: self-verify         ══ AI checks its own patch ══
         → Python validation (locate by evidence, syntax, apply, tests)
         → Confidence gate
-        → Apply patch → Commit + Push + PR
-        → Store the successful case for future retrieval
+        → Security vetting + apply patch → Commit + Push + PR
 
 Design notes carried over from the single-call version:
   * A small local model (qwen2.5-coder:3b) diagnoses well but mangles nested
@@ -33,14 +31,6 @@ Why staged instead of one call:
     FAST_MODE=1        → collapse Stage 1+2 into one call
     SKIP_SELF_VERIFY=1 → drop Stage 4 (Python validation is still the hard gate)
 
-Why RAG:
-  Priming Stage 2/3 with concrete past (root_cause, evidence→corrected) pairs
-  for a similar signal measurably steadies a 3B on failures it has seen before.
-  Memory lives OUTSIDE the checked-out repo so it survives across runs on a
-  self-hosted runner (default ~/.ai-fixer/memory.jsonl, override AI_FIXER_HOME).
-  If the embedding model is unavailable, retrieval degrades to "no context"
-  and the pipeline runs exactly as the non-RAG version did.
-
 Exit codes:
   0 success / nothing to do   2 AI failed        4 git failed
   1 log not found             3 no valid fix     5 tests failed (reverted)
@@ -50,7 +40,6 @@ import argparse
 import ast
 import difflib
 import json
-import math
 import os
 import re
 import subprocess
@@ -61,10 +50,13 @@ from pathlib import Path
 import requests
 import yaml
 
+# security layer lives beside this script
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import security
+
 # ── Ollama ────────────────────────────────────────────────────────────────────
 OLLAMA_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/api/generate")
 OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL",   "qwen2.5-coder:3b")
-EMBED_MODEL    = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 AI_TIMEOUT     = 210
 MAX_RETRIES    = 2
 RETRY_BACKOFF  = [20, 20]
@@ -73,14 +65,6 @@ MAX_AI_ROUNDS  = 3
 # staged-flow toggles
 FAST_MODE        = os.environ.get("FAST_MODE", "").lower() in ("1", "true", "yes")
 SKIP_SELF_VERIFY = os.environ.get("SKIP_SELF_VERIFY", "").lower() in ("1", "true", "yes")
-
-# ── RAG memory ────────────────────────────────────────────────────────────────
-AI_FIXER_HOME = Path(os.environ.get("AI_FIXER_HOME", os.path.expanduser("~/.ai-fixer")))
-MEMORY_PATH   = AI_FIXER_HOME / "memory.jsonl"
-RAG_TOP_K     = int(os.environ.get("RAG_TOP_K", "3"))
-RAG_MIN_SIM   = float(os.environ.get("RAG_MIN_SIM", "0.72"))
-RAG_MAX_CASES = int(os.environ.get("RAG_MAX_CASES", "500"))   # cap store growth
-RAG_ENABLED   = os.environ.get("RAG_ENABLED", "1").lower() not in ("0", "false", "no")
 
 # ── Prompt / context budget ───────────────────────────────────────────────────
 MAX_ERROR_LINES   = 14
@@ -158,23 +142,6 @@ def fingerprint_stack(log_text: str) -> set:
     stacks = {s for s, sig in TECH_STACK_SIGNALS.items() if any(x in low for x in sig)}
     print(f"[DETECT] Tech stacks: {stacks or {'unknown'}}")
     return stacks
-
-
-def normalize_signal(signal: str) -> str:
-    """
-    Canonicalize an error signal for RAG: strip volatile bits (timestamps,
-    line/column numbers, hex ids, temp paths) so the SAME class of failure
-    embeds close together regardless of run-specific noise. Used both as the
-    embedding input and as the dedup key when storing a case.
-    """
-    s = signal.lower()
-    s = re.sub(r'\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2}:\d{2}\S*', ' ', s)  # timestamps
-    s = re.sub(r'0x[0-9a-f]+', ' ', s)                                # hex ids
-    s = re.sub(r':\d+(?::\d+)?', ':', s)                              # :line:col
-    s = re.sub(r'/tmp/\S+', ' ', s)                                   # temp paths
-    s = re.sub(r'\b[0-9a-f]{7,40}\b', ' ', s)                         # sha-ish
-    s = re.sub(r'\s+', ' ', s).strip()
-    return s[:1200]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -304,6 +271,9 @@ def discover_context(signal: str, stacks: set, forced: list) -> tuple:
     for rel in forced:
         if len(included) >= MAX_CONTEXT_FILES:
             break
+        if not security.PathPolicy.is_readable_into_context(rel):
+            print(f"[SEC] excluding secret-bearing file from context: {rel}", file=sys.stderr)
+            continue
         p = Path(rel)
         if p.is_file() and _is_text_file(p):
             c = read_whole(p, cap=8000)
@@ -319,6 +289,8 @@ def discover_context(signal: str, stacks: set, forced: list) -> tuple:
                 continue
             rel = _relstrip(str(p))
             if rel in included or _is_blocked(rel):
+                continue
+            if not security.PathPolicy.is_readable_into_context(rel):
                 continue
             sc = _score_file(p, signal, stacks)
             if sc > 0:
@@ -394,116 +366,6 @@ def _scan_reference_details(included_contents: dict) -> tuple:
     if hint:
         print(f"[DISCOVER] Static reference hints:\n{hint}")
     return broken, hint
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# RAG — embed + memory store  (new)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _embed_endpoint():
-    base = re.sub(r"/(v1|api)/.*$", "", OLLAMA_API_URL.rstrip("/"))
-    return f"{base}/api/embeddings", f"{base}/api/embed"
-
-
-def embed_text(text: str):
-    """Return an embedding vector for `text`, or None if embeddings are off/unavailable.
-    Handles both the legacy /api/embeddings ({'embedding': [...]}) and the newer
-    /api/embed ({'embeddings': [[...]]}) Ollama shapes."""
-    if not RAG_ENABLED or not text.strip():
-        return None
-    legacy, modern = _embed_endpoint()
-    for url, key in ((legacy, "embedding"), (modern, "embeddings")):
-        try:
-            r = requests.post(url, json={"model": EMBED_MODEL, "prompt": text,
-                                         "input": text}, timeout=(10, 60))
-            if r.status_code != 200:
-                continue
-            body = r.json()
-            vec = body.get(key)
-            if key == "embeddings" and isinstance(vec, list) and vec and isinstance(vec[0], list):
-                vec = vec[0]
-            if isinstance(vec, list) and vec and all(isinstance(x, (int, float)) for x in vec):
-                return [float(x) for x in vec]
-        except Exception:
-            continue
-    print("[RAG] embedding unavailable — running without retrieved context", file=sys.stderr)
-    return None
-
-
-def _cosine(a, b) -> float:
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a))
-    nb = math.sqrt(sum(y * y for y in b))
-    return dot / (na * nb) if na and nb else 0.0
-
-
-class MemoryStore:
-    """Append-only JSONL of solved cases with embeddings. Cosine search in pure
-    Python — fine for the small corpora a single repo accumulates."""
-
-    def __init__(self, path: Path):
-        self.path = path
-        self.records = []
-        if path.is_file():
-            try:
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if line:
-                        self.records.append(json.loads(line))
-            except Exception as exc:
-                print(f"[RAG] could not read memory ({exc}) — starting empty", file=sys.stderr)
-        print(f"[RAG] memory: {len(self.records)} stored case(s) at {path}")
-
-    def search(self, query_vec, k=RAG_TOP_K, threshold=RAG_MIN_SIM):
-        if not query_vec:
-            return []
-        scored = []
-        for rec in self.records:
-            sim = _cosine(query_vec, rec.get("embedding", []))
-            if sim >= threshold:
-                scored.append((sim, rec))
-        scored.sort(key=lambda x: -x[0])
-        return scored[:k]
-
-    def add(self, record: dict):
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            # dedup: same normalized signature already stored → skip
-            sig = record.get("sig", "")
-            if sig and any(r.get("sig") == sig for r in self.records):
-                print("[RAG] case already stored — not duplicating")
-                return
-            with self.path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-            self.records.append(record)
-            # trim oldest if we exceed the cap (rewrite tail)
-            if len(self.records) > RAG_MAX_CASES:
-                self.records = self.records[-RAG_MAX_CASES:]
-                self.path.write_text(
-                    "\n".join(json.dumps(r, ensure_ascii=False) for r in self.records) + "\n",
-                    encoding="utf-8")
-            print(f"[RAG] stored case (memory now {len(self.records)})")
-        except Exception as exc:
-            print(f"[RAG] failed to store case: {exc}", file=sys.stderr)
-
-
-def format_retrieved(matches) -> str:
-    """Render top-k matches into a compact prompt block of concrete past fixes."""
-    if not matches:
-        return ""
-    out = []
-    for i, (sim, rec) in enumerate(matches, 1):
-        rc = (rec.get("root_cause") or "").strip()
-        line = f"{i}. (similarity {sim:.2f}) root cause: {rc[:160]}"
-        for iss in (rec.get("issues") or [])[:2]:
-            ev = (iss.get("evidence") or "")[:70]
-            co = (iss.get("corrected") or "")[:70]
-            if ev and co:
-                line += f"\n   fix: {ev!r} → {co!r}"
-        out.append(line)
-    return "\n".join(out)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -634,17 +496,15 @@ def repo_file_list(limit: int = 200) -> str:
     return ", ".join(files) if files else "(none found)"
 
 
-def _context_block(signal, context, stacks, hints, retrieved):
+def _context_block(signal, context, stacks, hints):
     repo_files = repo_file_list()
     hints_section = (f"## Static reference check (verify each — not authoritative):\n{hints}\n"
                      if hints else "")
-    rag_section = (f"## Similar past failures (for reference — verify against THIS repo):\n"
-                   f"{retrieved}\n" if retrieved else "")
     return (
         f"## Tech stack: {', '.join(sorted(stacks)) or 'unknown'}\n"
         f"## CI failure (key lines):\n```\n{signal}\n```\n"
         f"## Repo files (these exist — anything referenced but NOT here is a typo):\n{repo_files}\n"
-        f"{rag_section}{hints_section}"
+        f"{hints_section}"
         f"## File contents (you may ONLY edit these):\n{context}"
     )
 
@@ -681,9 +541,9 @@ Output ONLY one JSON object. No markdown fences. Start with { end with }.
 Copy tokens EXACTLY from the log and file contents. Do not invent files or symbols."""
 
 
-def ai_extract_facts(signal, context, stacks, hints, retrieved) -> dict:
+def ai_extract_facts(signal, context, stacks, hints) -> dict:
     def rebuild(ctx):
-        return _context_block(signal, ctx, stacks, hints, retrieved) + \
+        return _context_block(signal, ctx, stacks, hints) + \
                "\n\nExtract the facts as JSON."
     prompt = _cap_prompt(FACTS_SYSTEM, rebuild(context), context, rebuild)
     raw = _stream_ollama(prompt, FACTS_SCHEMA, num_predict=800,
@@ -720,13 +580,13 @@ contents, state the ROOT CAUSE. Do NOT write the fix yet. Output ONLY one JSON o
 Set confidence below 0.5 if the facts do not clearly pin a single cause."""
 
 
-def ai_root_cause(facts, signal, context, stacks, hints, retrieved) -> dict:
+def ai_root_cause(facts, signal, context, stacks, hints) -> dict:
     facts_line = (f"## Extracted facts:\nerror_type={facts.get('error_type')}; "
                   f"failing_files={facts.get('failing_files')}; "
                   f"key_symbols={facts.get('key_symbols')}; "
                   f"summary={facts.get('summary')}\n")
     def rebuild(ctx):
-        return facts_line + _context_block(signal, ctx, stacks, hints, retrieved) + \
+        return facts_line + _context_block(signal, ctx, stacks, hints) + \
                "\n\nGive root cause as JSON."
     prompt = _cap_prompt(CAUSE_SYSTEM, rebuild(context), context, rebuild)
     raw = _stream_ollama(prompt, CAUSE_SCHEMA, num_predict=700,
@@ -743,7 +603,7 @@ def ai_root_cause(facts, signal, context, stacks, hints, retrieved) -> dict:
     return data
 
 
-def ai_facts_and_cause(signal, context, stacks, hints, retrieved) -> tuple:
+def ai_facts_and_cause(signal, context, stacks, hints) -> tuple:
     """FAST_MODE: one call producing facts + cause together."""
     schema = {"type": "object", "properties": {
         **FACTS_SCHEMA["properties"], **CAUSE_SCHEMA["properties"]},
@@ -756,7 +616,7 @@ def ai_facts_and_cause(signal, context, stacks, hints, retrieved) -> tuple:
               '"summary":"...","root_cause":"...","solution":"...",'
               '"confidence":0.0-1.0,"commit_message":"fix: short"}')
     def rebuild(ctx):
-        return _context_block(signal, ctx, stacks, hints, retrieved) + \
+        return _context_block(signal, ctx, stacks, hints) + \
                "\n\nRespond with the combined JSON."
     prompt = _cap_prompt(system, rebuild(context), context, rebuild)
     raw = _stream_ollama(prompt, schema, num_predict=1000, temperature=0.05, tag="S1S2")
@@ -825,13 +685,13 @@ RULES:
 - Only files with a ### header may be fixed."""
 
 
-def ai_generate_fix(facts, cause, signal, context, stacks, hints, retrieved) -> list:
+def ai_generate_fix(facts, cause, signal, context, stacks, hints) -> list:
     ctx_line = (f"## Root cause (already determined): {cause.get('root_cause')}\n"
                 f"## Solution direction: {cause.get('solution')}\n"
                 f"## Facts: error_type={facts.get('error_type')}, "
                 f"symbols={facts.get('key_symbols')}\n")
     def rebuild(ctx):
-        return ctx_line + _context_block(signal, ctx, stacks, hints, retrieved) + \
+        return ctx_line + _context_block(signal, ctx, stacks, hints) + \
                "\n\nEmit the issues JSON."
     prompt = _cap_prompt(FIX_SYSTEM, rebuild(context), context, rebuild)
     raw = _stream_ollama(prompt, FIX_SCHEMA, num_predict=2800,
@@ -1080,6 +940,17 @@ def _apply_edits(original: str, edits: list) -> tuple:
         if find in content:
             content = content.replace(find, repl)
             continue
+        # idempotency: a prior edit (or a duplicate from the other AI pass)
+        # already made this exact change — the 'find' target is gone but the
+        # 'replace' result is present. Treat as satisfied, not a failure.
+        # Guard against coincidence by requiring find/replace to be a real
+        # before/after pair (shared prefix or suffix), which every edit these
+        # passes emit satisfies.
+        if isinstance(repl, str) and repl and repl in content and find != repl:
+            shares_edge = (find[:1] == repl[:1]) or (find[-1:] == repl[-1:])
+            if shares_edge:
+                print(f"[EDIT] edit #{i+1} already applied — skipping (result present)")
+                continue
         nf = "\n".join(l.strip() for l in find.splitlines())
         nc = "\n".join(l.strip() for l in content.splitlines())
         matched = False
@@ -1215,9 +1086,12 @@ def run_tests(stacks: set) -> bool:
         print("[TEST] No test runner detected — skipping")
         return True
     ok_all = True
+    safe_env = security.harden_test_env()
+    preexec = security.resource_limits_preexec()
     for cmd in cmds:
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=180,
+                               env=safe_env, preexec_fn=preexec)
             for line in (r.stdout + r.stderr).splitlines()[-15:]:
                 print(f"  {line}")
             passed = r.returncode == 0
@@ -1297,6 +1171,16 @@ def commit_to_branch(commit_msg: str, written: list) -> str:
             print("[COMMIT] Nothing to commit.")
             _git("checkout", GIT_BASE_BRANCH, check=False)
             return ""
+        # ── outbound secret gate: never commit a secret the fix introduced ──
+        clean, leaks = security.scan_staged_secrets(".")
+        if not clean:
+            detail = "; ".join(f"{l['file']} [{','.join(l['kinds'])}]" for l in leaks)
+            print(f"[SEC] BLOCKING COMMIT — staged changes contain secret-like "
+                  f"content: {detail}", file=sys.stderr)
+            security.audit({"phase": "secret_commit_blocked", "findings": leaks})
+            _git("reset", check=False)                       # unstage everything
+            _git("checkout", GIT_BASE_BRANCH, check=False)
+            return ""
         _git("commit", "-m", commit_msg)
         _git("push", "-u", "origin", branch)
         print(f"[GIT] Pushed {branch}")
@@ -1368,7 +1252,7 @@ def open_issue(token, repo, reason, run_url=""):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    ap = argparse.ArgumentParser(description="AI CI/CD auto-fixer (RAG + staged)")
+    ap = argparse.ArgumentParser(description="AI CI/CD auto-fixer (staged)")
     ap.add_argument("--input", required=True, help="Path to CI failure log")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--skip-tests", action="store_true")
@@ -1382,6 +1266,16 @@ def main():
     if not log_path.is_file():
         print(f"[ERROR] Log not found: {args.input}", file=sys.stderr)
         sys.exit(1)
+
+    # ── security: kill switch, trust boundary, token hygiene ──
+    if security.kill_switch():
+        sys.exit(0)
+    trust = security.assess_trust()
+    print(f"[SEC] origin trust: {trust['level']} ({trust['reason']})")
+    for w in security.check_token_scopes(token):
+        print(f"[SEC] token warning: {w}", file=sys.stderr)
+    security.audit({"phase": "start", "repo": repo, "trust": trust["level"],
+                    "trust_reason": trust["reason"], "input": args.input})
 
     # loop guards
     if last_commit_was_bot():
@@ -1415,26 +1309,28 @@ def main():
     context, included, included_contents = discover_context(signal, stacks, forced)
     if not included:
         print("[DISCOVER] WARNING: no files resolved.")
-    broken_lines, hints = _scan_reference_details(included_contents)
 
-    # ── RAG RETRIEVE ──
-    print("\n━━━ RAG RETRIEVE ━━━")
-    norm_sig = normalize_signal(signal)
-    query_vec = embed_text(norm_sig)
-    store = MemoryStore(MEMORY_PATH) if RAG_ENABLED else None
-    matches = store.search(query_vec) if store else []
-    retrieved = format_retrieved(matches)
-    if retrieved:
-        print(f"[RAG] {len(matches)} similar case(s) retrieved")
+    # ── security: redact secrets before ANYTHING leaves for the model / store ──
+    signal, sig_findings = security.redact_secrets(signal)
+    included_contents, ctx_findings = security.scrub_context(included_contents)
+    included = [f for f in included if f in included_contents]
+    # rebuild the prompt context from the redacted contents (same block format)
+    context = "\n\n".join(f"### {rel}\n```\n{c}\n```" for rel, c in included_contents.items())
+    if sig_findings or ctx_findings:
+        security.audit({"phase": "redaction",
+                        "signal_secrets": sorted(set(sig_findings)),
+                        "context_secrets": sorted(set(ctx_findings))})
+
+    broken_lines, hints = _scan_reference_details(included_contents)
 
     # ── AI STAGE 1 + 2 ──
     print("\n━━━ AI STAGE 1: FACTS / STAGE 2: ROOT CAUSE ━━━")
     try:
         if FAST_MODE:
-            facts, cause = ai_facts_and_cause(signal, context, stacks, hints, retrieved)
+            facts, cause = ai_facts_and_cause(signal, context, stacks, hints)
         else:
-            facts = ai_extract_facts(signal, context, stacks, hints, retrieved)
-            cause = ai_root_cause(facts, signal, context, stacks, hints, retrieved)
+            facts = ai_extract_facts(signal, context, stacks, hints)
+            cause = ai_root_cause(facts, signal, context, stacks, hints)
     except Exception as exc:
         print(f"[ERROR] AI stage 1/2 failed: {exc}", file=sys.stderr)
         if token and repo:
@@ -1469,7 +1365,7 @@ def main():
     # ── AI STAGE 3b: freeform diagnosis fix ──
     print("\n━━━ AI STAGE 3: GENERATE FIX ━━━")
     try:
-        issues = ai_generate_fix(facts, cause, signal, context, stacks, hints, retrieved)
+        issues = ai_generate_fix(facts, cause, signal, context, stacks, hints)
     except Exception as exc:
         print(f"[ERROR] AI stage 3 failed: {exc}", file=sys.stderr)
         if token and repo:
@@ -1523,6 +1419,46 @@ def main():
                        run_url)
         sys.exit(3)
 
+    # ── SECURITY VETTING: path review + supply-chain, before writing anything ──
+    print("\n━━━ SECURITY VETTING ━━━")
+    vetted, held = [], []
+    for fix in fixes:
+        file = (fix.get("file") or "").strip()
+        ok, reason = validate_fix(fix)                 # populates fix['fixed_content']
+        if not ok:
+            held.append((file, f"invalid ({reason})")); continue
+        try:
+            original = Path(file).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            original = ""
+        sc_verdict, sc_reason = security.vet_supplychain(fix, original)
+        if sc_verdict == "reject":
+            held.append((file, f"supply-chain reject — {sc_reason}")); continue
+        if sc_verdict == "review":
+            held.append((file, f"needs review — {sc_reason}")); continue
+        needs_review, rr = security.PathPolicy.review_reason(file)
+        if needs_review:
+            held.append((file, f"needs review — {rr}")); continue
+        vetted.append(fix)
+
+    for file, why in held:
+        print(f"  ⚠ held: {file} — {why}", file=sys.stderr)
+    security.audit({"phase": "vetting",
+                    "vetted": [f.get("file") for f in vetted],
+                    "held": [{"file": f, "why": w} for f, w in held]})
+
+    if not vetted:
+        detail = "; ".join(f"{f}: {w}" for f, w in held) or "all fixes held"
+        print("[SEC] no fix passed vetting — escalating to humans.", file=sys.stderr)
+        if token and repo:
+            open_issue(token, repo,
+                       f"AI proposed fixes but security policy withheld all of them.\n\n"
+                       f"Root cause: {root_cause}\n\nHeld: {detail}", run_url)
+        sys.exit(0)
+    if held:
+        print(f"[SEC] applying {len(vetted)} vetted fix(es); {len(held)} held for review.")
+    fixes = vetted
+
     # ── APPLY + VALIDATE ──
     print("\n━━━ APPLY + VALIDATE ━━━")
     if args.dry_run:
@@ -1575,9 +1511,9 @@ def main():
         written = list(dict.fromkeys(written + written_r))
         fixes = fixes + fixes_r
 
-    # ── RUN TESTS ──
+    # ── RUN TESTS (trust-gated; untrusted code is never executed here) ──
     print("\n━━━ RUN TESTS ━━━")
-    if not args.skip_tests:
+    if not args.skip_tests and security.should_run_tests(trust):
         if not run_tests(stacks):
             revert_files(originals)
             if token and repo:
@@ -1586,9 +1522,21 @@ def main():
                            run_url)
             sys.exit(5)
     else:
-        print("[TEST] Skipped (--skip-tests)")
+        print("[TEST] Skipped (--skip-tests or untrusted origin)")
 
-    # ── COMMIT + PR ──
+    # ── COMMIT + PR (untrusted origins never auto-push) ──
+    if not security.should_auto_pr(trust):
+        print(f"[SEC] untrusted origin ({trust['reason']}) — withholding auto-PR.")
+        revert_files(originals)
+        if token and repo:
+            open_issue(token, repo,
+                       f"Fix computed for an UNTRUSTED origin ({trust['reason']}). "
+                       f"Auto-PR withheld pending human review.\n\n"
+                       f"Proposed files: {', '.join(written)}\nRoot cause: {root_cause}",
+                       run_url)
+        security.audit({"phase": "withheld_untrusted", "files": written})
+        sys.exit(0)
+
     print("\n━━━ COMMIT + PR ━━━")
     branch = commit_to_branch(commit_msg, written)
     if not branch:
@@ -1596,29 +1544,11 @@ def main():
     if token and repo:
         open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
                 facts.get("summary", ""), solution)
+        security.audit({"phase": "pr_opened", "branch": branch, "files": written})
     else:
         print(f"[PR] No token — merge {branch} manually.")
 
-    # ── STORE SUCCESSFUL CASE (RAG write-back) ──
-    if store is not None and query_vec is not None:
-        print("\n━━━ STORE CASE IN RAG MEMORY ━━━")
-        stored_issues = [{"file": it.get("file", ""),
-                          "problem": (it.get("problem") or "")[:200],
-                          "evidence": (it.get("evidence") or "")[:200],
-                          "corrected": (it.get("corrected") or "")[:200]}
-                         for it in issues if it.get("evidence") and it.get("corrected")]
-        store.add({
-            "sig": norm_sig,
-            "embedding": query_vec,
-            "stacks": sorted(stacks),
-            "error_type": facts.get("error_type", ""),
-            "root_cause": root_cause,
-            "solution": solution,
-            "issues": stored_issues,
-            "files_changed": written,
-            "confidence": combined,
-            "ts": int(time.time()),
-        })
+    security.audit({"phase": "done", "root_cause": root_cause, "files": written})
 
     print("\n━━━ ✅ DONE ━━━")
     print(f"  root cause : {root_cause}")

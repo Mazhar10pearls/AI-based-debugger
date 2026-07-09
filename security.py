@@ -1,46 +1,71 @@
 #!/usr/bin/env python3
 """
-security.py — enterprise controls for the AI CI/CD auto-fixer.
+security.py — breach controls for the AI CI/CD auto-fixer.
 
 This module is the single place where the fixer's trust boundaries live. It is
-deliberately import-only (no side effects at import time) and fail-closed: when
-a check cannot complete (network down, malformed input), it returns the SAFE
-answer (redact / needs-review / don't-run), never the permissive one.
+import-only (no side effects at import time) and FAIL-CLOSED: when a check cannot
+complete (network down, git error, malformed input) it returns the SAFE answer
+(redact / hold-for-review / don't-run / don't-commit), never the permissive one.
 
-What each control does — and, honestly, does NOT do:
+═══════════════════════════════════════════════════════════════════════════════
+THREAT MODEL — the breach scenarios this system faces, and the control that
+counters each. "This system" = a fixer that reads attacker-influenceable CI logs
+and repo files, feeds them to a local model, writes files, runs code, and pushes
+to a repo with a token.
+═══════════════════════════════════════════════════════════════════════════════
 
-  redact_secrets / scrub_context
-      Regex-based scrubbing of well-known secret shapes before any text reaches
-      the model, the logs, a PR body, or the RAG store. This REDUCES leakage; it
-      is NOT a guarantee. For a hard gate, run gitleaks or trufflehog over the
-      checkout first and keep Ollama strictly local. Regexes miss novel formats.
+  BREACH 1 — Secret leaks OUT through a prompt, PR, log, or audit line.
+    Scenario: a CI log or a config file in context contains an AWS key / DB
+    connection string / token. It ends up in the model prompt (and, if Ollama
+    is remote or logs, off-box), or gets echoed into a PR body or issue.
+    Control: redact_secrets / scrub_context  — scrub known secret shapes from
+    every string before it leaves for the model, a PR, an issue, or the audit.
+    Limit: regex is best-effort; pair with gitleaks + a local-only Ollama.
 
-  PathPolicy
-      Keeps secret-bearing files (.env, *.pem, .aws/…) out of the model's context
-      entirely, and marks security-sensitive files (workflows, CODEOWNERS,
-      dependency manifests, auth/…) as review-required so the bot never silently
-      rewrites them.
+  BREACH 2 — The fixer COMMITS a secret it introduced.
+    Scenario: the model diagnoses "failing because API key is missing" and its
+    "fix" hardcodes a key into a file; the bot commits and pushes it.
+    Control: scan_staged_secrets  — scan the STAGED diff right before commit;
+    any newly-added secret aborts the commit. This is the outbound gate.
+    Limit: same regex caveat; back with GitHub push protection (server-side).
 
-  assess_trust
-      Reads the GitHub event payload to tell an internal push from a fork PR.
-      This is only meaningful if the WORKFLOW itself is configured not to hand
-      secrets to untrusted triggers — the code cannot fix a misconfigured trigger.
+  BREACH 3 — A secret-bearing file is read into the model's context.
+    Scenario: discovery pulls .env / id_rsa / .aws/credentials into the prompt.
+    Control: PathPolicy.is_readable_into_context  — those files never enter it.
 
-  vet_supplychain
-      Refuses to hand-edit lockfiles, refuses to auto-ADD dependencies, and
-      verifies changed pip/npm package+version against the real registry so a
-      hallucinated or typosquatted name is rejected. It CANNOT tell a real-but-
-      malicious package from a benign one — pair with a private registry, an
-      allowlist, and OSV/Dependabot scanning for actual supply-chain assurance.
+  BREACH 4 — The fixer silently rewrites a security-critical file.
+    Scenario: a "fix" edits .github/workflows/*, CODEOWNERS, an auth/ module, or
+    IaC — quietly weakening controls or opening a backdoor via an auto-PR.
+    Control: PathPolicy.review_reason  — those paths are held for human review,
+    never auto-applied.
 
-  harden_test_env / should_run_tests
-      Strips secrets from the test subprocess environment and refuses to execute
-      tests from untrusted origins. Python resource limits and env-stripping are
-      NOT a sandbox — real isolation needs a container/VM with no secret mounts
-      and controlled network egress.
+  BREACH 5 — Supply-chain injection through a dependency "fix".
+    Scenario: the fix adds a typosquatted/hallucinated package, edits a lockfile
+    by hand, or bumps a pin to a nonexistent version — pulling in attacker code.
+    Control: vet_supplychain  — reject lockfile edits, reject nonexistent
+    packages/versions (verified against PyPI/npm), hold new deps for review.
+    Limit: cannot tell a real-but-malicious package apart; add OSV/Dependabot.
 
-  audit
-      Append-only, redacted JSONL trail of every decision, file-mode 0600.
+  BREACH 6 — Untrusted code runs on the runner (RCE) with the token in reach.
+    Scenario: a fork PR's code (or a fork-triggered failure) reaches the test
+    step, executing attacker code on the self-hosted box next to the PAT.
+    Control: assess_trust + should_run_tests + should_auto_pr + harden_test_env
+    — untrusted origins never run tests or auto-PR; the test subprocess has
+    secrets stripped from its env.
+    Limit: env-stripping is not a sandbox; isolate the runner (container/VM).
+
+  BREACH 7 — Over-privileged / leaked token → account-wide blast radius.
+    Scenario: a broad classic PAT (repo + workflow) leaks; it can touch every
+    repo the account can and rewrite CI.
+    Control: check_token_scopes  — warns on broad classic scopes so you swap to
+    a fine-grained, repo-scoped, short-lived token. (Detection, not prevention.)
+
+  BREACH 8 — Runaway / kill-needed / no forensic trail.
+    Control: kill_switch (instant disable), audit (0600 redacted JSONL trail),
+    secure_file (lock down sensitive files), resource_limits_preexec (cap a
+    test process). Ship the audit off-box and alert on sensitive-path events.
+
+Everything below is grouped by the numbered breach it addresses.
 """
 
 import json
@@ -48,6 +73,7 @@ import math
 import os
 import re
 import stat
+import subprocess
 import sys
 import time
 from pathlib import Path
