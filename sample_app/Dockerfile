@@ -1,7 +1,7 @@
-FROM python:3.12
+FROM python:3.1qqq2
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirementssss.txt .
+RUN pip install --no-cache-dir -r requirementssss.txt
 COPY . .
 EXPOSE 5000
 CMD ["python", "app.py"]
