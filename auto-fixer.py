@@ -66,6 +66,13 @@ MAX_TOTAL_CONTEXT = 9000
 MAX_CONTEXT_FILES = 3
 MAX_FILES_FIXED   = 4
 
+# Robust multi-bug handling: after applying a round of fixes, re-read the
+# patched files and ask the model to audit again, looping until it reports
+# nothing left or a round makes no progress. The model does ALL detection each
+# round (no hardcoded rules) — it just gets repeated passes over fresh file
+# state instead of having to enumerate every bug perfectly in one shot.
+MAX_FIX_ROUNDS = int(os.environ.get("MAX_FIX_ROUNDS", "5"))
+
 # ── Git flow ──────────────────────────────────────────────────────────────────
 GIT_BASE_BRANCH   = os.environ.get("GIT_BASE_BRANCH",   "develop")
 GIT_TARGET_BRANCH = os.environ.get("GIT_TARGET_BRANCH", "develop")
@@ -1240,79 +1247,146 @@ def main():
     print(f"  SOLUTION   : {solution or '(none)'}")
     print(f"  confidence : {confidence:.0%}")
 
-    # ── AI STAGE 3: freeform diagnosis fix (finds EVERY bug, references included) ──
-    print("\n━━━ AI STAGE 3: GENERATE FIX ━━━")
-    try:
-        issues = ai_generate_fix(facts, cause, signal, context, stacks, hints)
-    except Exception as exc:
-        print(f"[ERROR] AI stage 3 failed: {exc}", file=sys.stderr)
-        if token and repo:
-            open_issue(token, repo, f"AI fix generation failed: {exc}", run_url)
-        sys.exit(2)
+    # ── AI STAGES 3 + 4: AUDIT LOOP ──
+    # Each round: re-read the CURRENT (possibly already-patched) files, ask the
+    # model to find EVERY remaining bug, self-verify, locate by evidence, apply.
+    # Repeat until the model finds nothing locatable or a round makes no
+    # progress. Detection is 100% the model's job on fresh file state every
+    # round — the loop is the only thing that makes multi-bug fixing robust,
+    # and it needs zero hardcoded rules to work.
+    cur_context, cur_included, cur_contents = context, included, included_contents
+    all_written, all_originals, all_fixes = [], {}, []
+    applied_sigs = set()          # (file, find, replace) already applied — loop guard
+    last_reject_reasons, last_pair_rejects = [], []
 
-    print(f"  issues reported: {len(issues)}")
-    for n, it in enumerate(issues, 1):
-        print(f"    {n}. {it.get('file','?')}: {it.get('problem','')[:80]}")
-        print(f"       {(it.get('evidence') or '')[:60]!r} → {(it.get('corrected') or '')[:60]!r}")
+    for round_no in range(1, MAX_FIX_ROUNDS + 1):
+        print(f"\n━━━ FIX ROUND {round_no}/{MAX_FIX_ROUNDS} — GENERATE FIX ━━━")
 
-    # ── AI STAGE 4: self-verify ──
-    verify_conf = None
-    if issues and not SKIP_SELF_VERIFY:
-        print("\n━━━ AI STAGE 4: SELF-VERIFY ━━━")
-        issues, verify_conf = ai_self_verify(issues, context)
-        print(f"  issues after verify: {len(issues)}"
-              + (f" | verify confidence {verify_conf:.0%}" if verify_conf is not None else ""))
+        # STAGE 3 — generate
+        try:
+            issues = ai_generate_fix(facts, cause, signal, cur_context, stacks, hints)
+        except Exception as exc:
+            print(f"[ERROR] AI stage 3 failed: {exc}", file=sys.stderr)
+            if round_no == 1:
+                if token and repo:
+                    open_issue(token, repo, f"AI fix generation failed: {exc}", run_url)
+                sys.exit(2)
+            print(f"[LOOP] round {round_no} generate failed — stopping with what we have.")
+            break
 
-    # ── CONFIDENCE GATE ──
-    combined = confidence if verify_conf is None else (confidence + verify_conf) / 2
-    if combined < 0.5:
-        print(f"[GATE] Confidence {combined:.0%} too low — escalating instead of guessing.")
-        if token and repo:
-            open_issue(token, repo,
-                       f"AI confidence too low ({combined:.0%}). Root cause: {root_cause}", run_url)
-        sys.exit(0)
+        print(f"  issues reported: {len(issues)}")
+        for n, it in enumerate(issues, 1):
+            print(f"    {n}. {it.get('file','?')}: {it.get('problem','')[:80]}")
+            print(f"       {(it.get('evidence') or '')[:60]!r} → {(it.get('corrected') or '')[:60]!r}")
 
-    # ── PAIR + LOCATE ──
-    freeform_fixes, pair_rejects = issues_to_fixes(issues, included_contents)
-    for rej in pair_rejects:
-        print(f"  ✗ {rej}", file=sys.stderr)
+        # STAGE 4 — self-verify
+        verify_conf = None
+        if issues and not SKIP_SELF_VERIFY:
+            print("  ── self-verify ──")
+            issues, verify_conf = ai_self_verify(issues, cur_context)
+            print(f"  issues after verify: {len(issues)}"
+                  + (f" | verify confidence {verify_conf:.0%}" if verify_conf is not None else ""))
 
-    merged = {}
-    for f in freeform_fixes:
-        entry = merged.setdefault(f["file"], {"file": f["file"],
-                 "reason": f.get("reason", ""), "edits": []})
-        for e in f.get("edits", []) or []:
-            if e not in entry["edits"]:
-                entry["edits"].append(e)
-        if f.get("reason") and f["reason"] not in entry["reason"]:
-            entry["reason"] = (entry["reason"] + "; " + f["reason"]).lstrip("; ")[:300]
-    fixes = list(merged.values())
+        # CONFIDENCE GATE — only decides whether to proceed AT ALL (round 1)
+        if round_no == 1:
+            combined = confidence if verify_conf is None else (confidence + verify_conf) / 2
+            if combined < 0.5:
+                print(f"[GATE] Confidence {combined:.0%} too low — escalating instead of guessing.")
+                if token and repo:
+                    open_issue(token, repo,
+                               f"AI confidence too low ({combined:.0%}). Root cause: {root_cause}",
+                               run_url)
+                sys.exit(0)
 
-    if not fixes:
-        detail = "; ".join(pair_rejects) or "model reported no locatable issues"
-        print(f"[ERROR] AI produced no usable fixes. {detail}", file=sys.stderr)
-        if token and repo:
-            open_issue(token, repo,
-                       f"AI produced no usable fixes. Root cause: {root_cause}\n\nDetail: {detail}",
-                       run_url)
-        sys.exit(3)
+        # LOCATE — pair each quoted evidence with its correction, by file
+        freeform_fixes, pair_rejects = issues_to_fixes(issues, cur_contents)
+        last_pair_rejects = pair_rejects
+        for rej in pair_rejects:
+            print(f"  ✗ {rej}", file=sys.stderr)
 
-    # ── APPLY + VALIDATE ──
-    print("\n━━━ APPLY + VALIDATE ━━━")
-    if args.dry_run:
-        for fix in fixes:
-            ok, reason = validate_fix(fix)
-            print(f"  {'would write' if ok else 'reject'} {fix.get('file','?')} — {reason}")
-        sys.exit(0)
+        merged = {}
+        for f in freeform_fixes:
+            entry = merged.setdefault(f["file"], {"file": f["file"],
+                     "reason": f.get("reason", ""), "edits": []})
+            for e in f.get("edits", []) or []:
+                if e not in entry["edits"]:
+                    entry["edits"].append(e)
+            if f.get("reason") and f["reason"] not in entry["reason"]:
+                entry["reason"] = (entry["reason"] + "; " + f["reason"]).lstrip("; ")[:300]
 
-    written, originals, reject_reasons = write_fixes(fixes)
+        # Drop edits we've already applied in a previous round — this is what
+        # makes the loop terminate: a bug that's already fixed no longer has its
+        # evidence in the file (rejected above), and any exact re-proposal is
+        # filtered here.
+        round_fixes = []
+        for f in merged.values():
+            new_edits = [e for e in f["edits"]
+                         if (f["file"], e.get("find"), e.get("replace")) not in applied_sigs]
+            if new_edits:
+                round_fixes.append({**f, "edits": new_edits})
+
+        if not round_fixes:
+            if round_no == 1:
+                detail = "; ".join(pair_rejects) or "model reported no locatable issues"
+                print(f"[ERROR] AI produced no usable fixes. {detail}", file=sys.stderr)
+                if token and repo:
+                    open_issue(token, repo,
+                               f"AI produced no usable fixes. Root cause: {root_cause}\n\nDetail: {detail}",
+                               run_url)
+                sys.exit(3)
+            print(f"[LOOP] round {round_no}: nothing new to fix — file(s) clean. Stopping.")
+            break
+
+        # DRY RUN — report round 1 and stop, never touching disk
+        if args.dry_run:
+            print("\n━━━ APPLY + VALIDATE (dry-run) ━━━")
+            for fix in round_fixes:
+                ok, reason = validate_fix(fix)
+                print(f"  {'would write' if ok else 'reject'} {fix.get('file','?')} — {reason}")
+            sys.exit(0)
+
+        # APPLY + VALIDATE
+        print("  ── apply + validate ──")
+        written, originals, reject_reasons = write_fixes(round_fixes)
+        last_reject_reasons = reject_reasons
+
+        if not written:
+            if round_no == 1:
+                detail = "; ".join(reject_reasons) or "no detail captured"
+                print(f"[ERROR] No valid fix applied. {detail}", file=sys.stderr)
+                if token and repo:
+                    open_issue(token, repo,
+                               f"AI fix failed validation. Root cause: {root_cause}\n\nDetail: {detail}",
+                               run_url)
+                sys.exit(3)
+            print(f"[LOOP] round {round_no}: nothing passed validation — stopping.")
+            break
+
+        # Record what landed (originals only the first time we touch a file, so
+        # a full revert restores pre-fix state across all rounds).
+        for fx in round_fixes:
+            for e in fx["edits"]:
+                applied_sigs.add((fx["file"], e.get("find"), e.get("replace")))
+        for fl, txt in originals.items():
+            all_originals.setdefault(fl, txt)
+        all_written = list(dict.fromkeys(all_written + written))
+        all_fixes.extend(round_fixes)
+        print(f"[LOOP] round {round_no} applied: {', '.join(written)}")
+
+        # RE-READ patched files for the next audit pass
+        cur_context, cur_included, cur_contents = discover_context(signal, stacks, forced)
+    else:
+        print(f"[LOOP] hit MAX_FIX_ROUNDS ({MAX_FIX_ROUNDS}) — stopping; "
+              "remaining issues (if any) escalate via tests/human review.")
+
+    # Hand the accumulated results to the downstream test/commit/PR stages.
+    written, originals, fixes = all_written, all_originals, all_fixes
     if not written:
-        detail = "; ".join(reject_reasons) or "no detail captured"
+        detail = "; ".join(last_reject_reasons or last_pair_rejects) or "no detail captured"
         print(f"[ERROR] No valid fix applied. {detail}", file=sys.stderr)
         if token and repo:
             open_issue(token, repo,
-                       f"AI fix failed validation. Root cause: {root_cause}\n\nDetail: {detail}",
-                       run_url)
+                       f"AI fix failed. Root cause: {root_cause}\n\nDetail: {detail}", run_url)
         sys.exit(3)
 
     # ── RUN TESTS ──
