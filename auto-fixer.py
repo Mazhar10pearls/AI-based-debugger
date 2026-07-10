@@ -362,6 +362,54 @@ DOCKERFILE_REF_PATTERNS = [
     (re.compile(r'ENTRYPOINT\s*\[\s*"[^"]*"\s*,\s*"([^"]+)"', re.I), "ENTRYPOINT"),
 ]
 
+# ── static Dockerfile base-image version scan (deterministic, no AI) ───────────
+# This is intentionally NOT left to the AI. Stage 3's prompt already tells the
+# model "python:3.1 / python:3.2 are INVALID — use 3.12", but a 3B model
+# reliably finds ONE bug per file and stops even when told not to — that's
+# exactly how a Dockerfile with both a broken COPY path AND an invalid
+# `FROM python:3.1` gets only the COPY path fixed. A version string is a pure,
+# checkable fact (existing CPython release or not) — Python can verify and
+# correct it with zero ambiguity, so there's no reason to gamble on the model
+# catching it.
+DOCKERFILE_FROM_PYTHON = re.compile(r'^(\s*FROM\s+)python:([^\s]+)(.*)$', re.I | re.M)
+VALID_PYTHON_MINORS = set(range(8, 14))   # CPython 3.8 – 3.13 (update as new releases land)
+DEFAULT_PYTHON_VERSION = "3.12"
+
+
+def scan_python_base_image(included_contents: dict) -> list:
+    """Deterministic check: 'FROM python:X.Y[-suffix]' in a Dockerfile must
+    name an existing, supported CPython release. Returns a list of
+    {file, line_in_file, corrected_line, reason} ready to apply directly —
+    no AI round-trip needed, since the fix (swap to a valid version, keep
+    any -slim/-alpine suffix) is unambiguous."""
+    fixes = []
+    for rel, content in included_contents.items():
+        if "dockerfile" not in Path(rel).name.lower():
+            continue
+        for m in DOCKERFILE_FROM_PYTHON.finditer(content):
+            prefix, version, suffix = m.groups()
+            base = version.split("-", 1)[0]
+            tag_suffix = version[len(base):]  # e.g. "-slim", "-alpine", or ""
+            vm = re.match(r'^(\d+)\.(\d+)', base)
+            if not vm:
+                continue  # can't parse a version out of this tag — leave it alone
+            major, minor = int(vm.group(1)), int(vm.group(2))
+            if major == 3 and minor in VALID_PYTHON_MINORS:
+                continue  # valid release, nothing to do
+            old_line = m.group(0)
+            new_line = f"{prefix}python:{DEFAULT_PYTHON_VERSION}{tag_suffix}{suffix}"
+            fixes.append({
+                "file": rel,
+                "line_in_file": old_line,
+                "corrected_line": new_line,
+                "reason": (f"invalid Python base image tag 'python:{version}' "
+                           f"(no such CPython release) — using "
+                           f"'python:{DEFAULT_PYTHON_VERSION}{tag_suffix}'"),
+            })
+            print(f"[BASE-IMAGE] {rel}: python:{version} is not a real release "
+                  f"→ python:{DEFAULT_PYTHON_VERSION}{tag_suffix}")
+    return fixes
+
 
 def scan_reference_hints(included_contents: dict) -> str:
     return _scan_reference_details(included_contents)[1]
@@ -1408,6 +1456,7 @@ def main():
     if not included:
         print("[DISCOVER] WARNING: no files resolved.")
     broken_lines, hints = _scan_reference_details(included_contents)
+    version_issues = scan_python_base_image(included_contents)
 
     # ── AI STAGE 1 + 2 ──
     print("\n━━━ AI STAGE 1: FACTS / STAGE 2: ROOT CAUSE ━━━")
@@ -1433,20 +1482,37 @@ def main():
     print(f"  SOLUTION   : {solution or '(none)'}")
     print(f"  confidence : {confidence:.0%}")
 
-    # ── AI STAGE 3a: focused correct-the-line for reference typos ──
-    prefilled_fixes = []
+    # ── STAGE 3a: focused correct-the-line (reference typos, AI) +
+    #             deterministic Dockerfile base-image version fix (Python) ──
+    # Both are static-scan-driven, so both get applied here regardless of
+    # what Stage 3's freeform pass finds — a file with N independent static
+    # bugs gets all N fixed, not just whichever one the 3B model noticed first.
+    by_file = {}
+
+    def _add_prefilled_edit(file, find, replace, reason):
+        entry = by_file.setdefault(file, {"file": file, "reason": reason, "edits": []})
+        edit = {"find": find, "replace": replace}
+        if edit not in entry["edits"]:
+            entry["edits"].append(edit)
+        if reason and reason not in entry["reason"]:
+            entry["reason"] = (entry["reason"] + "; " + reason).lstrip("; ")[:300]
+
     if broken_lines:
-        print("\n━━━ AI STAGE 3a: CORRECT-THE-LINE ━━━")
+        print("\n━━━ STAGE 3a: CORRECT-THE-LINE (reference typos) ━━━")
         corrections = ai_correct_lines(broken_lines)
-        by_file = {}
         for c in corrections:
-            entry = by_file.setdefault(c["file"], {"file": c["file"],
-                     "reason": "AI-corrected reference typo(s)", "edits": []})
-            edit = {"find": c["line_in_file"], "replace": c["corrected_line"]}
-            if edit not in entry["edits"]:
-                entry["edits"].append(edit)
-        prefilled_fixes = list(by_file.values())
-        print(f"[AI-LINES] {sum(len(f['edits']) for f in prefilled_fixes)} corrected line(s)")
+            _add_prefilled_edit(c["file"], c["line_in_file"], c["corrected_line"],
+                                "AI-corrected reference typo(s)")
+        print(f"[AI-LINES] {len(corrections)} corrected line(s)")
+
+    if version_issues:
+        print("\n━━━ STAGE 3a: BASE IMAGE VERSION (deterministic) ━━━")
+        for v in version_issues:
+            _add_prefilled_edit(v["file"], v["line_in_file"], v["corrected_line"], v["reason"])
+
+    prefilled_fixes = list(by_file.values())
+    print(f"[STAGE 3a] {sum(len(f['edits']) for f in prefilled_fixes)} deterministic fix(es) "
+          f"across {len(prefilled_fixes)} file(s)")
 
     # ── AI STAGE 3b: freeform diagnosis fix ──
     print("\n━━━ AI STAGE 3: GENERATE FIX ━━━")
@@ -1524,26 +1590,39 @@ def main():
         sys.exit(3)
 
     # ── ADDITIONAL ROUNDS (static rescan) ──
-    prev_hints = None
+    # Checks BOTH static-scan classes each round (reference typos + base-image
+    # version) so a file with several independent static bugs keeps getting
+    # revisited until it's clean, instead of stopping once one class is fixed.
+    prev_signature = None
     for round_no in range(2, MAX_AI_ROUNDS + 1):
         _, r_included, r_contents = discover_context(signal, stacks, forced)
         r_broken, r_hints = _scan_reference_details(r_contents)
-        if not r_hints:
+        r_versions = scan_python_base_image(r_contents)
+        if not r_hints and not r_versions:
             print(f"[LOOP] Static scan clean after round {round_no-1}.")
             break
-        if r_hints == prev_hints:
+        signature = r_hints + "\n" + "|".join(v["line_in_file"] for v in r_versions)
+        if signature == prev_signature:
             print(f"[LOOP] Round {round_no-1} left the same issue(s) — stopping.")
             break
-        prev_hints = r_hints
-        print(f"\n━━━ AI ROUND {round_no}/{MAX_AI_ROUNDS}: CORRECT-THE-LINE ━━━")
-        corrections = ai_correct_lines(r_broken)
+        prev_signature = signature
+        print(f"\n━━━ ROUND {round_no}/{MAX_AI_ROUNDS}: CORRECT-THE-LINE + BASE IMAGE VERSION ━━━")
         by_file = {}
-        for c in corrections:
-            entry = by_file.setdefault(c["file"], {"file": c["file"],
-                     "reason": "AI-corrected reference typo(s)", "edits": []})
-            edit = {"find": c["line_in_file"], "replace": c["corrected_line"]}
+
+        def _add_round_edit(file, find, replace, reason):
+            entry = by_file.setdefault(file, {"file": file, "reason": reason, "edits": []})
+            edit = {"find": find, "replace": replace}
             if edit not in entry["edits"]:
                 entry["edits"].append(edit)
+
+        if r_broken:
+            corrections = ai_correct_lines(r_broken)
+            for c in corrections:
+                _add_round_edit(c["file"], c["line_in_file"], c["corrected_line"],
+                                "AI-corrected reference typo(s)")
+        for v in r_versions:
+            _add_round_edit(v["file"], v["line_in_file"], v["corrected_line"], v["reason"])
+
         fixes_r = list(by_file.values())
         if not fixes_r:
             print(f"[LOOP] Nothing more to apply — stopping.")
