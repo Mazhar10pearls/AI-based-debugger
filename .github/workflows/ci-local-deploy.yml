@@ -1,17 +1,5 @@
 name: Local CI/CD Deploy
 
-# ── Git flow ────────────────────────────────────────────────────────────────
-# build + test → every push/PR to main, develop, qa/**
-# deploy        → push to main OR develop (same container, same :5000)
-#
-# Note: since both branches deploy to the same container/port, whichever one
-# pushes LAST wins — a develop push after a main push will overwrite what's
-# running, and vice versa. Fine for a single-box "test the latest build" setup.
-#
-# Deploy is self-verifying: the new image is started on a temp port and health-
-# checked BEFORE the live :5000 container is touched. A broken build can never
-# take down the running deployment — if the candidate is unhealthy, the step
-# fails and the current container keeps serving.
 on:
   push:
     branches: [main, develop, 'qa/**']
@@ -32,13 +20,11 @@ jobs:
     runs-on: self-hosted
 
     steps:
-      # ── Checkout ─────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ── Python ───────────────────────────────────────────────────────────
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -49,11 +35,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r sample_app/requirements.txt
 
-      # ── Test (always) ────────────────────────────────────────────────────
       - name: Run unit tests
         run: pytest sample_app/test_app.py
 
-      # ── Build (always) ──────────────────────────────────────────────────
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
 
@@ -67,63 +51,12 @@ jobs:
             --load \
             sample_app
 
-      # ── Deploy: verify new, then swap in (main OR develop, push only) ──────
-      # 1. start the candidate image on a temp port (5001) — live :5000 untouched
-      # 2. health-check it; bail fast (with logs) if it crashed or never served
-      # 3. only once it's proven healthy, replace the live :5000 container
-      # This one step replaces the old smoke-test + stop + start + wait + verify
-      # steps: the health check IS the smoke test, so there's no redundancy and
-      # no window where :5000 is down running a broken image.
-      - name: Deploy (verify new, then swap in)
+      - name: Deploy
         if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') && github.event_name == 'push'
         run: |
-          set -e
-          NEW=ai-devops-sample-app-new
-          LIVE=ai-devops-sample-app
-          IMAGE=ai-devops-sample-app:${{ github.sha }}
+          docker rm -f ai-devops-sample-app || true
+          docker run -d --name ai-devops-sample-app -p 5000:5000 ai-devops-sample-app:${{ github.sha }}
 
-          # 1. start the candidate on a temp port, never touching live :5000
-          docker rm -f "$NEW" >/dev/null 2>&1 || true
-          docker run -d --name "$NEW" -p 5001:5000 "$IMAGE"
-
-          # 2. prove it's healthy (bail the instant it dies — arch/CMD/import error)
-          ok=0
-          for i in $(seq 1 15); do
-            if curl -fsS --max-time 3 http://127.0.0.1:5001/ >/dev/null 2>&1; then
-              ok=1; break
-            fi
-            if [ "$(docker inspect -f '{{.State.Running}}' "$NEW" 2>/dev/null)" != "true" ]; then
-              break
-            fi
-            sleep 2
-          done
-
-          if [ "$ok" != "1" ]; then
-            echo "New image unhealthy — keeping the current deployment untouched."
-            echo "----- candidate logs -----"
-            docker logs "$NEW" 2>&1 | tail -n 50 || true
-            docker rm -f "$NEW" >/dev/null 2>&1 || true
-            exit 1
-          fi
-
-          # 3. healthy — swap it in: drop candidate, replace live on :5000
-          docker rm -f "$NEW" >/dev/null 2>&1 || true
-          docker rm -f "$LIVE" >/dev/null 2>&1 || true
-          docker run -d --name "$LIVE" -p 5000:5000 "$IMAGE"
-
-          # final confirmation on the live port
-          for i in $(seq 1 20); do
-            if curl -fsS --max-time 3 http://127.0.0.1:5000/ >/dev/null 2>&1; then
-              echo "Deployed $IMAGE — healthy on :5000"
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "Deployed but :5000 did not become healthy"
-          docker logs "$LIVE" 2>&1 | tail -n 50 || true
-          exit 1
-
-      # ── Housekeeping ─────────────────────────────────────────────────────
       - name: Prune dangling images
         if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') && github.event_name == 'push'
         run: docker image prune -f || true
