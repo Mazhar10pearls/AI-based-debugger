@@ -13,16 +13,14 @@ Pipeline (matches the diagram):
         → Confidence gate
         → Apply patch → Commit + Push + PR
 
-Design notes carried over from the single-call version:
+Design notes:
   * A small local model (qwen2.5-coder:3b) diagnoses well but mangles nested
     structure. Stage 3's output is a FLAT issues list — quote the offending
     text, quote the corrected text, one entry per bug. Python pairs each quote
     with its correction and LOCATES each fix by searching for the AI's own
     quoted evidence in the shown files. The AI authors every change; Python
-    never writes a fix of its own.
-  * The reference-typo class (broken COPY/ADD paths) still runs through the
-    focused correct-the-line sub-pass inside Stage 3 — that's the part that
-    made typos reliable, so it's kept.
+    never writes a fix of its own and never DETECTS a bug of its own — the
+    model owns all diagnosis, Python owns automation and safety gating.
 
 Why staged instead of one call:
   Four smaller tasks each stay inside the 3B's reliable instruction-following
@@ -56,7 +54,6 @@ OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL",   "qwen2.5-coder:3b")
 AI_TIMEOUT     = 210
 MAX_RETRIES    = 2
 RETRY_BACKOFF  = [20, 20]
-MAX_AI_ROUNDS  = 3
 
 # staged-flow toggles
 FAST_MODE        = os.environ.get("FAST_MODE", "").lower() in ("1", "true", "yes")
@@ -353,103 +350,6 @@ def discover_context(signal: str, stacks: set, forced: list) -> tuple:
     return context, included, contents
 
 
-# ── static reference scan (hints only) ─────────────────────────────────────────
-DOCKERFILE_REF_PATTERNS = [
-    (re.compile(r'^\s*COPY\s+(?:--from=\S+\s+)?(\S+)\s+\S+', re.I | re.M), "COPY"),
-    (re.compile(r'^\s*ADD\s+(?:--from=\S+\s+)?(\S+)\s+\S+', re.I | re.M), "ADD"),
-    (re.compile(r'-r\s+(\S+\.txt)'), "pip install -r"),
-    (re.compile(r'CMD\s*\[\s*"[^"]*"\s*,\s*"([^"]+)"', re.I), "CMD"),
-    (re.compile(r'ENTRYPOINT\s*\[\s*"[^"]*"\s*,\s*"([^"]+)"', re.I), "ENTRYPOINT"),
-]
-
-
-def scan_reference_hints(included_contents: dict) -> str:
-    return _scan_reference_details(included_contents)[1]
-
-
-def _scan_reference_details(included_contents: dict) -> tuple:
-    """Static scan for broken COPY/ADD/CMD/ENTRYPOINT references in Docker
-    files. CRITICAL: Dockerfile path arguments resolve against the BUILD
-    CONTEXT (conventionally the Dockerfile's own directory in this repo
-    layout, e.g. 'sample_app/'), NOT the git repo root. A suggested fix must
-    therefore be expressed relative to that context. Suggesting the full
-    repo-relative path (e.g. 'sample_app/app.py') looks plausible against the
-    repo tree but is WRONG inside the container — it resolves to
-    '/app/sample_app/app.py', which does not exist, and breaks the smoke
-    test/deploy even though the PR appears to "fix" the typo."""
-    all_repo = [_relstrip(str(p)) for p in Path(".").rglob("*")
-                if p.is_file() and not any(d in SKIP_DIRS for d in p.parts)]
-    basenames = {}
-    for f in all_repo:
-        basenames.setdefault(Path(f).name.lower(), []).append(f)
-    all_repo_set = set(all_repo)
-
-    broken, summary = [], []
-    for rel, content in included_contents.items():
-        name = Path(rel).name.lower()
-        if "dockerfile" not in name and "docker-compose" not in name and "compose.y" not in name:
-            continue
-        docker_dir = Path(rel).parent  # build context, by this repo's convention
-        for pat, label in DOCKERFILE_REF_PATTERNS:
-            for m in pat.finditer(content):
-                ref = m.group(1).strip().strip("'\"")
-                if not ref or ref in (".", "..") or ref.startswith("-") or ref.startswith("$"):
-                    continue
-                ref_clean = ref.lstrip("./")
-                candidates = {ref_clean, _relstrip(str(docker_dir / ref_clean))}
-                if any(Path(c).is_file() or c in all_repo_set for c in candidates):
-                    continue
-
-                close = difflib.get_close_matches(Path(ref_clean).name.lower(),
-                                                   basenames.keys(), n=1, cutoff=0.4)
-                closest_base = close[0] if close else ""
-
-                # Only offer a fix if the closest match ACTUALLY lives inside
-                # this Dockerfile's build context. No path string can fix a
-                # reference to a file that's outside the context — that needs
-                # a human to move the file or change the build context, not
-                # an AI-guessed path.
-                closest_full = ""
-                for cand in basenames.get(closest_base, []):
-                    try:
-                        closest_full = str(Path(cand).relative_to(docker_dir))
-                        break
-                    except ValueError:
-                        continue
-                fixable = bool(closest_full)
-
-                line_start = content.rfind("\n", 0, m.start()) + 1
-                line_end = content.find("\n", m.end())
-                if line_end == -1:
-                    line_end = len(content)
-                bad_line = content[line_start:line_end]
-                broken.append({"file": rel, "line": bad_line,
-                               "wrong_token": ref,
-                               "closest_basename": closest_base,
-                               "closest_full": closest_full,
-                               "fixable": fixable,
-                               "docker_dir": str(docker_dir)})
-                if fixable:
-                    summary.append(
-                        f"- {rel}: {label} references '{ref}' — not found in the "
-                        f"build context ({docker_dir}/). Correct in-context path: "
-                        f"'{closest_full}' (Dockerfile paths are relative to the "
-                        f"build context, NOT the repo root — do not use "
-                        f"'{docker_dir}/{closest_full}').")
-                else:
-                    summary.append(
-                        f"- {rel}: {label} references '{ref}' — not found in the "
-                        f"build context ({docker_dir}/), and no matching file exists "
-                        f"inside that context either. NOT AUTO-FIXABLE: needs a human "
-                        f"to move the file into the build context or adjust it. Do "
-                        f"NOT substitute a repo-relative path here — it will not "
-                        f"resolve inside the container.")
-    hint = "\n".join(dict.fromkeys(summary))
-    if hint:
-        print(f"[DISCOVER] Static reference hints:\n{hint}")
-    return broken, hint
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # AI plumbing — shared streaming + JSON extraction  (consolidated)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -721,7 +621,7 @@ def ai_facts_and_cause(signal, context, stacks, hints) -> tuple:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 3 — GENERATE FIX  (AI)  — flat issues contract + focused correct-the-line
+# STAGE 3 — GENERATE FIX  (AI)  — flat issues contract
 # ══════════════════════════════════════════════════════════════════════════════
 
 FIX_SCHEMA = {
@@ -787,98 +687,6 @@ def ai_generate_fix(facts, cause, signal, context, stacks, hints) -> list:
     if not issues and isinstance(data.get("fixes"), list):
         issues = data["fixes"]
     return _normalize_issue_keys(issues)
-
-
-CORRECT_LINE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "corrections": {"type": "array", "items": {
-            "type": "object",
-            "properties": {
-                "id":             {"type": "integer"},
-                "corrected_line": {"type": "string"},
-            },
-            "required": ["id", "corrected_line"]}}
-    },
-    "required": ["corrections"],
-}
-
-
-def ai_correct_lines(broken: list) -> list:
-    """Focused correct-the-line pass for reference typos. Returns
-    [{file, line_in_file, corrected_line}, ...]. Never edits anything itself.
-
-    Only operates on entries the scanner marked `fixable` — i.e. the closest
-    matching file actually lives inside the Dockerfile's own build context.
-    If the closest match is outside the context, no path string can fix it
-    (the file would need to be physically moved), so we don't hand the AI a
-    reference it can only "fix" by writing a path that resolves at the repo
-    level but breaks at container runtime."""
-    fixable = [b for b in broken if b.get("fixable", bool(b.get("closest_full")))]
-    fixable_ids = {id(b) for b in fixable}
-    unfixable = [b for b in broken if id(b) not in fixable_ids]
-    for b in unfixable:
-        print(f"[AI-LINES] skipping '{b['wrong_token']}' in {b['file']} — no match inside "
-              f"the build context ({b.get('docker_dir','?')}/); needs a human to relocate the file")
-    if not fixable:
-        return []
-    items = []
-    for i, b in enumerate(fixable, 1):
-        items.append(f'{i}. line: "{b["line"]}"\n'
-                     f'   contains the wrong filename "{b["wrong_token"]}"; '
-                     f'the correct path RELATIVE TO THE BUILD CONTEXT '
-                     f'({b.get("docker_dir","?")}/) is "{b["closest_full"]}" '
-                     f'(basename "{b["closest_basename"]}"). Do NOT prefix it with '
-                     f'"{b.get("docker_dir","?")}/" — that path only exists in the '
-                     f'repo, not inside the container.')
-    system = ("Correct-the-line task. Output ONLY JSON: "
-              '{"corrections":[{"id":N,"corrected_line":"..."}]}. '
-              "For each numbered line below, return the line with the wrong "
-              "filename replaced by the correct in-context filename shown. Keep "
-              "everything else on the line IDENTICAL — same indentation, directive, "
-              "quoting, trailing content. Do not add or remove lines. Do not add any "
-              "directory prefix that isn't explicitly given as the correct path.")
-    prompt = f"{system}\n\nLines to correct:\n" + "\n".join(items)
-    print(f"[AI-LINES] focused call: {len(fixable)} broken line(s)")
-
-    try:
-        raw = _stream_ollama(prompt, CORRECT_LINE_SCHEMA, num_predict=1200,
-                             temperature=0.0, num_ctx=4096, tag="AI-LINES", retries=1)
-    except Exception as exc:
-        print(f"[AI-LINES] failed: {exc}", file=sys.stderr)
-        return []
-    data = _json_from(raw)
-    if not data:
-        return []
-
-    out = []
-    for c in data.get("corrections", []) or []:
-        try:
-            idx = int(c.get("id", 0)) - 1
-        except (TypeError, ValueError):
-            continue
-        if not (0 <= idx < len(fixable)):
-            continue
-        b = fixable[idx]
-        new_line = c.get("corrected_line", "")
-        if not isinstance(new_line, str) or not new_line.strip() or b["line"] == new_line:
-            continue
-        if b["closest_basename"] and b["closest_basename"] not in new_line:
-            print(f"[AI-LINES] discarded id={idx+1}: missing real filename")
-            continue
-        # Reject if the AI re-added the repo-relative prefix we explicitly
-        # told it not to use — this is the exact regression we're fixing.
-        docker_dir = b.get("docker_dir", "")
-        if docker_dir and f"{docker_dir}/{b['closest_full']}" in new_line:
-            print(f"[AI-LINES] discarded id={idx+1}: reintroduced repo-relative "
-                  f"prefix '{docker_dir}/' — not valid inside the build context")
-            continue
-        if b["wrong_token"] in new_line:
-            print(f"[AI-LINES] discarded id={idx+1}: still contains wrong token")
-            continue
-        out.append({"file": b["file"], "line_in_file": b["line"],
-                    "corrected_line": new_line})
-    return out
 
 
 def _normalize_issue_keys(issues):
@@ -1047,13 +855,12 @@ def _apply_edits(original: str, edits: list) -> tuple:
         if find in content:
             content = content.replace(find, repl)
             continue
-        # IDEMPOTENCY: multiple AI stages can independently diagnose the same
-        # underlying bug (e.g. Stage 3a's correct-the-line pass AND Stage 3's
-        # freeform fix both catching the same Dockerfile typo). Edits are
-        # applied sequentially, so by the time edit #2 runs, edit #1 may have
-        # already produced the exact text edit #2 was going to write. That is
-        # not a failure — it's confirmation the fix already landed. Only treat
-        # it as unresolved if the replacement text is not already there.
+        # IDEMPOTENCY: multiple issues can independently diagnose the same
+        # underlying bug. Edits are applied sequentially, so by the time
+        # edit #2 runs, edit #1 may have already produced the exact text
+        # edit #2 was going to write. That is not a failure — it's
+        # confirmation the fix already landed. Only treat it as unresolved
+        # if the replacement text is not already there.
         if isinstance(repl, str) and repl.strip() and repl in content:
             print(f"[EDIT] edit #{i+1} already satisfied by a prior edit — skipping")
             continue
@@ -1355,7 +1162,7 @@ def open_issue(token, repo, reason, run_url=""):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    ap = argparse.ArgumentParser(description="AI CI/CD auto-fixer (staged)")
+    ap = argparse.ArgumentParser(description="AI CI/CD auto-fixer (pure-AI)")
     ap.add_argument("--input", required=True, help="Path to CI failure log")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--skip-tests", action="store_true")
@@ -1407,7 +1214,7 @@ def main():
     context, included, included_contents = discover_context(signal, stacks, forced)
     if not included:
         print("[DISCOVER] WARNING: no files resolved.")
-    broken_lines, hints = _scan_reference_details(included_contents)
+    hints = ""  # pure-AI mode: no deterministic prescan — the model finds everything
 
     # ── AI STAGE 1 + 2 ──
     print("\n━━━ AI STAGE 1: FACTS / STAGE 2: ROOT CAUSE ━━━")
@@ -1433,22 +1240,7 @@ def main():
     print(f"  SOLUTION   : {solution or '(none)'}")
     print(f"  confidence : {confidence:.0%}")
 
-    # ── AI STAGE 3a: focused correct-the-line for reference typos ──
-    prefilled_fixes = []
-    if broken_lines:
-        print("\n━━━ AI STAGE 3a: CORRECT-THE-LINE ━━━")
-        corrections = ai_correct_lines(broken_lines)
-        by_file = {}
-        for c in corrections:
-            entry = by_file.setdefault(c["file"], {"file": c["file"],
-                     "reason": "AI-corrected reference typo(s)", "edits": []})
-            edit = {"find": c["line_in_file"], "replace": c["corrected_line"]}
-            if edit not in entry["edits"]:
-                entry["edits"].append(edit)
-        prefilled_fixes = list(by_file.values())
-        print(f"[AI-LINES] {sum(len(f['edits']) for f in prefilled_fixes)} corrected line(s)")
-
-    # ── AI STAGE 3b: freeform diagnosis fix ──
+    # ── AI STAGE 3: freeform diagnosis fix (finds EVERY bug, references included) ──
     print("\n━━━ AI STAGE 3: GENERATE FIX ━━━")
     try:
         issues = ai_generate_fix(facts, cause, signal, context, stacks, hints)
@@ -1480,13 +1272,13 @@ def main():
                        f"AI confidence too low ({combined:.0%}). Root cause: {root_cause}", run_url)
         sys.exit(0)
 
-    # ── PAIR + LOCATE, merge with prefilled ──
+    # ── PAIR + LOCATE ──
     freeform_fixes, pair_rejects = issues_to_fixes(issues, included_contents)
     for rej in pair_rejects:
         print(f"  ✗ {rej}", file=sys.stderr)
 
     merged = {}
-    for f in prefilled_fixes + freeform_fixes:
+    for f in freeform_fixes:
         entry = merged.setdefault(f["file"], {"file": f["file"],
                  "reason": f.get("reason", ""), "edits": []})
         for e in f.get("edits", []) or []:
@@ -1522,40 +1314,6 @@ def main():
                        f"AI fix failed validation. Root cause: {root_cause}\n\nDetail: {detail}",
                        run_url)
         sys.exit(3)
-
-    # ── ADDITIONAL ROUNDS (static rescan) ──
-    prev_hints = None
-    for round_no in range(2, MAX_AI_ROUNDS + 1):
-        _, r_included, r_contents = discover_context(signal, stacks, forced)
-        r_broken, r_hints = _scan_reference_details(r_contents)
-        if not r_hints:
-            print(f"[LOOP] Static scan clean after round {round_no-1}.")
-            break
-        if r_hints == prev_hints:
-            print(f"[LOOP] Round {round_no-1} left the same issue(s) — stopping.")
-            break
-        prev_hints = r_hints
-        print(f"\n━━━ AI ROUND {round_no}/{MAX_AI_ROUNDS}: CORRECT-THE-LINE ━━━")
-        corrections = ai_correct_lines(r_broken)
-        by_file = {}
-        for c in corrections:
-            entry = by_file.setdefault(c["file"], {"file": c["file"],
-                     "reason": "AI-corrected reference typo(s)", "edits": []})
-            edit = {"find": c["line_in_file"], "replace": c["corrected_line"]}
-            if edit not in entry["edits"]:
-                entry["edits"].append(edit)
-        fixes_r = list(by_file.values())
-        if not fixes_r:
-            print(f"[LOOP] Nothing more to apply — stopping.")
-            break
-        written_r, originals_r, _ = write_fixes(fixes_r)
-        if not written_r:
-            print(f"[LOOP] Round {round_no} produced no valid fix — stopping.")
-            break
-        for f in written_r:
-            originals.setdefault(f, originals_r[f])
-        written = list(dict.fromkeys(written + written_r))
-        fixes = fixes + fixes_r
 
     # ── RUN TESTS ──
     print("\n━━━ RUN TESTS ━━━")
