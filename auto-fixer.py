@@ -91,17 +91,26 @@ BOT_PREFIX = "fix:"
 MAX_BOT_ATTEMPTS = 3
 
 ALWAYS_BLOCKED   = {".git", "auto-fixer.py"}
-BLOCKED_PATTERNS = [
-    # ALL workflow files — a "fix" to a deploy/CI workflow is a privilege-
-    # escalation vector. Workflow breakage always escalates to a human via
-    # open_issue(), never goes through auto-fix.
-    r"\.?github/workflows/.*\.ya?ml$",
-    r"\.?github/CODEOWNERS$",
+
+# Never even READ into a prompt — these are secret-bearing. Reading them for
+# "diagnosis" would leak the secret into the model's context and into logs.
+SECRET_BLOCKED_PATTERNS = [
     r"(^|/)\.env(\..*)?$",
     r".*\.pem$", r".*\.key$", r".*id_rsa.*", r".*id_ed25519.*",
     r".*secrets?\.ya?ml$", r".*\.tfstate(\.backup)?$",
     r"(^|/)\.npmrc$", r"(^|/)\.pypirc$",
 ]
+# Safe to READ (the diagram explicitly wants "Read Workflow YAML" as
+# diagnostic evidence) but NEVER WRITTEN — a "fix" to a deploy/CI workflow
+# is a privilege-escalation vector (it can change permissions, add steps, or
+# add secret-exfiltrating commands, and reads like a normal diff to a
+# reviewer). Workflow breakage always escalates to a human via open_issue(),
+# never goes through auto-fix.
+EDIT_ONLY_BLOCKED_PATTERNS = [
+    r"\.?github/workflows/.*\.ya?ml$",
+    r"\.?github/CODEOWNERS$",
+]
+BLOCKED_PATTERNS = SECRET_BLOCKED_PATTERNS + EDIT_ONLY_BLOCKED_PATTERNS  # edit-time (full) list
 
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "env",
              "dist", "build", ".pytest_cache", "target", "out", "vendor",
@@ -179,9 +188,21 @@ def _relstrip(rel): return rel[2:] if rel.startswith("./") else rel
 
 
 def _is_blocked(fp):
+    """EDIT-time check — blocks secret files AND edit-only paths (workflows,
+    CODEOWNERS). Used by validate_fix/write_fixes and anywhere a change is
+    about to be made."""
     if any(fp == b or fp.startswith(b.rstrip("/") + "/") for b in ALWAYS_BLOCKED):
         return True
     return any(re.search(p, fp) for p in BLOCKED_PATTERNS)
+
+
+def _is_read_blocked(fp):
+    """READ-time check — only blocks secret-bearing files. Workflow YAML and
+    CODEOWNERS are readable (the diagram lists 'Read Workflow YAML' as
+    diagnostic evidence) even though they can never be edited."""
+    if any(fp == b or fp.startswith(b.rstrip("/") + "/") for b in ALWAYS_BLOCKED):
+        return True
+    return any(re.search(p, fp) for p in SECRET_BLOCKED_PATTERNS)
 
 
 def _is_text_file(path: Path) -> bool:
@@ -243,7 +264,7 @@ def get_repo_tree(root: Path = Path("."), limit: int = MAX_TREE_ENTRIES) -> str:
         if any(part in SKIP_DIRS for part in p.parts):
             continue
         rel = _relstrip(str(p))
-        if _is_blocked(rel):
+        if _is_read_blocked(rel):
             continue
         entries.append(rel + ("/" if p.is_dir() else ""))
         if len(entries) >= limit:
@@ -490,11 +511,92 @@ def build_investigation_prompt(evidence: dict, transcript: list) -> str:
     return prompt
 
 
+DOCKERFILE_REF_PATTERNS = [
+    (re.compile(r'^\s*COPY\s+(?:--from=\S+\s+)?(\S+)\s+\S+', re.I | re.M), "COPY"),
+    (re.compile(r'^\s*ADD\s+(?:--from=\S+\s+)?(\S+)\s+\S+', re.I | re.M), "ADD"),
+    (re.compile(r'-r\s+(\S+\.txt)'), "pip install -r"),
+    (re.compile(r'CMD\s*\[\s*"[^"]*"\s*,\s*"([^"]+)"', re.I), "CMD"),
+    (re.compile(r'ENTRYPOINT\s*\[\s*"[^"]*"\s*,\s*"([^"]+)"', re.I), "ENTRYPOINT"),
+]
+VALID_PYTHON_MINOR = set(range(8, 14))  # python 3.8–3.13 are real published image tags
+
+
+def scan_dockerfile_hints(rel: str, content: str) -> str:
+    """Deterministic pass, NOT an AI call: cross-checks every COPY/ADD/CMD/
+    ENTRYPOINT/`-r requirements` reference in a Dockerfile against the real
+    repo file list (fuzzy-matched via difflib), and flags obviously-invalid
+    `FROM python:X.Y` tags. This exists because a 3B-8B local model is
+    unreliable at spotting things like 'apsddsp.py' vs 'app.py' by eye —
+    they don't visually resemble each other, so nothing short of an actual
+    directory listing comparison catches it reliably. The AI still has to
+    confirm and quote the exact broken line itself; this function only
+    produces a HINT, never edits anything.
+
+    CRITICAL: COPY/ADD/CMD/ENTRYPOINT paths resolve against the Docker BUILD
+    CONTEXT (the Dockerfile's own directory), NOT the repo root — the hint
+    text below is phrased relative to that context on purpose."""
+    hints = []
+    docker_dir = Path(rel).parent
+
+    all_repo = [_relstrip(str(p)) for p in Path(".").rglob("*")
+                if p.is_file() and not any(d in SKIP_DIRS for d in p.parts)]
+    basenames = {}
+    for f in all_repo:
+        basenames.setdefault(Path(f).name.lower(), []).append(f)
+    all_repo_set = set(all_repo)
+
+    for pat, label in DOCKERFILE_REF_PATTERNS:
+        for m in pat.finditer(content):
+            ref = m.group(1).strip().strip("'\"")
+            if not ref or ref in (".", "..") or ref.startswith("-") or ref.startswith("$"):
+                continue
+            ref_clean = ref.lstrip("./")
+            candidates = {ref_clean, _relstrip(str(docker_dir / ref_clean))}
+            if any(Path(c).is_file() or c in all_repo_set for c in candidates):
+                continue  # reference is valid, nothing to flag
+            close = difflib.get_close_matches(Path(ref_clean).name.lower(),
+                                               basenames.keys(), n=1, cutoff=0.3)
+            closest_base = close[0] if close else ""
+            closest_full = ""
+            for cand in basenames.get(closest_base, []):
+                try:
+                    closest_full = str(Path(cand).relative_to(docker_dir))
+                    break
+                except ValueError:
+                    continue
+            if closest_full:
+                hints.append(
+                    f"- {label} references '{ref}' — NOT FOUND in the build context "
+                    f"({docker_dir}/). Closest real file in the repo: '{closest_full}'. "
+                    f"This is almost certainly a typo — the fix is to replace '{ref}' with "
+                    f"'{closest_full}'. Do NOT prefix it with '{docker_dir}/' — that path "
+                    f"only exists relative to the repo root, not inside the build context.")
+            else:
+                hints.append(
+                    f"- {label} references '{ref}' — NOT FOUND in the build context "
+                    f"({docker_dir}/), and no similarly-named file exists anywhere in the "
+                    f"repo either. NOT a simple typo fix — likely needs a human to add or "
+                    f"relocate the file.")
+
+    m = re.search(r'FROM\s+python:(\d+)\.(\d+)', content)
+    if m:
+        major, minor = int(m.group(1)), int(m.group(2))
+        if major != 3 or minor not in VALID_PYTHON_MINOR:
+            hints.append(
+                f"- FROM python:{major}.{minor} is not a valid/published Python image tag "
+                f"on Docker Hub. Valid tags are python:3.8 through python:3.13 — the fix "
+                f"should update this to a real tag, e.g. python:3.12.")
+
+    return "\n".join(dict.fromkeys(hints))
+
+
 def fulfill_requests(requests_: list) -> tuple:
     """Python Orchestrator box: reads requested source files / Dockerfile /
     workflow YAML / requirements.txt / package.json, and runs allowed
-    diagnostic commands. Returns (transcript_entries, files_read_map)."""
-    entries, files_read = [], {}
+    diagnostic commands. Returns (transcript_entries, files_read_map,
+    hint_text) — hint_text is the deterministic scanner's findings, kept
+    separate so it can be forwarded verbatim into patch generation too."""
+    entries, files_read, hint_chunks = [], {}, []
     for req in requests_[:MAX_REQUESTS_PER_ROUND]:
         rtype = (req.get("type") or "").strip()
         target = (req.get("target") or "").strip()
@@ -503,18 +605,31 @@ def fulfill_requests(requests_: list) -> tuple:
             if ".." in rel or rel.startswith("/") or rel.startswith("~"):
                 entries.append(f"### {target} (denied: unsafe path)")
                 continue
-            if _is_blocked(rel):
-                entries.append(f"### {target} (denied: blocked/sensitive path)")
+            if _is_read_blocked(rel):
+                entries.append(f"### {target} (denied: secret-bearing path, never read)")
                 continue
             p = Path(rel)
             if not p.is_file() or not _is_text_file(p):
                 entries.append(f"### {target} (not found or not a text file)")
                 continue
+            edit_blocked_note = ""
+            if _is_blocked(rel):  # readable but not editable (workflow/CODEOWNERS)
+                edit_blocked_note = " — READ-ONLY EVIDENCE, do not propose editing this file"
             content = p.read_text(encoding="utf-8", errors="replace")[:MAX_FILE_CHARS]
             content = redact_secrets(content)
-            entries.append(f"### {rel}\n```\n{content}\n```")
-            files_read[rel] = content
-            print(f"[FULFILL] read_file {rel} ({len(content)} chars)")
+            entries.append(f"### {rel}{edit_blocked_note}\n```\n{content}\n```")
+            if not edit_blocked_note:
+                files_read[rel] = content  # only editable files go into patch-gen context
+            print(f"[FULFILL] read_file {rel} ({len(content)} chars)"
+                 + (" [read-only]" if edit_blocked_note else ""))
+            name_lower = Path(rel).name.lower()
+            if "dockerfile" in name_lower or "docker-compose" in name_lower or name_lower.startswith("compose."):
+                hint = scan_dockerfile_hints(rel, content)
+                if hint:
+                    entries.append(f"### Deterministic reference check on {rel} "
+                                   f"(verify each against the file — not authoritative on its own):\n{hint}")
+                    hint_chunks.append(hint)
+                    print(f"[FULFILL] deterministic scan flagged {hint.count(chr(10))+1} issue(s) in {rel}")
         elif rtype == "run_command":
             key = target
             if key not in SAFE_DIAGNOSTIC_COMMANDS:
@@ -537,12 +652,13 @@ def fulfill_requests(requests_: list) -> tuple:
                 entries.append(f"### command `{key}` (timed out)")
         else:
             entries.append(f"### unrecognized request type `{rtype}` for `{target}`")
-    return entries, files_read
+    return entries, files_read, "\n".join(dict.fromkeys(hint_chunks))
 
 
 def ai_investigate(evidence: dict) -> tuple:
-    """Runs the investigation loop. Returns (root_cause_dict, gathered_files)."""
-    transcript, gathered_files = [], {}
+    """Runs the investigation loop.
+    Returns (root_cause_dict, gathered_files, gathered_hints)."""
+    transcript, gathered_files, gathered_hints = [], {}, []
     result = {}
     for round_no in range(1, MAX_INVESTIGATION_ROUNDS + 1):
         print(f"\n━━━ AI INVESTIGATION — round {round_no}/{MAX_INVESTIGATION_ROUNDS} ━━━")
@@ -571,9 +687,11 @@ def ai_investigate(evidence: dict) -> tuple:
             result.setdefault("repair_strategy", "")
             result["confidence"] = float(data.get("confidence", 0.4) or 0.4)
             break
-        entries, files_read = fulfill_requests(requests_)
+        entries, files_read, hint_text = fulfill_requests(requests_)
         gathered_files.update(files_read)
         transcript.extend(entries)
+        if hint_text:
+            gathered_hints.append(hint_text)
     else:
         result["sufficient"] = True
         result.setdefault("root_cause", result.get("hypothesis", "unknown"))
@@ -589,8 +707,9 @@ def ai_investigate(evidence: dict) -> tuple:
         confidence = 0.5
     print(f"\n  ── confirmed ──\n  CAUSE      : {root_cause}\n"
           f"  STRATEGY   : {repair_strategy or '(none)'}\n  confidence : {confidence:.0%}")
-    return {"root_cause": root_cause, "repair_strategy": repair_strategy,
-            "confidence": confidence}, gathered_files
+    return ({"root_cause": root_cause, "repair_strategy": repair_strategy,
+             "confidence": confidence}, gathered_files,
+            "\n".join(dict.fromkeys(gathered_hints)))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -636,6 +755,19 @@ repo root. If the real file is at "sample_app/app.py" and the Dockerfile is
 at "sample_app/Dockerfile", the correct in-container reference is "app.py",
 never "sample_app/app.py".
 
+FINDING EVERY BUG: a file routinely contains MORE THAN ONE unrelated bug.
+Finding one and stopping is a FAILURE. Re-read the file line by line — a
+"## Deterministic reference check" section, if present below, has already
+verified which referenced filenames don't exist in the repo; treat every
+line in it as a bug to fix, not just the first one. Independently also
+check:
+  - Python base image tags: valid python:X.Y tags are 3.8 through 3.13.
+    python:3.0-3.7 or single-digit minors like python:3.1/3.2 are INVALID —
+    correct to python:3.12 unless the deterministic check said otherwise.
+  - Ports: if app.run(port=N) disagrees with a Dockerfile EXPOSE M, fix the
+    app code to bind M (don't change EXPOSE unless told to).
+Two bugs in one file = two entries in issues[] with the same "file".
+
 RULES:
 - evidence must literally appear in the file contents shown. If you cannot
   quote exact offending text, omit that issue.
@@ -644,11 +776,13 @@ RULES:
 
 
 def ai_generate_patch(cause: dict, evidence: dict, files_context: dict,
-                       extra_note: str = "") -> list:
+                       extra_note: str = "", hints: str = "") -> list:
     context_blocks = "\n\n".join(f"### {f}\n```\n{c}\n```" for f, c in files_context.items())
     ctx_line = (f"## Root cause: {cause['root_cause']}\n"
                 f"## Repair strategy: {cause['repair_strategy']}\n"
                 f"## Original CI failure:\n```\n{evidence['log_signal']}\n```\n")
+    if hints:
+        ctx_line += f"## Deterministic reference check (verify each against the file):\n{hints}\n"
     if extra_note:
         ctx_line += f"## Note from a previous failed attempt:\n{extra_note}\n"
     prompt = f"{FIX_SYSTEM}\n\n{ctx_line}\n## File contents (you may ONLY edit these):\n{context_blocks}\n\nEmit the issues JSON."
@@ -979,25 +1113,34 @@ def detect_test_commands(stacks: set) -> list:
     return cmds
 
 
-def run_tests(stacks: set) -> bool:
+def run_tests(stacks: set) -> tuple:
+    """Returns (passed: bool, failure_log: str). failure_log is the actual
+    captured test output — this IS the 'Collect New Failure Logs' evidence
+    the diagram hands back to the AI on the retry path, not just a note
+    saying tests failed."""
     cmds = detect_test_commands(stacks)
     if not cmds:
         print("[TEST] No test runner detected — skipping")
-        return True
-    ok_all = True
+        return True, ""
+    ok_all, failure_chunks = True, []
     for cmd in cmds:
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-            for line in (r.stdout + r.stderr).splitlines()[-15:]:
+            out = r.stdout + r.stderr
+            for line in out.splitlines()[-15:]:
                 print(f"  {line}")
             passed = r.returncode == 0
             print(f"[TEST] {' '.join(cmd[:2])}: {'✓ Passed' if passed else '✗ Failed'}")
             ok_all = ok_all and passed
+            if not passed:
+                failure_chunks.append(f"$ {' '.join(cmd)}\n{redact_secrets(out[-2000:])}")
         except FileNotFoundError:
             print(f"[TEST] {cmd[0]} not found — skipping")
         except subprocess.TimeoutExpired:
             print(f"[TEST] {cmd[0]} timed out — skipping")
-    return ok_all
+            failure_chunks.append(f"$ {' '.join(cmd)}\n(timed out after 180s)")
+            ok_all = False
+    return ok_all, "\n\n".join(failure_chunks)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1186,7 +1329,7 @@ def main():
 
     # ── AI INVESTIGATION AGENT (loop with Python-fulfilled requests) ──
     try:
-        cause, gathered_files = ai_investigate(evidence)
+        cause, gathered_files, det_hints = ai_investigate(evidence)
     except Exception as exc:
         print(f"[ERROR] Investigation failed: {exc}", file=sys.stderr)
         if token and repo:
@@ -1218,7 +1361,7 @@ def main():
     for attempt in range(1, MAX_PATCH_RETRY_ROUNDS + 1):
         print(f"\n━━━ AI PATCH GENERATION — attempt {attempt}/{MAX_PATCH_RETRY_ROUNDS} ━━━")
         try:
-            issues = ai_generate_patch(cause, evidence, gathered_files, extra_note)
+            issues = ai_generate_patch(cause, evidence, gathered_files, extra_note, det_hints)
         except Exception as exc:
             print(f"[ERROR] Patch generation failed: {exc}", file=sys.stderr)
             if attempt == MAX_PATCH_RETRY_ROUNDS:
@@ -1260,16 +1403,19 @@ def main():
         if args.skip_tests:
             print("[TEST] Skipped (--skip-tests)")
             break
-        if run_tests(stacks):
+        tests_passed, failure_log = run_tests(stacks)
+        if tests_passed:
             break
 
-        # failure branch: collect new failure evidence, let the AI review it,
-        # decide whether to retry
+        # failure branch: collect new failure evidence, let the AI review it
+        # on the next attempt's patch-generation call, decide whether to retry
         print("[TEST] Failed — reverting this attempt and gathering new evidence")
         revert_files(originals)
         written, originals = [], {}
-        extra_note = ("Your previous patch was reverted because tests failed after "
-                      "applying it. Reconsider the root cause and try a different fix.")
+        extra_note = (
+            "Your previous patch was reverted because tests failed after applying it. "
+            "Here is the actual new failure output — review it and reconsider the root "
+            f"cause, don't just repeat the same fix:\n{failure_log or '(no output captured)'}")
         if attempt == MAX_PATCH_RETRY_ROUNDS:
             flagged_for_review = True
 
