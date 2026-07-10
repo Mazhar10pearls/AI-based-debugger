@@ -72,7 +72,12 @@ jobs:
       # app filename); the failure only shows when the container actually runs.
       # This starts the image on a throwaway name+port and checks the app comes
       # up, so runtime breakage surfaces on EVERY branch — not silently on a main
-      # deploy. Uses port 5001 so it never collides with the live :5000 container.
+      # deploy. Uses port 5001 (host side) so it never collides with the live
+      # :5000 container that main's "Start container" step leaves running
+      # (--restart unless-stopped) across every subsequent CI run. The health
+      # check below MUST probe 5001, not 5000 — 5000 is the live prod port and
+      # checking it here would either fail outright (nothing bound) or, worse,
+      # silently pass against a stale prod container instead of this build.
       - name: Smoke-test the image
         run: |
           set -e
@@ -82,7 +87,7 @@ jobs:
 
           ok=0
           for i in {1..15}; do
-            if curl -fs http://127.0.0.1:5000 > /dev/null; then ok=1; break; fi
+            if curl -fs http://127.0.0.1:5001 > /dev/null; then ok=1; break; fi
             # Container exited already? bad CMD / crash-on-start — stop waiting.
             if [ "$(docker inspect -f '{{.State.Running}}' "$SMOKE" 2>/dev/null)" != "true" ]; then
               echo "Smoke test: container exited early — likely a runtime/CMD error"
