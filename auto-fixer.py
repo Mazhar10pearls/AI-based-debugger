@@ -675,13 +675,21 @@ RULES:
 - Only files with a ### header may be fixed."""
 
 
-def ai_generate_fix(facts, cause, signal, context, stacks, hints) -> list:
+def ai_generate_fix(facts, cause, signal, context, stacks, hints,
+                    already_fixed_lines=None) -> list:
     ctx_line = (f"## Root cause (already determined): {cause.get('root_cause')}\n"
                 f"## Solution direction: {cause.get('solution')}\n"
                 f"## Facts: error_type={facts.get('error_type')}, "
                 f"symbols={facts.get('key_symbols')}\n")
+    handled = ""
+    if already_fixed_lines:
+        listed = "\n".join(f"  - {ln}" for ln in already_fixed_lines if ln)
+        if listed:
+            handled = ("## Already being fixed by another pass — do NOT report these "
+                       "again. Instead, re-read the files for any OTHER bug still "
+                       "present and report only those:\n" + listed + "\n")
     def rebuild(ctx):
-        return ctx_line + _context_block(signal, ctx, stacks, hints) + \
+        return ctx_line + handled + _context_block(signal, ctx, stacks, hints) + \
                "\n\nEmit the issues JSON."
     prompt = _cap_prompt(FIX_SYSTEM, rebuild(context), context, rebuild)
     raw = _stream_ollama(prompt, FIX_SCHEMA, num_predict=2800,
@@ -841,9 +849,20 @@ def ai_self_verify(issues, context) -> tuple:
             idx = int(v.get("id", 0)) - 1
         except (TypeError, ValueError):
             continue
-        if 0 <= idx < len(issues) and v.get("keep") is False:
-            drop.add(idx)
-            print(f"[S4-VERIFY] dropped #{idx+1}: {v.get('reason','')[:80]}")
+        if not (0 <= idx < len(issues)) or v.get("keep") is not False:
+            continue
+        # The model's dominant failure mode is falsely claiming the evidence
+        # isn't in the file — which is deterministically checkable. Only honor a
+        # rejection when the evidence really is absent from the shown contents.
+        # If it's present, the verdict is wrong: keep the issue and let Python's
+        # locate + syntax + tests judge correctness.
+        ev = issues[idx].get("evidence") or ""
+        if ev and ev in context:
+            print(f"[S4-VERIFY] ignored drop of #{idx+1}: evidence is present in the "
+                  f"shown files (unreliable verdict overridden)")
+            continue
+        drop.add(idx)
+        print(f"[S4-VERIFY] dropped #{idx+1}: {v.get('reason','')[:80]}")
     kept = [it for i, it in enumerate(issues) if i not in drop]
     try:
         vc = float(data.get("confidence")) if data.get("confidence") is not None else None
@@ -860,6 +879,24 @@ def ai_self_verify(issues, context) -> tuple:
 # ══════════════════════════════════════════════════════════════════════════════
 # PAIR + LOCATE  (Python turns the AI's quotes into fixes)
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _changed_fragment(find, replace):
+    """The actual change an edit makes: (old, new) with the common prefix and
+    suffix stripped off. Two edits with the same fragment make the same net
+    change, regardless of how much surrounding text each quoted. Used to detect
+    when two passes proposed the identical fix — purely structural, so genuinely
+    different bugs on the same line reduce to different fragments and survive."""
+    if not isinstance(find, str) or not isinstance(replace, str):
+        return (find, replace)
+    i = 0
+    while i < len(find) and i < len(replace) and find[i] == replace[i]:
+        i += 1
+    j = 0
+    while (j < len(find) - i and j < len(replace) - i
+           and find[-1 - j] == replace[-1 - j]):
+        j += 1
+    return (find[i:len(find) - j], replace[i:len(replace) - j])
+
 
 def issues_to_fixes(issues: list, included_contents: dict) -> tuple:
     fixes_by_file, rejects = {}, []
@@ -1323,9 +1360,14 @@ def main():
         print(f"[AI-LINES] {sum(len(f['edits']) for f in prefilled_fixes)} corrected line(s)")
 
     # ── AI STAGE 3b: freeform diagnosis fix ──
+    # Tell the freeform pass which lines the correct-the-line pass already owns,
+    # so it stops re-reporting them and spends its attention on other bugs.
+    already_fixed_lines = [e.get("find", "") for f in prefilled_fixes
+                           for e in f.get("edits", []) or [] if e.get("find")]
     print("\n━━━ AI STAGE 3: GENERATE FIX ━━━")
     try:
-        issues = ai_generate_fix(facts, cause, signal, context, stacks, hints)
+        issues = ai_generate_fix(facts, cause, signal, context, stacks, hints,
+                                 already_fixed_lines=already_fixed_lines)
     except Exception as exc:
         print(f"[ERROR] AI stage 3 failed: {exc}", file=sys.stderr)
         if token and repo:
@@ -1358,6 +1400,27 @@ def main():
     freeform_fixes, pair_rejects = issues_to_fixes(issues, included_contents)
     for rej in pair_rejects:
         print(f"  ✗ {rej}", file=sys.stderr)
+
+    # Backstop: drop any freeform edit that makes the same net change (per file)
+    # as an edit the correct-the-line pass already produced — in case the model
+    # re-reported a line despite being told not to. Compared by changed fragment,
+    # so a genuinely different bug on the same line is not dropped.
+    prefilled_frags = {(f["file"], _changed_fragment(e.get("find", ""), e.get("replace", "")))
+                       for f in prefilled_fixes for e in f.get("edits", []) or []}
+    dropped_dupes = 0
+    for f in freeform_fixes:
+        keep = []
+        for e in f.get("edits", []) or []:
+            key = (f["file"], _changed_fragment(e.get("find", ""), e.get("replace", "")))
+            if key in prefilled_frags:
+                dropped_dupes += 1
+            else:
+                keep.append(e)
+        f["edits"] = keep
+    freeform_fixes = [f for f in freeform_fixes if f.get("edits")]
+    if dropped_dupes:
+        print(f"[MERGE] dropped {dropped_dupes} freeform edit(s) already covered by "
+              f"the correct-the-line pass")
 
     merged = {}
     for f in prefilled_fixes + freeform_fixes:
