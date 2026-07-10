@@ -2,15 +2,16 @@ name: Local CI/CD Deploy
 
 # ── Git flow ────────────────────────────────────────────────────────────────
 # build + test  → runs on every push/PR to main & develop (and feature→develop PRs)
-# deploy        → ONLY on push to main (the box has one app + one port 5000)
+# deploy        → runs on every PUSH (any branch), not PR builds
 #
-#   feature/* ──PR──► develop ──► release/* ──► main ──► (deploy)
-#                       │            │            └─ deploy + tag
-#                       └ build+test └ build+test (no deploy)
-#
-# Why split: building on every branch catches Dockerfile/test breakage BEFORE
-# merge, but only main may bind :5000 and run a container — otherwise two
-# branches racing on an 8GB single-box runner collide on the port and on RAM.
+# ⚠ CHANGED: deploy is no longer restricted to `main`. This box has ONE app
+# container name and ONE host port (5000). Deploying from more than one
+# branch's push will collide — either "port is already allocated" if a
+# previous branch's container is still up, or one branch silently killing
+# another branch's just-deployed container via "Stop existing container".
+# There is currently no per-branch isolation (container name / port are not
+# branch-scoped) — if two branches get pushed in quick succession, whichever
+# deploy runs second wins and the other's container is gone.
 on:
   push:
     branches: [main, develop, 'qa/**']
@@ -111,11 +112,11 @@ jobs:
       # ── Deploy (main + push only) ─────────────────────────────────────────
       # Every deploy step is gated so PRs and develop pushes stop after build.
       - name: Stop existing container
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        if: github.event_name == 'push'
         run: docker rm -f ai-devops-sample-app || true
 
       - name: Start container
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        if: github.event_name == 'push'
         run: |
           docker run -d \
             --name ai-devops-sample-app \
@@ -124,7 +125,7 @@ jobs:
             ai-devops-sample-app:${{ github.sha }}
 
       - name: Wait for app to be healthy
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        if: github.event_name == 'push'
         run: |
           echo "Waiting for application to start..."
           for i in {1..20}; do
@@ -140,10 +141,10 @@ jobs:
           exit 1
 
       - name: Verify deployment
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        if: github.event_name == 'push'
         run: curl -f http://127.0.0.1:5000
 
       # ── Housekeeping: drop old image tags so the 8GB box doesn't fill up ──
       - name: Prune dangling images
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        if: github.event_name == 'push'
         run: docker image prune -f || true
