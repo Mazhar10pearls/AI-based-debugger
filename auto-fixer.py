@@ -473,6 +473,17 @@ separate typo'd file paths) — finding one and stopping is a FAILURE. \
 "root_cause"/"solution" above are just a one-sentence roll-up for a commit \
 message; "findings" is the itemized breakdown a human will actually read.
 
+ALSO CRITICAL — a CI pipeline stops at the first failing step, so later \
+steps never ran and their bugs can't appear in the logs. But if a file you \
+were shown for one bug ALSO contains an obviously broken later step (e.g. a \
+workflow file's test step references a filename that isn't in the \
+repository tree, even though an earlier step is what actually failed this \
+run), report that as its own "findings" entry too. Fixing it now saves a \
+second CI run from hitting the exact same class of bug one step further in. \
+Only do this for issues you can directly verify from what's shown to you \
+(e.g. a referenced filename that doesn't exist in the repo tree) — don't \
+guess at bugs you can't confirm.
+
 Rules:
 - If the logs and diff already make the cause obvious, confirm immediately — \
 don't pad with unnecessary file requests.
@@ -500,9 +511,58 @@ def _closest_allowed_file(requested: str, allowed_files: set) -> str:
     return best[0] if best else candidates[0]
 
 
+# High-signal, low-noise file types worth pre-scanning for broken references
+# — the same class of bug (typo'd filename) the investigation loop keeps
+# rediscovering the slow way. Deliberately narrow: config/CI files where a
+# path-like token is almost always meant to resolve to a real repo file.
+PRESCAN_FILE_PATTERN = re.compile(r"(^|/)(dockerfile[\w.\-]*|.*\.ya?ml)$", re.I)
+REPO_REF_EXT_PATTERN = re.compile(
+    r'(?<![\w./\-])((?:[\w.\-]+/)*[\w\-]+\.(?:py|txt|ya?ml|json|toml|cfg|ini|'
+    r'js|jsx|ts|tsx|go|java|rb|sh))(?![\w./\-])')
+PRESCAN_MIN_SIMILARITY = 0.72
+
+
+def deterministic_reference_scan(allowed_files: set) -> list:
+    """Fast, Python-only pass over Dockerfiles and workflow YAML for broken
+    file references — no model call, no waiting. Runs in well under a
+    second versus minutes of a small local model repeatedly failing to
+    produce useful output for the same class of bug. Returns a list of
+    {file, wrong_token, suggested, line} candidates; empty list if nothing
+    found, in which case the caller falls back to the full AI investigation."""
+    candidates = []
+    for f in sorted(allowed_files):
+        if not PRESCAN_FILE_PATTERN.search(f):
+            continue
+        content = _read_evidence_file(f)
+        if content is None:
+            continue
+        seen_tokens = set()
+        for m in REPO_REF_EXT_PATTERN.finditer(content):
+            token = m.group(1)
+            if token in seen_tokens or token in allowed_files:
+                continue
+            seen_tokens.add(token)
+            if "${{" in token or token.startswith("."):
+                continue
+            match = _closest_allowed_file(token, allowed_files)
+            if not match or match == token:
+                continue
+            similarity = difflib.SequenceMatcher(None, token, match).ratio()
+            if similarity < PRESCAN_MIN_SIMILARITY:
+                continue
+            line_start = content.rfind("\n", 0, m.start()) + 1
+            line_end = content.find("\n", m.end())
+            line = content[line_start:(line_end if line_end != -1 else len(content))].strip()
+            candidates.append({"file": f, "wrong_token": token,
+                               "suggested": match, "line": line})
+            print(f"[PRESCAN] {f}: '{token}' looks like a typo of '{match}' "
+                  f"(similarity {similarity:.2f})")
+    return candidates
+
+
 def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
                                 evidence: dict, last_turn: bool,
-                                notes: list = None) -> str:
+                                notes: list = None, hint_text: str = "") -> str:
     ev_parts, total = [], 0
     for f, c in evidence.items():
         block = f"### {f}\n```\n{c}\n```"
@@ -520,8 +580,19 @@ def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
         notes_section = ("\n## Notes on your last request (read this before "
                          "deciding what to request next):\n"
                          + "\n".join(f"- {n}" for n in notes) + "\n")
+    hint_section = ""
+    if hint_text:
+        hint_section = (
+            "\n## Static pre-scan hint (NOT a conclusion — verify it yourself "
+            "against the evidence below before relying on it; it can have false "
+            "positives):\n" + hint_text + "\n"
+            "Some relevant files have already been read for you and appear "
+            "under 'Evidence gathered so far'. You still decide the root cause, "
+            "confidence, and findings — this hint only points you at where to "
+            "look first.\n"
+        )
     return (
-        f"{INVESTIGATE_SYSTEM}{turn_note}{notes_section}\n"
+        f"{INVESTIGATE_SYSTEM}{turn_note}{notes_section}{hint_section}\n"
         f"## CI failure (key lines):\n```\n{signal}\n```\n"
         f"## Exit code: {exit_code}\n"
         f"## Git diff (most recent commit):\n```\n{git_diff}\n```\n"
@@ -563,10 +634,18 @@ def _finalize_investigation(data: dict, forced: bool) -> dict:
     }
 
 
-def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set) -> dict:
+def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
+                   seed_evidence: dict = None, hint_text: str = "") -> dict:
     """The core investigation loop from the diagram: AI reads evidence, thinks,
     requests more if needed, loops, confirms root cause. Bounded by
     MAX_INVESTIGATION_TURNS so a small model can't spin forever.
+
+    seed_evidence/hint_text let a fast Python pre-scan hand the AI a head
+    start — relevant files pre-loaded, a pointer to what looks suspicious —
+    WITHOUT deciding the root cause itself. The AI still reads everything,
+    still has to confirm or refute the hint against the actual evidence, and
+    still sets its own confidence and findings. Python assists; it doesn't
+    conclude.
 
     Two things keep a small model from stalling here:
       - a requested file that doesn't exist gets fuzzy-matched against the
@@ -575,7 +654,8 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set) -
       - if a turn produces literally no new evidence (everything requested
         was already denied/read before), that's a stall — after 2 such
         turns in a row we force a final decision instead of repeating."""
-    evidence, log, result = {}, [], None
+    evidence = dict(seed_evidence) if seed_evidence else {}
+    log, result = [], None
     dead_ends = set()       # requests with no usable match — no point re-suggesting
     pending_notes = []      # fed into the next prompt
     stall_count = 0
@@ -584,7 +664,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set) -
         last_turn = (turn == MAX_INVESTIGATION_TURNS)
         prompt = _build_investigation_prompt(signal, exit_code, repo_tree,
                                              git_diff, evidence, last_turn,
-                                             pending_notes)
+                                             pending_notes, hint_text)
         pending_notes = []
         try:
             raw = _stream_ollama(prompt, INVESTIGATE_SCHEMA, num_predict=900,
@@ -643,7 +723,8 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set) -
                     print("[INVESTIGATE] no new evidence for 2 turns in a row — "
                           "forcing a final decision instead of continuing to stall.")
                 final_prompt = _build_investigation_prompt(
-                    signal, exit_code, repo_tree, git_diff, evidence, True, pending_notes)
+                    signal, exit_code, repo_tree, git_diff, evidence, True,
+                    pending_notes, hint_text)
                 try:
                     raw2 = _stream_ollama(final_prompt, INVESTIGATE_SCHEMA,
                                           num_predict=900, temperature=0.05,
@@ -1451,9 +1532,26 @@ def main():
     repo_tree, allowed_files = repo_tree_text()
     print(f"[EVIDENCE] exit_code={exit_code} | {len(allowed_files)} readable file(s) in tree")
 
+    # ── DETERMINISTIC PRE-SCAN (context for the AI — never decides anything itself) ──
+    print("\n━━━ DETERMINISTIC REFERENCE SCAN ━━━")
+    prescan = deterministic_reference_scan(allowed_files)
+    seed_evidence, hint_text = {}, ""
+    if prescan:
+        seed_evidence = {c["file"]: _read_evidence_file(c["file"]) for c in prescan}
+        hint_lines = "\n".join(
+            f"- {c['file']}: '{c['wrong_token']}' does not appear in the repository "
+            f"tree; the closest real file is '{c['suggested']}'" for c in prescan)
+        hint_text = hint_lines
+        print(f"[PRESCAN] {len(prescan)} candidate(s) found — pre-loading "
+              f"{len(seed_evidence)} file(s) and passing this as a hint to the "
+              f"investigation agent (it still decides).")
+    else:
+        print("[PRESCAN] nothing found — investigation agent starts with no hint.")
+
     # ── AI INVESTIGATION AGENT ──
     print("\n━━━ AI INVESTIGATION AGENT ━━━")
-    investigation = ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files)
+    investigation = ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files,
+                                   seed_evidence, hint_text)
     root_cause = investigation["root_cause"]
     solution   = investigation["solution"]
     commit_msg = investigation["commit_message"]
@@ -1476,8 +1574,15 @@ def main():
     if confidence < 0.5:
         print(f"[GATE] Confidence {confidence:.0%} too low — escalating instead of guessing.")
         if token and repo:
-            open_issue(token, repo,
-                       f"AI confidence too low ({confidence:.0%}). Root cause: {root_cause}", run_url)
+            escalation_detail = (
+                f"AI confidence too low ({confidence:.0%}). Root cause: {root_cause}\n\n"
+                f"**Error signal Python extracted from the log:**\n```\n{signal[:1500]}\n```\n\n"
+                f"**Files read during investigation:** "
+                f"{', '.join(evidence.keys()) or '(none)'}\n\n"
+                f"The investigation agent could not converge on a confident diagnosis "
+                f"— a human will need to look at the log/files directly."
+            )
+            open_issue(token, repo, escalation_detail, run_url)
         sys.exit(0)
 
     # feed every itemized issue into the patch agent, not just the one-line
