@@ -73,9 +73,15 @@ MAX_REPAIR_ROUNDS       = int(os.environ.get("MAX_REPAIR_ROUNDS", "2"))
 # ── Prompt / context budget ───────────────────────────────────────────────────
 MAX_ERROR_LINES   = 14
 MAX_FILE_CHARS    = 4000
-MAX_TOTAL_CONTEXT = 10000
+MAX_TOTAL_CONTEXT = 6000      # evidence (incl. seeds) budget — kept small so a
+                             # 3B model isn't handed a wall of text it can't parse
 MAX_FILES_FIXED   = 4
 MAX_PROMPT_CHARS  = 11000
+# The investigation prompt had NO cap before, so seeding two full workflow
+# files blew it past 17K chars and the model degenerated into empty stubs.
+# Cap it, and trim the git diff for this stage specifically.
+MAX_INVESTIGATION_PROMPT_CHARS = 12000
+MAX_INVEST_DIFF_CHARS          = 1500
 
 # ── Git flow ──────────────────────────────────────────────────────────────────
 GIT_BASE_BRANCH   = os.environ.get("GIT_BASE_BRANCH",   "develop")
@@ -115,10 +121,16 @@ SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "env",
              ".idea", ".vscode", "coverage", "tmp", "temp", "logs"}
 MAX_FILE_SIZE_BYTES = 100_000
 
-# How many workflow files to seed into the initial evidence bundle. There's
-# normally one; the cap keeps a repo with many workflows from blowing the
-# context budget.
-MAX_SEED_WORKFLOWS = int(os.environ.get("MAX_SEED_WORKFLOWS", "2"))
+# How many workflow files to seed into the initial evidence bundle, and how
+# much of each. Kept to ONE small file by default: seeding two full workflows
+# blew the prompt past what a 3B model can handle. The relevant CI workflow is
+# usually one file; more than that is noise that drowns the signal.
+MAX_SEED_WORKFLOWS  = int(os.environ.get("MAX_SEED_WORKFLOWS", "1"))
+MAX_SEED_FILE_CHARS = int(os.environ.get("MAX_SEED_FILE_CHARS", "2500"))
+# A workflow that references the auto-fixer itself is the meta-workflow that
+# RUNS this tool on failure — it is never the thing being fixed, so it's
+# excluded from seeding (it's pure noise in the investigation prompt).
+META_WORKFLOW_MARKERS = ("auto-fixer", "auto_fixer", "self-healing", "self_healing")
 
 # ── Secret scanning ─────────────────────────────────────────────────────────
 SECRET_PATTERNS = [
@@ -375,14 +387,23 @@ def seed_workflow_evidence(allowed_files: set) -> dict:
     """
     seeded = {}
     wf_files = sorted(f for f in allowed_files if WORKFLOW_PATTERN.search(f))
-    for f in wf_files[:MAX_SEED_WORKFLOWS]:
+    for f in wf_files:
+        if len(seeded) >= MAX_SEED_WORKFLOWS:
+            break
         content = _read_evidence_file(f)
-        if content is not None:
-            seeded[f] = content
+        if content is None:
+            continue
+        # skip the auto-fixer's own trigger workflow — it's never a fix target
+        if any(m in content.lower() for m in META_WORKFLOW_MARKERS):
+            print(f"[EVIDENCE]   skip seeding meta-workflow {f} (runs the fixer)")
+            continue
+        if len(content) > MAX_SEED_FILE_CHARS:
+            content = content[:MAX_SEED_FILE_CHARS] + "\n...(truncated)"
+        seeded[f] = content
     if seeded:
         print(f"[EVIDENCE] seeded workflow file(s): {', '.join(seeded)}")
     else:
-        print("[EVIDENCE] no workflow file found to seed")
+        print("[EVIDENCE] no non-meta workflow file found to seed")
     return seeded
 
 
@@ -583,16 +604,33 @@ def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
                  "status \"root_cause_confirmed\" now, using your best "
                  "hypothesis from the evidence so far. Lower your confidence "
                  "if you're not fully sure.\n" if last_turn else "")
-    return (
-        f"{INVESTIGATE_SYSTEM}{turn_note}\n"
-        f"## CI failure (key lines):\n```\n{signal}\n```\n"
-        f"## Exit code: {exit_code}\n"
-        f"## Git diff (most recent commit):\n```\n{git_diff}\n```\n"
-        f"## Repository tree (folders & filenames only — request only from this list):\n{repo_tree}\n"
-        f"{denied_note}"
-        f"## Evidence gathered so far:\n{ev_text}\n\n"
-        f"Respond with the JSON described above."
-    )
+    diff = git_diff or ""
+    if len(diff) > MAX_INVEST_DIFF_CHARS:
+        diff = diff[:MAX_INVEST_DIFF_CHARS] + "\n...(truncated)"
+
+    def _assemble(ev):
+        return (
+            f"{INVESTIGATE_SYSTEM}{turn_note}\n"
+            f"## CI failure (key lines):\n```\n{signal}\n```\n"
+            f"## Exit code: {exit_code}\n"
+            f"## Git diff (most recent commit):\n```\n{diff}\n```\n"
+            f"## Repository tree (folders & filenames only — request only from this list):\n{repo_tree}\n"
+            f"{denied_note}"
+            f"## Evidence gathered so far:\n{ev}\n\n"
+            f"Respond with the JSON described above."
+        )
+
+    prompt = _assemble(ev_text)
+    # Hard cap: if the prompt is oversized, trim the EVIDENCE only — never the
+    # JSON instructions or the error signal. A 3B model handed a wall of text
+    # degenerates into empty stubs, which is exactly what over-seeding caused.
+    if len(prompt) > MAX_INVESTIGATION_PROMPT_CHARS:
+        overshoot = len(prompt) - MAX_INVESTIGATION_PROMPT_CHARS
+        trimmed = ev_text[:max(0, len(ev_text) - overshoot - 20)] + "\n...(evidence truncated)"
+        prompt = _assemble(trimmed)
+        print(f"[INVESTIGATE] prompt trimmed to fit "
+              f"({len(prompt)} chars, cap {MAX_INVESTIGATION_PROMPT_CHARS})")
+    return prompt
 
 
 def _finalize_investigation(data: dict, forced: bool) -> dict:
