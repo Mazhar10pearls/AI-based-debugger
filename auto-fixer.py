@@ -54,32 +54,67 @@ import yaml
 # ── Ollama ────────────────────────────────────────────────────────────────────
 OLLAMA_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/api/generate")
 OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL",   "qwen2.5-coder:3b")
-# A bigger model is slower per token on the same CPU box, but needs far fewer
-# retries/turns to get a real answer — so the per-call budget goes UP even
-# though total wall time usually goes down. All tunable per model via env.
-AI_TIMEOUT     = int(os.environ.get("AI_TIMEOUT", "300"))
+# Used by patch-generation/review calls (fewer, more consequential — worth a
+# bit more patience than the investigation loop, which has its own tighter
+# INVESTIGATION_TIMEOUT below). 210s matches what was actually proven to
+# work for 3B on this box before the 7B experiment.
+AI_TIMEOUT     = int(os.environ.get("AI_TIMEOUT", "210"))
 MAX_RETRIES    = int(os.environ.get("AI_MAX_RETRIES", "2"))
 RETRY_BACKOFF  = [20, 20]
-# qwen2.5-coder:7b ships with a real 32K-token context window (vs. the 3B's
-# same nominal window but far worse ability to actually use it). 16K tokens
-# leaves headroom for the output + is comfortably inside 32K.
-OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "16384"))
+# Sized for qwen2.5-coder:3b on a resource-constrained self-hosted runner
+# that's shared with the rest of the CI job (docker build, pip install,
+# pytest all competing for the same RAM). A bigger num_ctx means a bigger
+# resident KV cache — on a tight box that's the difference between running
+# fine and swapping, which is far worse for latency than the model itself
+# being smaller. If you move to a bigger/dedicated box, raise this via env.
+OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
+
+# Investigation turns get their OWN, tighter timeout/retry budget. The turn
+# loop already has its own recovery logic (fuzzy-match, stall detection,
+# forced final turn) — a stuck low-level HTTP call doesn't need its own
+# multi-attempt retry loop stacked on top of that, it just needs to fail
+# fast so the turn loop can move on. This is what actually keeps a run from
+# needing to be manually cancelled: worst case per turn is bounded tightly,
+# not AI_TIMEOUT × MAX_RETRIES.
+INVESTIGATION_TIMEOUT = int(os.environ.get("INVESTIGATION_TIMEOUT", "150"))
+INVESTIGATION_RETRIES = int(os.environ.get("INVESTIGATION_RETRIES", "1"))
+
+# Hard ceiling on the whole run's AI-calling wall-clock time. Checked at
+# every major stage boundary (each investigation turn, each repair round);
+# once exceeded, the script stops making model calls and escalates with
+# whatever it has, instead of running until someone cancels it by hand.
+TOTAL_TIME_BUDGET = int(os.environ.get("TOTAL_TIME_BUDGET", "600"))
+_run_start_time = None
+
+
+def _elapsed() -> float:
+    return time.time() - _run_start_time if _run_start_time else 0.0
+
+
+def _budget_exceeded() -> bool:
+    return _run_start_time is not None and _elapsed() >= TOTAL_TIME_BUDGET
+
 
 # ── Agentic-loop bounds ──────────────────────────────────────────────────────
 MAX_INVESTIGATION_TURNS = int(os.environ.get("MAX_INVESTIGATION_TURNS", "4"))
+# When the deterministic pre-scan hands the AI a hint, it shouldn't need the
+# full turn budget to explore — it already knows where to look. Cuts the
+# worst case for the common "typo'd reference" scenario dramatically.
+MAX_TURNS_WITH_HINT     = int(os.environ.get("MAX_TURNS_WITH_HINT", "2"))
 MAX_FILES_PER_REQUEST   = int(os.environ.get("MAX_FILES_PER_REQUEST", "3"))
 MAX_REPAIR_ROUNDS       = int(os.environ.get("MAX_REPAIR_ROUNDS", "2"))
 
 # ── Prompt / context budget ───────────────────────────────────────────────────
-# Bumped from the 3B-era defaults (4000/10000/11000 chars) now that the model
-# can actually make use of more context instead of getting lost in it. Still
-# comfortably inside OLLAMA_NUM_CTX (16K tokens ≈ 60K+ chars) with room to
-# spare for the system prompt, repo tree, and output.
+# Kept small deliberately: qwen2.5-coder:3b doesn't reliably USE extra
+# context (it gets "lost in the middle" on large prompts rather than
+# reasoning better), and on this box every extra KB of context is also more
+# RAM held resident while competing with the rest of the CI job. Only raise
+# these if you also move to a bigger model on a less contended box.
 MAX_ERROR_LINES   = 14
-MAX_FILE_CHARS    = int(os.environ.get("MAX_FILE_CHARS", "8000"))
-MAX_TOTAL_CONTEXT = int(os.environ.get("MAX_TOTAL_CONTEXT", "20000"))
+MAX_FILE_CHARS    = int(os.environ.get("MAX_FILE_CHARS", "4000"))
+MAX_TOTAL_CONTEXT = int(os.environ.get("MAX_TOTAL_CONTEXT", "10000"))
 MAX_FILES_FIXED   = 4
-MAX_PROMPT_CHARS  = int(os.environ.get("MAX_PROMPT_CHARS", "24000"))
+MAX_PROMPT_CHARS  = int(os.environ.get("MAX_PROMPT_CHARS", "11000"))
 
 # ── Git flow ──────────────────────────────────────────────────────────────────
 GIT_BASE_BRANCH   = os.environ.get("GIT_BASE_BRANCH",   "develop")
@@ -351,7 +386,8 @@ def _extract_token(line: bytes, fmt: str) -> str:
 
 
 def _stream_ollama(prompt, schema=None, num_predict=2000, temperature=0.05,
-                   num_ctx=OLLAMA_NUM_CTX, tag="AI", retries=MAX_RETRIES) -> str:
+                   num_ctx=OLLAMA_NUM_CTX, tag="AI", retries=MAX_RETRIES,
+                   timeout=AI_TIMEOUT) -> str:
     endpoint, fmt = _detect_endpoint()
     if fmt == "openai":
         payload = {"model": OLLAMA_MODEL, "prompt": prompt, "temperature": temperature,
@@ -368,7 +404,7 @@ def _stream_ollama(prompt, schema=None, num_predict=2000, temperature=0.05,
     for attempt in range(retries):
         try:
             t0, collected = time.time(), []
-            resp = requests.post(endpoint, json=payload, timeout=(10, AI_TIMEOUT), stream=True)
+            resp = requests.post(endpoint, json=payload, timeout=(10, timeout), stream=True)
             resp.raise_for_status()
             for line in resp.iter_lines():
                 tok = _extract_token(line, fmt)
@@ -599,8 +635,12 @@ def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
             "positives):\n" + hint_text + "\n"
             "Some relevant files have already been read for you and appear "
             "under 'Evidence gathered so far'. You still decide the root cause, "
-            "confidence, and findings — this hint only points you at where to "
-            "look first.\n"
+            "confidence, and findings. But if you check the evidence and this "
+            "hint fully explains the CI failure, respond with status "
+            "\"root_cause_confirmed\" RIGHT NOW — do not request more files "
+            "just to double-check something already visible in the evidence "
+            "you have. Only ask for more if the hint does NOT explain the "
+            "failure or you need to see something else to be sure.\n"
         )
     return (
         f"{INVESTIGATE_SYSTEM}{turn_note}{notes_section}{hint_section}\n"
@@ -671,15 +711,25 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
     pending_notes = []      # fed into the next prompt
     stall_count = 0
 
-    for turn in range(1, MAX_INVESTIGATION_TURNS + 1):
-        last_turn = (turn == MAX_INVESTIGATION_TURNS)
+    effective_turns = MAX_TURNS_WITH_HINT if hint_text else MAX_INVESTIGATION_TURNS
+    if hint_text:
+        print(f"[INVESTIGATE] pre-scan hint present — capping this run to "
+              f"{effective_turns} turn(s) instead of the full {MAX_INVESTIGATION_TURNS}.")
+
+    for turn in range(1, effective_turns + 1):
+        if _budget_exceeded():
+            print(f"[INVESTIGATE] time budget ({TOTAL_TIME_BUDGET}s) exceeded "
+                  f"before turn {turn} — stopping instead of starting another slow call.")
+            break
+        last_turn = (turn == effective_turns)
         prompt = _build_investigation_prompt(signal, exit_code, repo_tree,
                                              git_diff, evidence, last_turn,
                                              pending_notes, hint_text)
         pending_notes = []
         try:
-            raw = _stream_ollama(prompt, INVESTIGATE_SCHEMA, num_predict=1400,
-                                 temperature=0.05, tag=f"INVESTIGATE-T{turn}")
+            raw = _stream_ollama(prompt, INVESTIGATE_SCHEMA, num_predict=900,
+                                 temperature=0.05, tag=f"INVESTIGATE-T{turn}",
+                                 timeout=INVESTIGATION_TIMEOUT, retries=INVESTIGATION_RETRIES)
         except Exception as exc:
             print(f"[INVESTIGATE] turn {turn} failed: {exc}", file=sys.stderr)
             break
@@ -733,13 +783,20 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                 if stall_count >= 2 and not last_turn:
                     print("[INVESTIGATE] no new evidence for 2 turns in a row — "
                           "forcing a final decision instead of continuing to stall.")
+                if _budget_exceeded():
+                    print(f"[INVESTIGATE] time budget exceeded — skipping the extra "
+                          f"final call and finalizing from turn {turn}'s data.")
+                    result = _finalize_investigation(data, True)
+                    break
                 final_prompt = _build_investigation_prompt(
                     signal, exit_code, repo_tree, git_diff, evidence, True,
                     pending_notes, hint_text)
                 try:
                     raw2 = _stream_ollama(final_prompt, INVESTIGATE_SCHEMA,
-                                          num_predict=1400, temperature=0.05,
-                                          tag="INVESTIGATE-FINAL")
+                                          num_predict=900, temperature=0.05,
+                                          tag="INVESTIGATE-FINAL",
+                                          timeout=INVESTIGATION_TIMEOUT,
+                                          retries=INVESTIGATION_RETRIES)
                     data2 = _json_from(raw2) or data
                 except Exception as exc:
                     print(f"[INVESTIGATE] final turn failed: {exc}", file=sys.stderr)
@@ -826,7 +883,7 @@ def ai_generate_patch(root_cause: str, solution: str, evidence: dict,
               f"Emit the issues JSON.")
     if len(prompt) > MAX_PROMPT_CHARS:
         prompt = prompt[:MAX_PROMPT_CHARS]
-    raw = _stream_ollama(prompt, PATCH_SCHEMA, num_predict=3000,
+    raw = _stream_ollama(prompt, PATCH_SCHEMA, num_predict=2200,
                          temperature=0.05, tag="PATCH")
     data = _json_from(raw)
     if data is None:
@@ -1494,12 +1551,16 @@ def open_issue(token, repo, reason, run_url=""):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    global _run_start_time
+    _run_start_time = time.time()
+
     ap = argparse.ArgumentParser(description="AI CI/CD auto-fixer (agentic investigation)")
     ap.add_argument("--input", required=True, help="Path to CI failure log")
     ap.add_argument("--exit-code", default=None, help="Exit code of the failed step, if known")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--skip-tests", action="store_true")
     args = ap.parse_args()
+    print(f"[BUDGET] total wall-clock budget for this run: {TOTAL_TIME_BUDGET}s")
 
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_PAT", "")
     repo  = os.environ.get("GITHUB_REPOSITORY", "")
@@ -1610,6 +1671,18 @@ def main():
     retry_note = ""
 
     for repair_round in range(1, MAX_REPAIR_ROUNDS + 1):
+        if _budget_exceeded():
+            print(f"[BUDGET] time budget ({TOTAL_TIME_BUDGET}s) exceeded before "
+                  f"repair round {repair_round} — stopping instead of starting "
+                  f"another slow cycle.")
+            if token and repo:
+                open_issue(token, repo,
+                           f"Auto-fixer hit its time budget ({TOTAL_TIME_BUDGET}s) before "
+                           f"finishing. Root cause so far: {root_cause}\n\nThis stopped "
+                           f"itself instead of running until manually cancelled — check "
+                           f"TOTAL_TIME_BUDGET / OLLAMA_NUM_CTX / MAX_TOTAL_CONTEXT if this "
+                           f"keeps happening.", run_url)
+            sys.exit(5)
         print(f"\n━━━ AI PATCH GENERATION AGENT (round {repair_round}/{MAX_REPAIR_ROUNDS}) ━━━")
         try:
             issues = ai_generate_patch(patch_root_cause, solution, evidence, retry_note)
