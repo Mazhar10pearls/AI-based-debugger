@@ -338,6 +338,11 @@ def _score_file(path: Path, signal: str, stacks: set) -> int:
 
 
 def find_ci_workflow_files(root: Path = Path(".")) -> list:
+    """Discover CI workflow files for GROUNDING. Deliberately does NOT apply
+    _is_blocked — reading a workflow to understand a CI failure is always safe
+    and always relevant; whether we may EDIT it is a separate decision made at
+    rewrite time (ALLOW_WORKFLOW_FIXES). The only skip is the workflow that
+    runs this very tool, to avoid it diagnosing/looping on itself."""
     found = []
     wf_dir = root / ".github" / "workflows"
     if not wf_dir.is_dir():
@@ -346,8 +351,6 @@ def find_ci_workflow_files(root: Path = Path(".")) -> list:
         if not p.is_file():
             continue
         rel = _relstrip(str(p))
-        if _is_blocked(rel):
-            continue
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
         except Exception:
@@ -1424,28 +1427,59 @@ def main():
         sys.exit(0)
 
     forced = extract_referenced_paths(log_text)
-    # When workflow fixing is enabled, the CI workflow is a prime suspect for
-    # the whole class of "typo in the pipeline" bugs (bad python-version,
-    # mistyped -r path, wrong test path). The referenced files in the log are
-    # often the *targets* of those typos, not where the fix goes — the fix goes
-    # in the workflow. So always pull the workflow(s) into context; observations
-    # will confirm whether they're actually broken.
-    if ALLOW_WORKFLOW_FIXES:
-        wf = find_ci_workflow_files()
-        if wf:
-            print(f"[DISCOVER] Workflow fixing enabled — including workflow(s): {wf}")
-            forced = list(dict.fromkeys(wf + forced))
-    if not forced:
-        wf = find_ci_workflow_files()
-        if wf:
-            print(f"[DISCOVER] No source file referenced — falling back to CI workflow: {wf}")
-            forced = wf
+    # ALWAYS pull the CI workflow(s) into context — reading them is grounding,
+    # not editing. The referenced files in the log are usually the TARGETS of a
+    # pipeline typo (bad python-version, mistyped `-r` path, wrong test path),
+    # while the fix itself lives in the workflow. Prepending them means the
+    # diagnosis is grounded on the workflow's actual contents even when editing
+    # workflows is disabled — the difference the toggle makes is whether we can
+    # then FIX them or must escalate. (This is what stops the ungrounded
+    # "failure.log is missing" hallucination: with the workflow observed, the
+    # model gets concrete verified facts to reason from.)
+    wf = find_ci_workflow_files()
+    if wf:
+        edit_state = "editable" if ALLOW_WORKFLOW_FIXES else "read-only (grounding)"
+        print(f"[DISCOVER] Including CI workflow(s) [{edit_state}]: {wf}")
+        forced = list(dict.fromkeys(wf + forced))
     context, included, included_contents = discover_context(signal, stacks, forced)
     if not included:
         print("[DISCOVER] WARNING: no files resolved.")
 
     observations = scan_observations(included_contents)
     obs_text = observations_text(observations)
+
+    # Split observations by whether we can actually edit the file they concern.
+    # A problem in a non-editable file (e.g. a workflow, when ALLOW_WORKFLOW_FIXES
+    # is off) must NOT cause the tool to go rewrite some unrelated editable file
+    # to compensate — that's the exact "add failure.log to requirements.txt"
+    # flailing. Instead, if the real fix target isn't editable, we escalate with
+    # the precise, grounded diagnosis.
+    editable_obs = [o for o in observations if not _is_blocked(o["file"])]
+    blocked_obs  = [o for o in observations if _is_blocked(o["file"])]
+    if blocked_obs:
+        bfiles = sorted({o["file"] for o in blocked_obs})
+        print(f"[OBSERVE] {len(blocked_obs)} problem(s) in NON-editable file(s): {bfiles}")
+
+    if blocked_obs and not editable_obs:
+        detail = observations_text(blocked_obs)
+        wf_involved = any(_is_workflow(o["file"]) for o in blocked_obs)
+        hint = ""
+        if wf_involved and not ALLOW_WORKFLOW_FIXES:
+            hint = ("\n\n➡ These problems are in a GitHub Actions workflow, which "
+                    "this tool does NOT edit by default (a bad workflow change can "
+                    "alter what runs with which permissions). To let it auto-fix "
+                    "value-level workflow typos like these — version strings and "
+                    "file paths, with permission/step changes still blocked — set "
+                    "`ALLOW_WORKFLOW_FIXES=1` in the environment of the step that "
+                    "runs auto-fixer.py, then re-run.")
+        print("[GATE] The real fix target is not editable — escalating with a "
+              "precise diagnosis instead of touching unrelated files.")
+        print(detail)
+        if token and repo:
+            open_issue(token, repo,
+                       "CI is failing because of problems the auto-fixer is not "
+                       f"permitted to edit:\n\n{detail}{hint}", run_url)
+        sys.exit(0)
 
     # ── AI STAGE 1 + 2: DIAGNOSIS ──
     print("\n━━━ AI STAGE 1: FACTS / STAGE 2: ROOT CAUSE ━━━")
@@ -1490,16 +1524,17 @@ def main():
     # the decision of what needs changing stays with the AI).
     candidates = []
     for rel in included:
-        if rel not in candidates:
+        if rel not in candidates and not _is_blocked(rel):
             candidates.append(rel)
     for rel in facts.get("failing_files", []) or []:
         rel = _relstrip(str(rel).strip())
-        if rel in included_contents and rel not in candidates:
+        if rel in included_contents and rel not in candidates and not _is_blocked(rel):
             candidates.append(rel)
     obs_by_file = {}
     for o in observations:
         obs_by_file.setdefault(o["file"], []).append(o)
-    # files with observations go first — most likely to need work
+    # editable files that carry a verified observation go first — they're the
+    # ones we KNOW are broken and CAN fix
     candidates.sort(key=lambda r: (r not in obs_by_file,))
     candidates = candidates[:MAX_FILES_FIXED]
 
