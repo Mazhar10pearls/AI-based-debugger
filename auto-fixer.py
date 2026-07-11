@@ -89,6 +89,24 @@ MAX_AI_ROUNDS  = 3   # rewrite rounds per run (round 2+ = observation-driven re-
 FAST_MODE        = os.environ.get("FAST_MODE", "").lower() in ("1", "true", "yes")
 SKIP_SELF_VERIFY = os.environ.get("SKIP_SELF_VERIFY", "").lower() in ("1", "true", "yes")
 
+# ── Tool's own artifacts ──────────────────────────────────────────────────────
+# The CI failure log passed via --input is the tool's INPUT, not a repo file.
+# Left unguarded it becomes a classic self-reference trap: the model sees its
+# filename in context, decides it's a "missing file", pins the root cause on
+# it, and "fixes" the failure by adding that filename as a line to whatever
+# files it's allowed to edit (e.g. appending `failure.log` to requirements.txt).
+# Populated in main() from args.input. Its basename is filtered out of
+# referenced paths, discovered context, and the AI's failing_files/symbols, and
+# any rewrite that tries to INTRODUCE it is rejected.
+IGNORED_ARTIFACTS = set()
+
+
+def _is_ignored_artifact(name: str) -> bool:
+    if not name:
+        return False
+    base = Path(name.strip().strip("'\"")).name.lower()
+    return base in IGNORED_ARTIFACTS
+
 # ── Prompt / context budget ───────────────────────────────────────────────────
 MAX_ERROR_LINES   = 14
 MAX_FILE_CHARS    = 4000
@@ -263,7 +281,7 @@ def extract_referenced_paths(log_text: str, root: Path = Path(".")) -> list:
     order, counts = [], {}
     def add(rel):
         rel = _relstrip(rel)
-        if _is_blocked(rel):
+        if _is_blocked(rel) or _is_ignored_artifact(rel):
             return
         if rel not in counts:
             order.append(rel)
@@ -650,7 +668,11 @@ FACTS_SYSTEM = """\
 You are a CI/CD triage engineer. Extract FACTS ONLY — do not diagnose or fix yet.
 Output ONLY one JSON object. No markdown fences. Start with { end with }.
 {"error_type":"short category e.g. missing_file / bad_version / port_mismatch / import_error","failing_files":["exact/path from a ### header, if any"],"key_symbols":["the literal tokens the error names — filenames, versions, ports"],"summary":"one sentence of what the log shows"}
-Copy tokens EXACTLY from the log and file contents. Do not invent files or symbols."""
+Copy tokens EXACTLY from the log and file contents. Do not invent files or symbols.
+The CI failure log itself (the file whose contents you are reading) is the CI
+system's OWN output — it is NOT a project file, NOT a missing dependency, and
+must NEVER appear in failing_files or key_symbols. Diagnose the error the log
+DESCRIBES, never the log file itself."""
 
 
 def ai_extract_facts(signal, context, stacks, obs_text) -> dict:
@@ -665,6 +687,12 @@ def ai_extract_facts(signal, context, stacks, obs_text) -> dict:
     data.setdefault("failing_files", [])
     data.setdefault("key_symbols", [])
     data.setdefault("summary", "")
+    # scrub the tool's own artifacts if the model named them anyway
+    dropped = [f for f in data["failing_files"] if _is_ignored_artifact(f)]
+    data["failing_files"] = [f for f in data["failing_files"] if not _is_ignored_artifact(f)]
+    data["key_symbols"]   = [s for s in data["key_symbols"] if not _is_ignored_artifact(s)]
+    if dropped:
+        print(f"[S1-FACTS] scrubbed tool artifact(s) from failing_files: {dropped}")
     print(f"[S1-FACTS] {data.get('error_type')} | files={data.get('failing_files')} "
           f"| symbols={data.get('key_symbols')}")
     return data
@@ -736,8 +764,10 @@ def ai_facts_and_cause(signal, context, stacks, obs_text) -> tuple:
     raw = _stream_ollama(prompt, schema, num_predict=1000, temperature=0.05, tag="S1S2")
     data = _json_from(raw) or {}
     facts = {"error_type": data.get("error_type", "unknown"),
-             "failing_files": data.get("failing_files", []) or [],
-             "key_symbols": data.get("key_symbols", []) or [],
+             "failing_files": [f for f in (data.get("failing_files", []) or [])
+                               if not _is_ignored_artifact(f)],
+             "key_symbols": [s for s in (data.get("key_symbols", []) or [])
+                             if not _is_ignored_artifact(s)],
              "summary": data.get("summary", "")}
     try:
         conf = float(data.get("confidence", 0.5))
@@ -873,6 +903,15 @@ def validate_rewrite(rel: str, original: str, new: str) -> tuple:
     secret_hits = scan_text_for_secrets("\n".join(added))
     if secret_hits:
         return False, f"potential secret in fix ({', '.join(secret_hits)}) — blocked"
+    # Reject rewrites that INTRODUCE the tool's own input-log filename. This is
+    # the "add failure.log to requirements.txt" failure mode — a junk one-line
+    # addition small enough to clear the similarity floor and line caps, so
+    # this is the only guard that catches it when SKIP_SELF_VERIFY is set.
+    for line in added:
+        for name in IGNORED_ARTIFACTS:
+            if name and name in line.lower():
+                return False, (f"fix introduces the tool's own input artifact "
+                               f"'{name}' — this is a self-reference, not a fix")
 
     if rel.endswith(".py"):
         try:
@@ -1176,6 +1215,12 @@ def main():
     if not log_path.is_file():
         print(f"[ERROR] Log not found: {args.input}", file=sys.stderr)
         sys.exit(1)
+
+    # The input log is the tool's own artifact — never a fix target, never a
+    # thing to introduce into the repo. Register its name (and common aliases)
+    # so the diagnosis and rewrite layers ignore it.
+    IGNORED_ARTIFACTS.update({log_path.name.lower(), "failure.log", "ci.log"})
+    print(f"[INIT] Ignoring tool artifacts: {sorted(IGNORED_ARTIFACTS)}")
 
     # loop guards
     if last_commit_was_bot():
