@@ -6,10 +6,6 @@ Pipeline:
 
     GitHub Actions Pipeline Failed
         → Python: collect initial evidence (logs, exit code, repo tree, git diff)
-        → Python: seed context — pre-read files the failure itself points at
-              (paths named verbatim in the error log, files changed in the
-              failing commit). Pure context provision: no similarity matching,
-              no suspects, no suggested fixes — the AI decides what matters.
         → AI Investigation Agent (multi-turn loop):
               reads evidence → forms hypothesis → requests more files if needed
               → Python fetches requested files (read-only) → loop → confirms root cause
@@ -21,25 +17,19 @@ Pipeline:
         → on success: commit, push, open PR
 
 Design notes:
-  * A small local model is unreliable at open-ended multi-turn tool use — it
-    can loop forever, request irrelevant files, or hallucinate a root cause
-    with high confidence. Every agentic step here is bounded:
+  * A small local model (qwen2.5-coder:3b) is unreliable at open-ended multi-turn
+    tool use — it can loop forever, request irrelevant files, or hallucinate a
+    root cause with high confidence. Every agentic step here is bounded:
     MAX_INVESTIGATION_TURNS caps the investigation loop, MAX_FILES_PER_REQUEST
     caps how much it can ask for at once, and the model may ONLY request files
     that literally appear in the repository tree Python already listed for it
     — it can never name a file into existence.
   * The AI never writes to disk directly. It only ever emits JSON (a file
-    request, a verdict, or an evidence→corrected quote). Python is the only
-    thing that reads or writes files, and it re-validates every AI-authored
-    change (syntax, YAML/JSON parse, secret scan, dangerous-command scan, and
-    a couple of deterministic "is this Dockerfile change actually complete"
+    request, or an evidence→corrected quote). Python is the only thing that
+    reads or writes files, and it re-validates every AI-authored change
+    (syntax, YAML/JSON parse, secret scan, dangerous-command scan, and a
+    couple of deterministic "is this Dockerfile change actually complete"
     checks) before it's ever applied.
-  * Division of labor is strict: the AI does ALL diagnosis and authors ALL
-    fixes; Python never pre-solves, never nominates suspects, never hints at
-    root causes. Python's contribution to diagnosis quality is CONTEXT — a
-    clean error signal, the diff, the repo tree, and pre-reading the files
-    the failure log itself names — plus validation and execution after the
-    AI has decided.
 
 Exit codes:
   0 success / nothing to do / escalated (low confidence, open issue instead)
@@ -62,24 +52,34 @@ import requests
 import yaml
 
 # ── Ollama ────────────────────────────────────────────────────────────────────
-OLLAMA_API_URL   = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/api/generate")
-OLLAMA_MODEL     = os.environ.get("OLLAMA_MODEL",   "qwen2.5-coder:7b")
-OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
-AI_TIMEOUT     = int(os.environ.get("AI_TIMEOUT", "330"))  # 7b on CPU is ~2x slower than 3b
-MAX_RETRIES    = 2
+OLLAMA_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/api/generate")
+OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL",   "qwen2.5-coder:3b")
+# A bigger model is slower per token on the same CPU box, but needs far fewer
+# retries/turns to get a real answer — so the per-call budget goes UP even
+# though total wall time usually goes down. All tunable per model via env.
+AI_TIMEOUT     = int(os.environ.get("AI_TIMEOUT", "300"))
+MAX_RETRIES    = int(os.environ.get("AI_MAX_RETRIES", "2"))
 RETRY_BACKOFF  = [20, 20]
+# qwen2.5-coder:7b ships with a real 32K-token context window (vs. the 3B's
+# same nominal window but far worse ability to actually use it). 16K tokens
+# leaves headroom for the output + is comfortably inside 32K.
+OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "16384"))
 
-# ── Agentic-loop bounds (the guardrails a small model needs) ───────────────────
+# ── Agentic-loop bounds ──────────────────────────────────────────────────────
 MAX_INVESTIGATION_TURNS = int(os.environ.get("MAX_INVESTIGATION_TURNS", "4"))
 MAX_FILES_PER_REQUEST   = int(os.environ.get("MAX_FILES_PER_REQUEST", "3"))
 MAX_REPAIR_ROUNDS       = int(os.environ.get("MAX_REPAIR_ROUNDS", "2"))
 
 # ── Prompt / context budget ───────────────────────────────────────────────────
+# Bumped from the 3B-era defaults (4000/10000/11000 chars) now that the model
+# can actually make use of more context instead of getting lost in it. Still
+# comfortably inside OLLAMA_NUM_CTX (16K tokens ≈ 60K+ chars) with room to
+# spare for the system prompt, repo tree, and output.
 MAX_ERROR_LINES   = 14
-MAX_FILE_CHARS    = 4000
-MAX_TOTAL_CONTEXT = 10000
+MAX_FILE_CHARS    = int(os.environ.get("MAX_FILE_CHARS", "8000"))
+MAX_TOTAL_CONTEXT = int(os.environ.get("MAX_TOTAL_CONTEXT", "20000"))
 MAX_FILES_FIXED   = 4
-MAX_PROMPT_CHARS  = 11000
+MAX_PROMPT_CHARS  = int(os.environ.get("MAX_PROMPT_CHARS", "24000"))
 
 # ── Git flow ──────────────────────────────────────────────────────────────────
 GIT_BASE_BRANCH   = os.environ.get("GIT_BASE_BRANCH",   "develop")
@@ -351,7 +351,7 @@ def _extract_token(line: bytes, fmt: str) -> str:
 
 
 def _stream_ollama(prompt, schema=None, num_predict=2000, temperature=0.05,
-                   num_ctx=8192, tag="AI", retries=MAX_RETRIES) -> str:
+                   num_ctx=OLLAMA_NUM_CTX, tag="AI", retries=MAX_RETRIES) -> str:
     endpoint, fmt = _detect_endpoint()
     if fmt == "openai":
         payload = {"model": OLLAMA_MODEL, "prompt": prompt, "temperature": temperature,
@@ -359,12 +359,7 @@ def _stream_ollama(prompt, schema=None, num_predict=2000, temperature=0.05,
     else:
         payload = {"model": OLLAMA_MODEL, "prompt": prompt,
                    "options": {"temperature": temperature, "num_predict": num_predict,
-                               "num_ctx": num_ctx},
-                   # keep the model resident between the 4-6 sequential calls a
-                   # run makes — cold model-load + cold prompt-eval on CPU is
-                   # what was tripping first-attempt timeouts
-                   "keep_alive": OLLAMA_KEEP_ALIVE,
-                   "stream": True}
+                               "num_ctx": num_ctx}, "stream": True}
         if schema:
             payload["format"] = schema
     print(f"[{tag}] {endpoint} ({fmt}) | prompt {len(prompt)} chars | model {OLLAMA_MODEL}")
@@ -527,66 +522,62 @@ def _closest_allowed_file(requested: str, allowed_files: set) -> str:
     return best[0] if best else candidates[0]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CONTEXT SEEDING (Python, no AI, no conclusions)
-# ══════════════════════════════════════════════════════════════════════════════
-# Python's job is better CONTEXT, not diagnosis. Before the investigation
-# starts, pre-read the files the failure itself points at:
-#   (a) any real repo path named verbatim in the error signal, and
-#   (b) files changed in the failing commit (from the git diff).
-# Strictly exact matches only — no fuzzy matching, no "this looks like a typo
-# of X" suggestions, no suspects. The AI is told WHY each file was pre-read
-# (it appears in the log / the diff) and nothing more; it alone decides what
-# is relevant and what the root cause is.
-
-MAX_SEED_FILES = int(os.environ.get("MAX_SEED_FILES", "3"))
-DIFF_FILE_LINE = re.compile(r'^diff --git a/(\S+) b/(\S+)', re.M)
+# High-signal, low-noise file types worth pre-scanning for broken references
+# — the same class of bug (typo'd filename) the investigation loop keeps
+# rediscovering the slow way. Deliberately narrow: config/CI files where a
+# path-like token is almost always meant to resolve to a real repo file.
+PRESCAN_FILE_PATTERN = re.compile(r"(^|/)(dockerfile[\w.\-]*|.*\.ya?ml)$", re.I)
+REPO_REF_EXT_PATTERN = re.compile(
+    r'(?<![\w./\-])((?:[\w.\-]+/)*[\w\-]+\.(?:py|txt|ya?ml|json|toml|cfg|ini|'
+    r'js|jsx|ts|tsx|go|java|rb|sh))(?![\w./\-])')
+PRESCAN_MIN_SIMILARITY = 0.72
 
 
-def seed_evidence_from_signal(signal: str, git_diff: str,
-                              allowed_files: set) -> tuple:
-    """Returns (seed_evidence dict, reasons dict) — files pre-read purely as
-    context. A path only qualifies if it EXACTLY matches a readable file in
-    the repo tree; nothing is inferred or suggested."""
-    reasons = {}
-
-    # (a) exact repo paths named in the error signal — a file mentioned in a
-    # traceback / error line is the single highest-value context there is
-    for f in allowed_files:
-        if f in signal:
-            reasons.setdefault(f, "named in the failure log")
-
-    # (b) files changed in the failing commit — most CI breaks come from the
-    # last change, so what the commit touched is context the AI should see
-    for m in DIFF_FILE_LINE.finditer(git_diff):
-        for f in (m.group(1), m.group(2)):
-            f = _relstrip(f)
-            if f in allowed_files:
-                reasons.setdefault(f, "changed in the failing commit")
-
-    # deterministic order: log-named files first, then diff files; cap it
-    ordered = sorted(reasons, key=lambda f: (reasons[f] != "named in the failure log", f))
-    seed = {}
-    for f in ordered[:MAX_SEED_FILES]:
+def deterministic_reference_scan(allowed_files: set) -> list:
+    """Fast, Python-only pass over Dockerfiles and workflow YAML for broken
+    file references — no model call, no waiting. Runs in well under a
+    second versus minutes of a small local model repeatedly failing to
+    produce useful output for the same class of bug. Returns a list of
+    {file, wrong_token, suggested, line} candidates; empty list if nothing
+    found, in which case the caller falls back to the full AI investigation."""
+    candidates = []
+    for f in sorted(allowed_files):
+        if not PRESCAN_FILE_PATTERN.search(f):
+            continue
         content = _read_evidence_file(f)
-        if content is not None:
-            seed[f] = content
-            print(f"[SEED] pre-read {f} ({len(content)} chars) — {reasons[f]}")
-    return seed, {f: reasons[f] for f in seed}
+        if content is None:
+            continue
+        seen_tokens = set()
+        for m in REPO_REF_EXT_PATTERN.finditer(content):
+            token = m.group(1)
+            if token in seen_tokens or token in allowed_files:
+                continue
+            seen_tokens.add(token)
+            if "${{" in token or token.startswith("."):
+                continue
+            match = _closest_allowed_file(token, allowed_files)
+            if not match or match == token:
+                continue
+            similarity = difflib.SequenceMatcher(None, token, match).ratio()
+            if similarity < PRESCAN_MIN_SIMILARITY:
+                continue
+            line_start = content.rfind("\n", 0, m.start()) + 1
+            line_end = content.find("\n", m.end())
+            line = content[line_start:(line_end if line_end != -1 else len(content))].strip()
+            candidates.append({"file": f, "wrong_token": token,
+                               "suggested": match, "line": line})
+            print(f"[PRESCAN] {f}: '{token}' looks like a typo of '{match}' "
+                  f"(similarity {similarity:.2f})")
+    return candidates
 
 
 def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
                                 evidence: dict, last_turn: bool,
-                                notes: list = None, seed_reasons: dict = None,
-                                ev_budget: int = MAX_TOTAL_CONTEXT) -> str:
-    seed_reasons = seed_reasons or {}
+                                notes: list = None, hint_text: str = "") -> str:
     ev_parts, total = [], 0
     for f, c in evidence.items():
-        # seeded files carry a neutral factual label (WHY Python pre-read
-        # them) — never an opinion about what's wrong in them
-        label = f"  [pre-read by Python: {seed_reasons[f]}]" if f in seed_reasons else ""
-        block = f"### {f}{label}\n```\n{c}\n```"
-        if total + len(block) > ev_budget and ev_parts:
+        block = f"### {f}\n```\n{c}\n```"
+        if total + len(block) > MAX_TOTAL_CONTEXT and ev_parts:
             break
         ev_parts.append(block)
         total += len(block)
@@ -600,8 +591,19 @@ def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
         notes_section = ("\n## Notes on your last request (read this before "
                          "deciding what to request next):\n"
                          + "\n".join(f"- {n}" for n in notes) + "\n")
-    prompt = (
-        f"{INVESTIGATE_SYSTEM}{turn_note}{notes_section}\n"
+    hint_section = ""
+    if hint_text:
+        hint_section = (
+            "\n## Static pre-scan hint (NOT a conclusion — verify it yourself "
+            "against the evidence below before relying on it; it can have false "
+            "positives):\n" + hint_text + "\n"
+            "Some relevant files have already been read for you and appear "
+            "under 'Evidence gathered so far'. You still decide the root cause, "
+            "confidence, and findings — this hint only points you at where to "
+            "look first.\n"
+        )
+    return (
+        f"{INVESTIGATE_SYSTEM}{turn_note}{notes_section}{hint_section}\n"
         f"## CI failure (key lines):\n```\n{signal}\n```\n"
         f"## Exit code: {exit_code}\n"
         f"## Git diff (most recent commit):\n```\n{git_diff}\n```\n"
@@ -609,14 +611,6 @@ def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
         f"## Evidence gathered so far:\n{ev_text}\n\n"
         f"Respond with the JSON described above."
     )
-    # Enforce the prompt budget by shrinking the EVIDENCE section rather than
-    # blind-truncating (which would cut the closing instruction). The system
-    # prompt, error signal, diff and tree are already individually capped.
-    if len(prompt) > MAX_PROMPT_CHARS and ev_budget > 2500:
-        return _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
-                                           evidence, last_turn, notes, seed_reasons,
-                                           ev_budget=ev_budget // 2)
-    return prompt
 
 
 def _finalize_investigation(data: dict, forced: bool) -> dict:
@@ -652,27 +646,25 @@ def _finalize_investigation(data: dict, forced: bool) -> dict:
 
 
 def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
-                   seed_evidence: dict = None, seed_reasons: dict = None) -> dict:
+                   seed_evidence: dict = None, hint_text: str = "") -> dict:
     """The core investigation loop from the diagram: AI reads evidence, thinks,
     requests more if needed, loops, confirms root cause. Bounded by
     MAX_INVESTIGATION_TURNS so a small model can't spin forever.
 
-    seed_evidence/seed_reasons are pure context provided by Python: files
-    pre-read because the failure itself points at them (named verbatim in
-    the error log, or changed in the failing commit), each labeled only with
-    that factual reason. No suspects, no suggestions, no opinions about
-    what's wrong — the AI alone diagnoses, sets confidence, and lists
-    findings. Python provides context; it never concludes.
+    seed_evidence/hint_text let a fast Python pre-scan hand the AI a head
+    start — relevant files pre-loaded, a pointer to what looks suspicious —
+    WITHOUT deciding the root cause itself. The AI still reads everything,
+    still has to confirm or refute the hint against the actual evidence, and
+    still sets its own confidence and findings. Python assists; it doesn't
+    conclude.
 
-    Three things keep a small model from stalling here:
+    Two things keep a small model from stalling here:
       - a requested file that doesn't exist gets fuzzy-matched against the
         real tree and the close match is read anyway, rather than just
         denied (a typo'd request is often exactly the bug being diagnosed);
-      - EVERY unusable request — already shown, already denied, or missing —
-        generates an explicit note the model sees on its next turn, so it is
-        told WHY nothing new appeared instead of silently repeating itself;
-      - if a turn still produces no new evidence, that's a stall — after 2
-        such turns in a row we force a final decision instead of repeating."""
+      - if a turn produces literally no new evidence (everything requested
+        was already denied/read before), that's a stall — after 2 such
+        turns in a row we force a final decision instead of repeating."""
     evidence = dict(seed_evidence) if seed_evidence else {}
     log, result = [], None
     dead_ends = set()       # requests with no usable match — no point re-suggesting
@@ -683,10 +675,10 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
         last_turn = (turn == MAX_INVESTIGATION_TURNS)
         prompt = _build_investigation_prompt(signal, exit_code, repo_tree,
                                              git_diff, evidence, last_turn,
-                                             pending_notes, seed_reasons)
+                                             pending_notes, hint_text)
         pending_notes = []
         try:
-            raw = _stream_ollama(prompt, INVESTIGATE_SCHEMA, num_predict=900,
+            raw = _stream_ollama(prompt, INVESTIGATE_SCHEMA, num_predict=1400,
                                  temperature=0.05, tag=f"INVESTIGATE-T{turn}")
         except Exception as exc:
             print(f"[INVESTIGATE] turn {turn} failed: {exc}", file=sys.stderr)
@@ -706,29 +698,9 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
         if status == "need_more_info":
             requested = [f.strip() for f in (data.get("requested_files") or [])
                         if isinstance(f, str) and f.strip()]
-            print(f"[INVESTIGATE]   requested_files: {requested or '(none!)'}")
-            if not requested:
-                pending_notes.append(
-                    "You returned status 'need_more_info' but requested NO files. "
-                    "Either request specific paths from the repository tree, or "
-                    "return 'root_cause_confirmed' with your best hypothesis.")
             to_read = []
             for f in requested[:MAX_FILES_PER_REQUEST]:
-                if f in evidence:
-                    # THE stall fix: previously this skipped silently, so the
-                    # model was never told it already had the file and asked
-                    # for it again every turn until forced to stop.
-                    print(f"[INVESTIGATE]   = '{f}' already in evidence — telling the model")
-                    pending_notes.append(
-                        f"'{f}' was ALREADY shown to you under '## Evidence "
-                        f"gathered so far'. Do NOT request it again — read it "
-                        f"there and decide.")
-                    continue
-                if f in dead_ends:
-                    print(f"[INVESTIGATE]   = '{f}' already denied — telling the model")
-                    pending_notes.append(
-                        f"'{f}' was already denied — it does not exist. Do NOT "
-                        f"request it again.")
+                if f in evidence or f in dead_ends:
                     continue
                 if f in allowed_files:
                     to_read.append(f)
@@ -753,7 +725,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                 evidence[f] = content if content is not None else "(could not read this file)"
                 print(f"[INVESTIGATE]   + read {f} ({len(evidence[f])} chars)")
 
-            stalled = (not to_read and not last_turn)
+            stalled = (not to_read and requested and not last_turn)
             stall_count = stall_count + 1 if stalled else 0
             force_now = last_turn or stall_count >= 2
 
@@ -763,10 +735,10 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                           "forcing a final decision instead of continuing to stall.")
                 final_prompt = _build_investigation_prompt(
                     signal, exit_code, repo_tree, git_diff, evidence, True,
-                    pending_notes, seed_reasons)
+                    pending_notes, hint_text)
                 try:
                     raw2 = _stream_ollama(final_prompt, INVESTIGATE_SCHEMA,
-                                          num_predict=900, temperature=0.05,
+                                          num_predict=1400, temperature=0.05,
                                           tag="INVESTIGATE-FINAL")
                     data2 = _json_from(raw2) or data
                 except Exception as exc:
@@ -854,7 +826,7 @@ def ai_generate_patch(root_cause: str, solution: str, evidence: dict,
               f"Emit the issues JSON.")
     if len(prompt) > MAX_PROMPT_CHARS:
         prompt = prompt[:MAX_PROMPT_CHARS]
-    raw = _stream_ollama(prompt, PATCH_SCHEMA, num_predict=2200,
+    raw = _stream_ollama(prompt, PATCH_SCHEMA, num_predict=3000,
                          temperature=0.05, tag="PATCH")
     data = _json_from(raw)
     if data is None:
@@ -1571,20 +1543,26 @@ def main():
     repo_tree, allowed_files = repo_tree_text()
     print(f"[EVIDENCE] exit_code={exit_code} | {len(allowed_files)} readable file(s) in tree")
 
-    # ── SEED CONTEXT (Python pre-reads what the failure points at — no AI,
-    #    no suspects, no suggestions; the AI does all the diagnosing) ──
-    print("\n━━━ SEED CONTEXT ━━━")
-    seed_evidence, seed_reasons = seed_evidence_from_signal(signal, git_diff,
-                                                            allowed_files)
-    if not seed_evidence:
-        print("[SEED] failure log / diff name no readable repo files — "
-              "investigation starts from logs, diff, and tree only.")
+    # ── DETERMINISTIC PRE-SCAN (context for the AI — never decides anything itself) ──
+    print("\n━━━ DETERMINISTIC REFERENCE SCAN ━━━")
+    prescan = deterministic_reference_scan(allowed_files)
+    seed_evidence, hint_text = {}, ""
+    if prescan:
+        seed_evidence = {c["file"]: _read_evidence_file(c["file"]) for c in prescan}
+        hint_lines = "\n".join(
+            f"- {c['file']}: '{c['wrong_token']}' does not appear in the repository "
+            f"tree; the closest real file is '{c['suggested']}'" for c in prescan)
+        hint_text = hint_lines
+        print(f"[PRESCAN] {len(prescan)} candidate(s) found — pre-loading "
+              f"{len(seed_evidence)} file(s) and passing this as a hint to the "
+              f"investigation agent (it still decides).")
+    else:
+        print("[PRESCAN] nothing found — investigation agent starts with no hint.")
 
     # ── AI INVESTIGATION AGENT ──
     print("\n━━━ AI INVESTIGATION AGENT ━━━")
-    investigation = ai_investigate(signal, exit_code, repo_tree, git_diff,
-                                   allowed_files, seed_evidence, seed_reasons)
-
+    investigation = ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files,
+                                   seed_evidence, hint_text)
     root_cause = investigation["root_cause"]
     solution   = investigation["solution"]
     commit_msg = investigation["commit_message"]
