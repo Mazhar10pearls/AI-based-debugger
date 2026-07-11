@@ -5,7 +5,8 @@ Self-Healing CI/CD Auto-Fixer — agentic investigation flow.
 Pipeline:
 
     GitHub Actions Pipeline Failed
-        → Python: collect initial evidence (logs, exit code, repo tree, git diff)
+        → Python: collect initial evidence (logs, exit code, repo tree, git diff,
+              AND the triggering workflow file(s) — seeded up front)
         → AI Investigation Agent (multi-turn loop):
               reads evidence → forms hypothesis → requests more files if needed
               → Python fetches requested files (read-only) → loop → confirms root cause
@@ -30,6 +31,12 @@ Design notes:
     (syntax, YAML/JSON parse, secret scan, dangerous-command scan, and a
     couple of deterministic "is this Dockerfile change actually complete"
     checks) before it's ever applied.
+  * The workflow file that defined the failing run is seeded into the initial
+    evidence bundle (Python reads it, never edits it here). Almost every CI
+    failure is either in app code or in the workflow itself (a bad
+    python-version, a typo'd path in a `run:` step), and the model is
+    unreliable at requesting the workflow by its exact name — so Python hands
+    it over up front rather than hoping the model asks for it correctly.
 
 Exit codes:
   0 success / nothing to do / escalated (low confidence, open issue instead)
@@ -107,6 +114,11 @@ SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "env",
              "dist", "build", ".pytest_cache", "target", "out", "vendor",
              ".idea", ".vscode", "coverage", "tmp", "temp", "logs"}
 MAX_FILE_SIZE_BYTES = 100_000
+
+# How many workflow files to seed into the initial evidence bundle. There's
+# normally one; the cap keeps a repo with many workflows from blowing the
+# context budget.
+MAX_SEED_WORKFLOWS = int(os.environ.get("MAX_SEED_WORKFLOWS", "2"))
 
 # ── Secret scanning ─────────────────────────────────────────────────────────
 SECRET_PATTERNS = [
@@ -201,6 +213,44 @@ def _is_text_file(path: Path) -> bool:
         return b"\x00" not in path.read_bytes()[:512]
     except Exception:
         return False
+
+
+def _resolve_requested_path(req: str, allowed_files: set):
+    """Best-effort map an AI-requested path onto a real repo path.
+
+    A 3B model routinely mangles the paths it asks for: a leading slash
+    (`/github/workflows/...`), a `./` prefix, or just the basename. It also
+    tends to echo absolute traceback paths (`/home/.../site-packages/...`)
+    that can never be in the repo. Rather than deny every near-miss outright
+    (which is what stalled the investigation loop), try to snap the request
+    onto a real, read-permitted path — but ONLY ever return something already
+    in `allowed_files`, so this can't widen what the agent is allowed to read.
+
+    Returns the real repo path, or None if it can't be resolved unambiguously.
+    """
+    if not isinstance(req, str):
+        return None
+    req = req.strip()
+    if not req:
+        return None
+    if req in allowed_files:
+        return req
+    norm = req.lstrip("/")
+    if norm.startswith("./"):
+        norm = norm[2:]
+    if norm in allowed_files:
+        return norm
+    # unique suffix match: a real path ends with the requested tail
+    tail_hits = [a for a in allowed_files if a == norm or a.endswith("/" + norm)]
+    if len(tail_hits) == 1:
+        return tail_hits[0]
+    # unique basename match (last resort — only if exactly one file has it)
+    base = norm.rsplit("/", 1)[-1]
+    if base:
+        base_hits = [a for a in allowed_files if a.rsplit("/", 1)[-1] == base]
+        if len(base_hits) == 1:
+            return base_hits[0]
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -307,6 +357,33 @@ def _read_evidence_file(rel: str):
     if len(raw) > MAX_FILE_CHARS:
         raw = raw[:MAX_FILE_CHARS] + "\n...(truncated)"
     return raw
+
+
+def seed_workflow_evidence(allowed_files: set) -> dict:
+    """Seed the investigation with the workflow file(s) that define the CI run.
+
+    Almost every CI failure is either in app code or in the workflow itself
+    (a bad python-version, a typo'd path in a `run:` step). The workflow is
+    small and cheap to include, and a 3B model is unreliable at requesting it
+    by its exact name — in practice it asks for `/github/workflows/<guessed>`
+    with a wrong basename and gets denied, then burns the whole loop. So
+    Python reads the workflow up front and hands it over as evidence rather
+    than hoping the model asks for it correctly.
+
+    This is observation only: Python reads the file here, it never edits it.
+    Any edit still goes through validate_workflow_edit()'s strict gate later.
+    """
+    seeded = {}
+    wf_files = sorted(f for f in allowed_files if WORKFLOW_PATTERN.search(f))
+    for f in wf_files[:MAX_SEED_WORKFLOWS]:
+        content = _read_evidence_file(f)
+        if content is not None:
+            seeded[f] = content
+    if seeded:
+        print(f"[EVIDENCE] seeded workflow file(s): {', '.join(seeded)}")
+    else:
+        print("[EVIDENCE] no workflow file found to seed")
+    return seeded
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -475,14 +552,21 @@ message; "findings" is the itemized breakdown a human will actually read.
 
 Rules:
 - If the logs and diff already make the cause obvious, confirm immediately — \
-don't pad with unnecessary file requests.
+don't pad with unnecessary file requests. A "No such file" error for a path \
+referenced in the workflow, where a near-identically-named file DOES exist in \
+the repository tree, is a typo you can confirm right now.
 - A file being merely related to the tech stack is not enough reason to \
 request it — request only what actually tests your hypothesis.
+- Paths under site-packages, /home/, or the runner's work directory are NOT \
+part of this repository and CANNOT be requested — do not ask for them. Only \
+request paths that appear verbatim in the repository tree below.
+- If a path is listed under "## Already denied", it is not in the repo. Do \
+NOT request it again — pick a different file or confirm your hypothesis.
 """
 
 
 def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
-                                evidence: dict, last_turn: bool) -> str:
+                                evidence: dict, denied: list, last_turn: bool) -> str:
     ev_parts, total = [], 0
     for f, c in evidence.items():
         block = f"### {f}\n```\n{c}\n```"
@@ -491,6 +575,10 @@ def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
         ev_parts.append(block)
         total += len(block)
     ev_text = "\n\n".join(ev_parts) if ev_parts else "(none read yet)"
+    denied_note = ""
+    if denied:
+        denied_note = ("## Already denied — NOT in this repo, do not request again:\n"
+                       + "\n".join(f"- {d}" for d in denied[-8:]) + "\n")
     turn_note = ("\n## THIS IS YOUR FINAL TURN. You MUST return "
                  "status \"root_cause_confirmed\" now, using your best "
                  "hypothesis from the evidence so far. Lower your confidence "
@@ -501,6 +589,7 @@ def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
         f"## Exit code: {exit_code}\n"
         f"## Git diff (most recent commit):\n```\n{git_diff}\n```\n"
         f"## Repository tree (folders & filenames only — request only from this list):\n{repo_tree}\n"
+        f"{denied_note}"
         f"## Evidence gathered so far:\n{ev_text}\n\n"
         f"Respond with the JSON described above."
     )
@@ -538,16 +627,23 @@ def _finalize_investigation(data: dict, forced: bool) -> dict:
     }
 
 
-def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set) -> dict:
+def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
+                   seed_evidence: dict = None) -> dict:
     """The core investigation loop from the diagram: AI reads evidence, thinks,
     requests more if needed, loops, confirms root cause. Bounded by
-    MAX_INVESTIGATION_TURNS so a small model can't spin forever."""
-    evidence, log, result = {}, [], None
+    MAX_INVESTIGATION_TURNS so a small model can't spin forever.
+
+    `seed_evidence` is evidence Python hands over up front (e.g. the workflow
+    file that defined the run) so the model doesn't have to correctly request
+    it. `denied` remembers paths already rejected so the model stops asking
+    for the same un-requestable path every turn."""
+    evidence = dict(seed_evidence) if seed_evidence else {}
+    log, result, denied = [], None, []
 
     for turn in range(1, MAX_INVESTIGATION_TURNS + 1):
         last_turn = (turn == MAX_INVESTIGATION_TURNS)
         prompt = _build_investigation_prompt(signal, exit_code, repo_tree,
-                                             git_diff, evidence, last_turn)
+                                             git_diff, evidence, denied, last_turn)
         try:
             raw = _stream_ollama(prompt, INVESTIGATE_SCHEMA, num_predict=900,
                                  temperature=0.05, tag=f"INVESTIGATE-T{turn}")
@@ -571,12 +667,17 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set) -
                         if isinstance(f, str) and f.strip()]
             to_read = []
             for f in requested[:MAX_FILES_PER_REQUEST]:
-                if f in evidence:
-                    continue
-                if f not in allowed_files:
+                resolved = _resolve_requested_path(f, allowed_files)
+                if resolved is None:
+                    if f not in denied:
+                        denied.append(f)
                     print(f"[INVESTIGATE]   ✗ requested '{f}' — not in repo tree, denied")
                     continue
-                to_read.append(f)
+                if resolved in evidence:
+                    continue
+                if resolved != f:
+                    print(f"[INVESTIGATE]   ~ resolved '{f}' → '{resolved}'")
+                to_read.append(resolved)
             for f in to_read:
                 content = _read_evidence_file(f)
                 evidence[f] = content if content is not None else "(could not read this file)"
@@ -585,7 +686,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set) -
             if last_turn:
                 # force a final decision using whatever evidence we now have
                 final_prompt = _build_investigation_prompt(
-                    signal, exit_code, repo_tree, git_diff, evidence, True)
+                    signal, exit_code, repo_tree, git_diff, evidence, denied, True)
                 try:
                     raw2 = _stream_ollama(final_prompt, INVESTIGATE_SCHEMA,
                                           num_predict=900, temperature=0.05,
@@ -1392,9 +1493,15 @@ def main():
     repo_tree, allowed_files = repo_tree_text()
     print(f"[EVIDENCE] exit_code={exit_code} | {len(allowed_files)} readable file(s) in tree")
 
+    # Seed the triggering workflow file(s) as evidence up front — the model is
+    # unreliable at requesting the workflow by exact name, and almost every CI
+    # failure's fix lives in either app code or the workflow itself.
+    seed_evidence = seed_workflow_evidence(allowed_files)
+
     # ── AI INVESTIGATION AGENT ──
     print("\n━━━ AI INVESTIGATION AGENT ━━━")
-    investigation = ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files)
+    investigation = ai_investigate(signal, exit_code, repo_tree, git_diff,
+                                   allowed_files, seed_evidence)
     root_cause = investigation["root_cause"]
     solution   = investigation["solution"]
     commit_msg = investigation["commit_message"]
