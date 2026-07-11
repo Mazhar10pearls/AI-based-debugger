@@ -1,39 +1,129 @@
 #!/usr/bin/env python3
 """
-Self-Healing CI/CD Auto-Fixer — staged-AI flow.
+Self-Healing CI/CD Auto-Fixer — AI-Centric Architecture v2
 
-Pipeline (matches the diagram):
+ARCHITECTURE:
 
-    Collect logs + repo context (Python)
-        → AI Stage 1: extract facts
-        → AI Stage 2: determine root cause (+ confidence)
-        → AI Stage 3: generate fix        ══ flat issues: evidence → corrected ══
-        → AI Stage 4: self-verify         ══ AI checks its own patch ══
-        → Python validation (locate by evidence, syntax, apply, tests)
-        → Confidence gate
-        → Apply patch → Commit + Push + PR
+    ┌─────────────────────────────────────────────────────────┐
+    │ PHASE 1: COLLECTION (Deterministic)                     │
+    │ ─────────────────────────────────────────────────────────│
+    │ • Parse & redact logs                                    │
+    │ • Extract error signal + tech stack fingerprint          │
+    │ • Discover all available files (with scoring/ranking)    │
+    │ • Read file contents (with budgets)                      │
+    │ • Provide static hints (file existence, reference scan)  │
+    │                                                           │
+    │ Output: (signal, stacks, context, files, hints)          │
+    └─────────────────────────────────────────────────────────┘
+                              ↓
+    ┌─────────────────────────────────────────────────────────┐
+    │ PHASE 2: AI DIAGNOSIS (Single Unified Call)              │
+    │ ─────────────────────────────────────────────────────────│
+    │ Input: error signal + file context + hints               │
+    │                                                           │
+    │ AI Outputs:                                              │
+    │  {                                                       │
+    │    "error_type": "missing_file|bad_version|...",        │
+    │    "root_cause": "detailed explanation",                │
+    │    "reasoning": "step-by-step thinking",                │
+    │    "confidence": 0.0–1.0,                               │
+    │    "solution": "plain English description",             │
+    │    "commit_message": "fix: ..."                         │
+    │  }                                                       │
+    │                                                           │
+    │ (FAST_MODE combines multiple steps; standard does >1)    │
+    └─────────────────────────────────────────────────────────┘
+                              ↓
+    ┌─────────────────────────────────────────────────────────┐
+    │ PHASE 3: AI FIX GENERATION (Comprehensive)               │
+    │ ─────────────────────────────────────────────────────────│
+    │ Input: diagnosis + full file context                     │
+    │                                                           │
+    │ AI Outputs: Flat issues list                             │
+    │  {                                                       │
+    │    "issues": [                                           │
+    │      {                                                   │
+    │        "file": "path/to/file",                           │
+    │        "problem": "description",                         │
+    │        "evidence": "exact text from file",               │
+    │        "corrected": "fixed version",                     │
+    │        "reasoning": "why this fix works"                 │
+    │      },                                                  │
+    │      ...                                                 │
+    │    ],                                                    │
+    │    "all_issues_found": true,  ← critical: tell us if     │
+    │    "reasoning": "scan procedure"  you found EVERY bug    │
+    │  }                                                       │
+    │                                                           │
+    │ AI is responsible for finding ALL issues, not just one   │
+    └─────────────────────────────────────────────────────────┘
+                              ↓
+    ┌─────────────────────────────────────────────────────────┐
+    │ PHASE 4: VALIDATION (Deterministic Safety Gates)        │
+    │ ─────────────────────────────────────────────────────────│
+    │ For each fix:                                            │
+    │  ✓ evidence actually exists in file (no hallucination)   │
+    │  ✓ corrected differs from evidence (not a no-op)         │
+    │  ✓ syntax valid (Python, YAML, JSON, etc.)              │
+    │  ✓ no secrets introduced                                │
+    │  ✓ file paths safe (no .. / ~ escapes)                  │
+    │  ✓ added lines < threshold (catches suspicious blobs)    │
+    │  ✓ diff < size limit (blocks unauthorized feature adds)  │
+    │                                                           │
+    │ Python never writes a fix; only validates AI's work      │
+    └─────────────────────────────────────────────────────────┘
+                              ↓
+    ┌─────────────────────────────────────────────────────────┐
+    │ PHASE 5: EXECUTION (Deterministic)                      │
+    │ ─────────────────────────────────────────────────────────│
+    │ • Apply validated patches (find/replace)                 │
+    │ • Run tests                                              │
+    │ • If tests fail → revert all                             │
+    │ • Commit + push + open PR                                │
+    │ • On any failure → escalate to GitHub issue              │
+    └─────────────────────────────────────────────────────────┘
 
-Design notes carried over from the single-call version:
-  * A small local model (qwen2.5-coder:3b) diagnoses well but mangles nested
-    structure. Stage 3's output is a FLAT issues list — quote the offending
-    text, quote the corrected text, one entry per bug. Python pairs each quote
-    with its correction and LOCATES each fix by searching for the AI's own
-    quoted evidence in the shown files. The AI authors every change; Python
-    never writes a fix of its own.
-  * The reference-typo class (broken COPY/ADD paths) still runs through the
-    focused correct-the-line sub-pass inside Stage 3 — that's the part that
-    made typos reliable, so it's kept.
 
-Why staged instead of one call:
-  Four smaller tasks each stay inside the 3B's reliable instruction-following
-  window better than one big task. The cost is latency (four sequential calls
-  on CPU). Two escape hatches:
-    FAST_MODE=1        → collapse Stage 1+2 into one call
-    SKIP_SELF_VERIFY=1 → drop Stage 4 (Python validation is still the hard gate)
+KEY CHANGES FROM v1:
 
-Exit codes:
-  0 success / nothing to do   2 AI failed        4 git failed
-  1 log not found             3 no valid fix     5 tests failed (reverted)
+1. NO DETERMINISTIC PROBLEM-SOLVING
+   ✗ Removed: scan_python_base_image() (was pre-fixing versions)
+   ✗ Removed: ai_correct_lines() as isolated stage (blame goes to AI)
+   ✓ Added: "all_issues_found" flag so AI commits to completeness
+
+2. AI OWNS THE DIAGNOSIS
+   ✓ Single unified diagnosis call (with FAST_MODE option)
+   ✓ AI produces "reasoning" explaining its thinking
+   ✓ AI explicitly hunts for ALL bugs (not just one per file)
+   ✓ Deterministic only validates, never rewrites
+
+3. CLEAR RESPONSIBILITY BOUNDARY
+   AI says: "Here are the bugs and fixes"
+   Python says: "I checked your work — these pass safety gates"
+   Python does NOT say: "I found extra bugs you missed"
+
+4. AUDITABILITY
+   ✓ Each AI stage includes "reasoning" for review
+   ✓ Issues include per-fix reasoning
+   ✓ Clear trace: error → diagnosis → fixes → validation → execution
+
+
+SECURITY MODEL (improved):
+
+   Secret scanning:     redact BEFORE entering any prompt
+   Syntax validation:   parse corrected text before applying
+   Path validation:     reject .., ~, absolute paths
+   Diff size cap:       block 40+ new lines (catches payload injections)
+   Evidence matching:   Python proves evidence exists (no hallucination)
+   Immutable prompts:   file list, repo structure, error signal cannot be changed by AI
+
+
+BACKWARD COMPAT:
+
+   - FAST_MODE=1 still works (fewer AI calls, same result)
+   - SKIP_SELF_VERIFY=1 removed (self-verify should be mandatory now)
+   - Same env vars for ollama, git, github tokens
+   - Same exit codes (0=success, 1=not found, 2=AI failed, 3=no valid fix, 4=git, 5=tests)
 """
 
 import argparse
@@ -56,13 +146,11 @@ OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL",   "qwen2.5-coder:3b")
 AI_TIMEOUT     = 210
 MAX_RETRIES    = 2
 RETRY_BACKOFF  = [20, 20]
-MAX_AI_ROUNDS  = 3
 
-# staged-flow toggles
-FAST_MODE        = os.environ.get("FAST_MODE", "").lower() in ("1", "true", "yes")
-SKIP_SELF_VERIFY = os.environ.get("SKIP_SELF_VERIFY", "").lower() in ("1", "true", "yes")
+# ── Staged-flow toggles ───────────────────────────────────────────────────────
+FAST_MODE = os.environ.get("FAST_MODE", "").lower() in ("1", "true", "yes")
 
-# ── Prompt / context budget ───────────────────────────────────────────────────
+# ── Prompt budgets ────────────────────────────────────────────────────────────
 MAX_ERROR_LINES   = 14
 MAX_FILE_CHARS    = 4000
 MAX_TOTAL_CONTEXT = 9000
@@ -77,16 +165,10 @@ BOT_EMAIL  = "github-actions[bot]@users.noreply.github.com"
 BOT_PREFIX = "fix:"
 MAX_BOT_ATTEMPTS = 3
 
-ALWAYS_BLOCKED   = {".git", "auto-fixer.py"}
+ALWAYS_BLOCKED = {".git", "auto-fixer.py"}
 BLOCKED_PATTERNS = [
-    # ALL workflow files — not just auto-fix/self-heal ones. A "fix" to a
-    # deploy or CI workflow is a privilege-escalation vector (it can change
-    # permissions, add steps, or add secret-exfiltrating commands, and reads
-    # like a normal diff to a reviewer). Workflow breakage should always
-    # escalate to a human via open_issue(), never go through auto-fix.
     r"\.?github/workflows/.*\.ya?ml$",
     r"\.?github/CODEOWNERS$",
-    # Common secret-bearing file patterns
     r"(^|/)\.env(\..*)?$",
     r".*\.pem$", r".*\.key$", r".*id_rsa.*", r".*id_ed25519.*",
     r".*secrets?\.ya?ml$", r".*\.tfstate(\.backup)?$",
@@ -98,11 +180,7 @@ SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "env",
              ".idea", ".vscode", "coverage", "tmp", "temp", "logs"}
 MAX_FILE_SIZE_BYTES = 100_000
 
-# ── Secret scanning ─────────────────────────────────────────────────────────
-# Deterministic, non-AI safety net — same category as syntax validation below.
-# Catches secrets the AI might echo back from a leaky log, or that a prompt-
-# injected instruction tries to smuggle into a "fix". Not a substitute for a
-# real scanner (gitleaks/trufflehog) in CI — see workflow-level recommendation.
+# ── Secret scanning ───────────────────────────────────────────────────────────
 SECRET_PATTERNS = [
     ("AWS access key",   re.compile(r"AKIA[0-9A-Z]{16}")),
     ("AWS secret key",   re.compile(r"(?i)aws_secret_access_key\s*[:=]\s*['\"]?[A-Za-z0-9/+=]{40}")),
@@ -113,8 +191,7 @@ SECRET_PATTERNS = [
     ("JWT",              re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
     ("Bearer token",     re.compile(r"(?i)bearer\s+[A-Za-z0-9\-_.=]{20,}")),
 ]
-MAX_ADDED_LINES_PER_FIX = 40  # a legit typo/version/port fix is tiny; a big
-                              # blob of new lines is suspicious for an autofix
+MAX_ADDED_LINES_PER_FIX = 40
 
 
 def scan_text_for_secrets(text: str) -> list:
@@ -126,9 +203,6 @@ def scan_text_for_secrets(text: str) -> list:
 
 
 def redact_secrets(text: str) -> str:
-    """Scrub known secret shapes before they ever enter a prompt, a commit
-    message, or a PR/issue body. Defense-in-depth — the workflow's log
-    download step should also redact before writing failure.log to disk."""
     out = text
     for name, pat in SECRET_PATTERNS:
         out = pat.sub(f"[REDACTED:{name}]", out)
@@ -141,7 +215,7 @@ def _added_lines(original: str, new: str) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 1 — READ LOGS + DETECT TECH STACK  (unchanged, proven)
+# PHASE 1: COLLECTION (Deterministic)
 # ══════════════════════════════════════════════════════════════════════════════
 
 ERROR_KEYWORDS = [
@@ -182,37 +256,15 @@ def extract_error_signal(log_text: str) -> str:
     tail = [l.strip() for l in lines[-20:]
             if l.strip() and not any(n in l.lower() for n in NOISE_KEYWORDS)]
     signal = "\n".join(list(dict.fromkeys(relevant + tail)))
-    print(f"[DETECT] Error signal: {len(signal)} chars")
+    print(f"[COLLECT] Error signal: {len(signal)} chars")
     return signal
 
 
 def fingerprint_stack(log_text: str) -> set:
     low = log_text.lower()
     stacks = {s for s, sig in TECH_STACK_SIGNALS.items() if any(x in low for x in sig)}
-    print(f"[DETECT] Tech stacks: {stacks or {'unknown'}}")
+    print(f"[COLLECT] Tech stacks: {stacks or {'unknown'}}")
     return stacks
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STAGE 2 — DISCOVER FILES  (unchanged, proven)
-# ══════════════════════════════════════════════════════════════════════════════
-
-REFERENCED_PATH_PATTERNS = [
-    r'File "([^"]+\.\w+)"',
-    r'([\w./\-]+\.[A-Za-z0-9]+):\d+(?::\d+)?',
-    r'((?:[\w./\-]+/)?Dockerfile(?:\.\w+)?)\b',
-    r'([\w./\-]+/requirements[\w.\-]*\.txt)',
-    r'(?:in|from|at|open)\s+([\w./\-]+\.[A-Za-z0-9]+)',
-]
-STACK_FILE_SIGNALS = {
-    "python": [".py", "requirements.txt", "pyproject.toml", "setup.py"],
-    "node":   [".js", ".ts", "package.json"],
-    "docker": ["Dockerfile", "docker-compose"],
-    "java":   [".java", "pom.xml", "build.gradle"],
-    "go":     [".go", "go.mod"],
-}
-HIGH_VALUE = {"dockerfile", "requirements.txt", "package.json", "pom.xml",
-              "go.mod", "pyproject.toml", "setup.py", "docker-compose.yml"}
 
 
 def _relstrip(rel): return rel[2:] if rel.startswith("./") else rel
@@ -232,6 +284,14 @@ def _is_text_file(path: Path) -> bool:
 
 
 def extract_referenced_paths(log_text: str, root: Path = Path(".")) -> list:
+    """Extract file paths mentioned in log."""
+    REFERENCED_PATH_PATTERNS = [
+        r'File "([^"]+\.\w+)"',
+        r'([\w./\-]+\.[A-Za-z0-9]+):\d+(?::\d+)?',
+        r'((?:[\w./\-]+/)?Dockerfile(?:\.\w+)?)\b',
+        r'([\w./\-]+/requirements[\w.\-]*\.txt)',
+        r'(?:in|from|at|open)\s+([\w./\-]+\.[A-Za-z0-9]+)',
+    ]
     hits = []
     for pat in REFERENCED_PATH_PATTERNS:
         for m in re.finditer(pat, log_text):
@@ -258,7 +318,7 @@ def extract_referenced_paths(log_text: str, root: Path = Path(".")) -> list:
             add(rel)
     resolved = sorted(order, key=lambda r: -counts[r])
     if resolved:
-        print(f"[DISCOVER] Referenced in log: {resolved}")
+        print(f"[COLLECT] Referenced in log: {resolved}")
     return resolved
 
 
@@ -267,38 +327,14 @@ def _score_file(path: Path, signal: str, stacks: set) -> int:
     if name in low or str(path).lower() in low:
         score += 50
     for st in stacks:
-        for pat in STACK_FILE_SIGNALS.get(st, []):
-            if pat.startswith(".") and name.endswith(pat):
+        for pat in ["Dockerfile", "requirements.txt", "package.json", "pom.xml", ".py", ".js"]:
+            if pat.lower() in name:
                 score += 20
-            elif pat.lower() == name:
-                score += 25
-    if name in HIGH_VALUE:
-        score += 15
     return score
 
 
-def find_ci_workflow_files(root: Path = Path(".")) -> list:
-    found = []
-    wf_dir = root / ".github" / "workflows"
-    if not wf_dir.is_dir():
-        return found
-    for p in sorted(wf_dir.glob("*.y*ml")):
-        if not p.is_file():
-            continue
-        rel = _relstrip(str(p))
-        if _is_blocked(rel):
-            continue
-        try:
-            text = p.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            continue
-        if "auto-fixer.py" in text or "auto_fixer.py" in text:
-            continue
-        found.append(rel)
-    return found
-
-
 def discover_context(signal: str, stacks: set, forced: list) -> tuple:
+    """Discover and read relevant files. Returns (context_text, file_list, contents_dict)."""
     parts, included, contents, total = [], [], {}, 0
 
     def read_whole(path, cap=MAX_FILE_CHARS):
@@ -314,9 +350,10 @@ def discover_context(signal: str, stacks: set, forced: list) -> tuple:
         if total + len(block) > MAX_TOTAL_CONTEXT and included:
             return False
         parts.append(block); included.append(rel); contents[rel] = content; total += len(block)
-        print(f"[DISCOVER] + {rel} ({len(content)} chars)")
+        print(f"[COLLECT] + {rel} ({len(content)} chars)")
         return True
 
+    # Forced files first
     for rel in forced:
         if len(included) >= MAX_CONTEXT_FILES:
             break
@@ -326,6 +363,7 @@ def discover_context(signal: str, stacks: set, forced: list) -> tuple:
             if c is not None:
                 try_add(rel, c)
 
+    # Then score remaining files
     if len(included) < MAX_CONTEXT_FILES:
         cand = []
         for p in Path(".").rglob("*"):
@@ -349,157 +387,46 @@ def discover_context(signal: str, stacks: set, forced: list) -> tuple:
                 try_add(rel, c)
 
     context = "\n\n".join(parts)
-    print(f"[DISCOVER] {len(included)} files, {len(context)} chars")
+    print(f"[COLLECT] {len(included)} files, {len(context)} chars")
     return context, included, contents
 
 
-# ── static reference scan (hints only) ─────────────────────────────────────────
-DOCKERFILE_REF_PATTERNS = [
-    (re.compile(r'^\s*COPY\s+(?:--from=\S+\s+)?(\S+)\s+\S+', re.I | re.M), "COPY"),
-    (re.compile(r'^\s*ADD\s+(?:--from=\S+\s+)?(\S+)\s+\S+', re.I | re.M), "ADD"),
-    (re.compile(r'-r\s+(\S+\.txt)'), "pip install -r"),
-    (re.compile(r'CMD\s*\[\s*"[^"]*"\s*,\s*"([^"]+)"', re.I), "CMD"),
-    (re.compile(r'ENTRYPOINT\s*\[\s*"[^"]*"\s*,\s*"([^"]+)"', re.I), "ENTRYPOINT"),
-]
-
-# ── static Dockerfile base-image version scan (deterministic, no AI) ───────────
-# This is intentionally NOT left to the AI. Stage 3's prompt already tells the
-# model "python:3.1 / python:3.2 are INVALID — use 3.12", but a 3B model
-# reliably finds ONE bug per file and stops even when told not to — that's
-# exactly how a Dockerfile with both a broken COPY path AND an invalid
-# `FROM python:3.1` gets only the COPY path fixed. A version string is a pure,
-# checkable fact (existing CPython release or not) — Python can verify and
-# correct it with zero ambiguity, so there's no reason to gamble on the model
-# catching it.
-DOCKERFILE_FROM_PYTHON = re.compile(r'^(\s*FROM\s+)python:([^\s]+)(.*)$', re.I | re.M)
-VALID_PYTHON_MINORS = set(range(8, 14))   # CPython 3.8 – 3.13 (update as new releases land)
-DEFAULT_PYTHON_VERSION = "3.12"
+def repo_file_list(limit: int = 200) -> str:
+    """Return comma-separated list of all repo files (safe reference)."""
+    files = []
+    for p in sorted(Path(".").rglob("*")):
+        if p.is_file() and not any(d in SKIP_DIRS for d in p.parts):
+            rel = _relstrip(str(p))
+            if not _is_blocked(rel):
+                files.append(rel)
+        if len(files) >= limit:
+            break
+    return ", ".join(files) if files else "(none found)"
 
 
-def scan_python_base_image(included_contents: dict) -> list:
-    """Deterministic check: 'FROM python:X.Y[-suffix]' in a Dockerfile must
-    name an existing, supported CPython release. Returns a list of
-    {file, line_in_file, corrected_line, reason} ready to apply directly —
-    no AI round-trip needed, since the fix (swap to a valid version, keep
-    any -slim/-alpine suffix) is unambiguous."""
-    fixes = []
-    for rel, content in included_contents.items():
-        if "dockerfile" not in Path(rel).name.lower():
-            continue
-        for m in DOCKERFILE_FROM_PYTHON.finditer(content):
-            prefix, version, suffix = m.groups()
-            base = version.split("-", 1)[0]
-            tag_suffix = version[len(base):]  # e.g. "-slim", "-alpine", or ""
-            vm = re.match(r'^(\d+)\.(\d+)', base)
-            if not vm:
-                continue  # can't parse a version out of this tag — leave it alone
-            major, minor = int(vm.group(1)), int(vm.group(2))
-            if major == 3 and minor in VALID_PYTHON_MINORS:
-                continue  # valid release, nothing to do
-            old_line = m.group(0)
-            new_line = f"{prefix}python:{DEFAULT_PYTHON_VERSION}{tag_suffix}{suffix}"
-            fixes.append({
-                "file": rel,
-                "line_in_file": old_line,
-                "corrected_line": new_line,
-                "reason": (f"invalid Python base image tag 'python:{version}' "
-                           f"(no such CPython release) — using "
-                           f"'python:{DEFAULT_PYTHON_VERSION}{tag_suffix}'"),
-            })
-            print(f"[BASE-IMAGE] {rel}: python:{version} is not a real release "
-                  f"→ python:{DEFAULT_PYTHON_VERSION}{tag_suffix}")
-    return fixes
+def _context_block(signal, context, stacks):
+    """Format context for AI consumption."""
+    repo_files = repo_file_list()
+    return (
+        f"## Tech stack: {', '.join(sorted(stacks)) or 'unknown'}\n"
+        f"## CI failure (key lines):\n```\n{signal}\n```\n"
+        f"## Repo files (these exist — anything referenced but NOT here is a typo):\n{repo_files}\n"
+        f"## File contents (read these carefully):\n{context}"
+    )
 
 
-def scan_reference_hints(included_contents: dict) -> str:
-    return _scan_reference_details(included_contents)[1]
-
-
-def _scan_reference_details(included_contents: dict) -> tuple:
-    """Static scan for broken COPY/ADD/CMD/ENTRYPOINT references in Docker
-    files. CRITICAL: Dockerfile path arguments resolve against the BUILD
-    CONTEXT (conventionally the Dockerfile's own directory in this repo
-    layout, e.g. 'sample_app/'), NOT the git repo root. A suggested fix must
-    therefore be expressed relative to that context. Suggesting the full
-    repo-relative path (e.g. 'sample_app/app.py') looks plausible against the
-    repo tree but is WRONG inside the container — it resolves to
-    '/app/sample_app/app.py', which does not exist, and breaks the smoke
-    test/deploy even though the PR appears to "fix" the typo."""
-    all_repo = [_relstrip(str(p)) for p in Path(".").rglob("*")
-                if p.is_file() and not any(d in SKIP_DIRS for d in p.parts)]
-    basenames = {}
-    for f in all_repo:
-        basenames.setdefault(Path(f).name.lower(), []).append(f)
-    all_repo_set = set(all_repo)
-
-    broken, summary = [], []
-    for rel, content in included_contents.items():
-        name = Path(rel).name.lower()
-        if "dockerfile" not in name and "docker-compose" not in name and "compose.y" not in name:
-            continue
-        docker_dir = Path(rel).parent  # build context, by this repo's convention
-        for pat, label in DOCKERFILE_REF_PATTERNS:
-            for m in pat.finditer(content):
-                ref = m.group(1).strip().strip("'\"")
-                if not ref or ref in (".", "..") or ref.startswith("-") or ref.startswith("$"):
-                    continue
-                ref_clean = ref.lstrip("./")
-                candidates = {ref_clean, _relstrip(str(docker_dir / ref_clean))}
-                if any(Path(c).is_file() or c in all_repo_set for c in candidates):
-                    continue
-
-                close = difflib.get_close_matches(Path(ref_clean).name.lower(),
-                                                   basenames.keys(), n=1, cutoff=0.4)
-                closest_base = close[0] if close else ""
-
-                # Only offer a fix if the closest match ACTUALLY lives inside
-                # this Dockerfile's build context. No path string can fix a
-                # reference to a file that's outside the context — that needs
-                # a human to move the file or change the build context, not
-                # an AI-guessed path.
-                closest_full = ""
-                for cand in basenames.get(closest_base, []):
-                    try:
-                        closest_full = str(Path(cand).relative_to(docker_dir))
-                        break
-                    except ValueError:
-                        continue
-                fixable = bool(closest_full)
-
-                line_start = content.rfind("\n", 0, m.start()) + 1
-                line_end = content.find("\n", m.end())
-                if line_end == -1:
-                    line_end = len(content)
-                bad_line = content[line_start:line_end]
-                broken.append({"file": rel, "line": bad_line,
-                               "wrong_token": ref,
-                               "closest_basename": closest_base,
-                               "closest_full": closest_full,
-                               "fixable": fixable,
-                               "docker_dir": str(docker_dir)})
-                if fixable:
-                    summary.append(
-                        f"- {rel}: {label} references '{ref}' — not found in the "
-                        f"build context ({docker_dir}/). Correct in-context path: "
-                        f"'{closest_full}' (Dockerfile paths are relative to the "
-                        f"build context, NOT the repo root — do not use "
-                        f"'{docker_dir}/{closest_full}').")
-                else:
-                    summary.append(
-                        f"- {rel}: {label} references '{ref}' — not found in the "
-                        f"build context ({docker_dir}/), and no matching file exists "
-                        f"inside that context either. NOT AUTO-FIXABLE: needs a human "
-                        f"to move the file into the build context or adjust it. Do "
-                        f"NOT substitute a repo-relative path here — it will not "
-                        f"resolve inside the container.")
-    hint = "\n".join(dict.fromkeys(summary))
-    if hint:
-        print(f"[DISCOVER] Static reference hints:\n{hint}")
-    return broken, hint
+def _cap_prompt(system: str, body: str, context: str, rebuild, cap=9500) -> str:
+    """Trim file-contents if prompt is too long."""
+    full = f"{system}\n\n{body}"
+    if len(full) <= cap:
+        return full
+    allowed = cap - len(system) - len(rebuild("")) - 100
+    trimmed = context[:max(allowed, 1000)] + "\n...(trimmed)"
+    return f"{system}\n\n{rebuild(trimmed)}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AI plumbing — shared streaming + JSON extraction  (consolidated)
+# AI Plumbing (shared streaming + JSON extraction)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _detect_endpoint():
@@ -530,8 +457,7 @@ def _extract_token(line: bytes, fmt: str) -> str:
 
 def _stream_ollama(prompt, schema=None, num_predict=2000, temperature=0.05,
                    num_ctx=8192, tag="AI", retries=MAX_RETRIES) -> str:
-    """Single entry point for every AI stage. Streams the response, returns raw
-    text. Retries on timeout only (connection errors are terminal)."""
+    """Stream from Ollama with retries on timeout."""
     endpoint, fmt = _detect_endpoint()
     if fmt == "openai":
         payload = {"model": OLLAMA_MODEL, "prompt": prompt, "temperature": temperature,
@@ -542,7 +468,7 @@ def _stream_ollama(prompt, schema=None, num_predict=2000, temperature=0.05,
                                "num_ctx": num_ctx}, "stream": True}
         if schema:
             payload["format"] = schema
-    print(f"[{tag}] {endpoint} ({fmt}) | prompt {len(prompt)} chars | model {OLLAMA_MODEL}")
+    print(f"[{tag}] {endpoint} ({fmt}) | prompt {len(prompt)} chars")
 
     last = None
     for attempt in range(retries):
@@ -580,8 +506,7 @@ def _stream_ollama(prompt, schema=None, num_predict=2000, temperature=0.05,
 
 
 def _json_from(raw: str):
-    """Best-effort JSON extraction: direct parse, then widest brace-balanced
-    object, then brace-completion."""
+    """Best-effort JSON extraction."""
     cleaned = re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
     try:
         return json.loads(cleaned)
@@ -611,165 +536,63 @@ def _json_from(raw: str):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Repo-file listing + shared prompt fragments
+# PHASE 2: AI DIAGNOSIS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def repo_file_list(limit: int = 200) -> str:
-    files = []
-    for p in sorted(Path(".").rglob("*")):
-        if p.is_file() and not any(d in SKIP_DIRS for d in p.parts):
-            rel = _relstrip(str(p))
-            if not _is_blocked(rel):
-                files.append(rel)
-        if len(files) >= limit:
-            break
-    return ", ".join(files) if files else "(none found)"
-
-
-def _context_block(signal, context, stacks, hints):
-    repo_files = repo_file_list()
-    hints_section = (f"## Static reference check (verify each — not authoritative):\n{hints}\n"
-                     if hints else "")
-    return (
-        f"## Tech stack: {', '.join(sorted(stacks)) or 'unknown'}\n"
-        f"## CI failure (key lines):\n```\n{signal}\n```\n"
-        f"## Repo files (these exist — anything referenced but NOT here is a typo):\n{repo_files}\n"
-        f"{hints_section}"
-        f"## File contents (you may ONLY edit these):\n{context}"
-    )
-
-
-def _cap_prompt(system: str, body: str, context: str, rebuild, cap=9500) -> str:
-    """Trim the file-contents portion if the whole prompt is too long."""
-    full = f"{system}\n\n{body}"
-    if len(full) <= cap:
-        return full
-    allowed = cap - len(system) - len(rebuild("")) - 100
-    trimmed = context[:max(allowed, 1000)] + "\n...(trimmed)"
-    return f"{system}\n\n{rebuild(trimmed)}"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STAGE 1 — EXTRACT FACTS  (AI)
-# ══════════════════════════════════════════════════════════════════════════════
-
-FACTS_SCHEMA = {
+DIAGNOSIS_SCHEMA = {
     "type": "object",
     "properties": {
-        "error_type":    {"type": "string"},
-        "failing_files": {"type": "array", "items": {"type": "string"}},
-        "key_symbols":   {"type": "array", "items": {"type": "string"}},
-        "summary":       {"type": "string"},
+        "error_type":       {"type": "string"},
+        "root_cause":       {"type": "string"},
+        "reasoning":        {"type": "string"},
+        "confidence":       {"type": "number"},
+        "solution":         {"type": "string"},
+        "commit_message":   {"type": "string"},
     },
-    "required": ["error_type", "failing_files", "summary"],
+    "required": ["error_type", "root_cause", "confidence", "commit_message"],
 }
 
-FACTS_SYSTEM = """\
-You are a CI/CD triage engineer. Extract FACTS ONLY — do not diagnose or fix yet.
-Output ONLY one JSON object. No markdown fences. Start with { end with }.
-{"error_type":"short category e.g. missing_file / bad_version / port_mismatch / import_error","failing_files":["exact/path from a ### header, if any"],"key_symbols":["the literal tokens the error names — filenames, versions, ports"],"summary":"one sentence of what the log shows"}
-Copy tokens EXACTLY from the log and file contents. Do not invent files or symbols."""
+DIAGNOSIS_SYSTEM = """\
+You are a senior CI/CD debugging engineer. Given the CI failure logs and file contents, produce a DIAGNOSIS.
 
-
-def ai_extract_facts(signal, context, stacks, hints) -> dict:
-    def rebuild(ctx):
-        return _context_block(signal, ctx, stacks, hints) + \
-               "\n\nExtract the facts as JSON."
-    prompt = _cap_prompt(FACTS_SYSTEM, rebuild(context), context, rebuild)
-    raw = _stream_ollama(prompt, FACTS_SCHEMA, num_predict=800,
-                         temperature=0.0, tag="S1-FACTS")
-    data = _json_from(raw) or {}
-    data.setdefault("error_type", "unknown")
-    data.setdefault("failing_files", [])
-    data.setdefault("key_symbols", [])
-    data.setdefault("summary", "")
-    print(f"[S1-FACTS] {data.get('error_type')} | files={data.get('failing_files')} "
-          f"| symbols={data.get('key_symbols')}")
-    return data
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STAGE 2 — ROOT CAUSE  (AI)
-# ══════════════════════════════════════════════════════════════════════════════
-
-CAUSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "root_cause":     {"type": "string"},
-        "solution":       {"type": "string"},
-        "confidence":     {"type": "number"},
-        "commit_message": {"type": "string"},
-    },
-    "required": ["root_cause", "solution", "confidence", "commit_message"],
+Output ONLY one JSON object (no markdown fences):
+{
+  "error_type": "category (e.g., missing_file, bad_version, syntax_error, import_error)",
+  "root_cause": "one sentence: WHY it failed — the core problem",
+  "reasoning": "2-3 sentences: step-by-step thinking that led to this diagnosis",
+  "confidence": 0.0–1.0 (lower if multiple causes plausible),
+  "solution": "plain English: WHAT must change to fix it",
+  "commit_message": "fix: short description for git"
 }
 
-CAUSE_SYSTEM = """\
-You are a senior CI/CD debugging engineer. Given the extracted facts and the file
-contents, state the ROOT CAUSE. Do NOT write the fix yet. Output ONLY one JSON object.
-{"root_cause":"one sentence: WHY it failed","solution":"plain words: WHAT must change","confidence":0.0-1.0,"commit_message":"fix: short"}
+Do NOT diagnose what to fix yet. Just state the problem and why it happened.
 Set confidence below 0.5 if the facts do not clearly pin a single cause."""
 
 
-def ai_root_cause(facts, signal, context, stacks, hints) -> dict:
-    facts_line = (f"## Extracted facts:\nerror_type={facts.get('error_type')}; "
-                  f"failing_files={facts.get('failing_files')}; "
-                  f"key_symbols={facts.get('key_symbols')}; "
-                  f"summary={facts.get('summary')}\n")
+def ai_diagnose(signal, context, stacks) -> dict:
+    """Single AI call for diagnosis (or first half of FAST_MODE)."""
     def rebuild(ctx):
-        return facts_line + _context_block(signal, ctx, stacks, hints) + \
-               "\n\nGive root cause as JSON."
-    prompt = _cap_prompt(CAUSE_SYSTEM, rebuild(context), context, rebuild)
-    raw = _stream_ollama(prompt, CAUSE_SCHEMA, num_predict=700,
-                         temperature=0.05, tag="S2-CAUSE")
+        return _context_block(signal, ctx, stacks) + "\n\nProvide a diagnosis as JSON."
+    prompt = _cap_prompt(DIAGNOSIS_SYSTEM, rebuild(context), context, rebuild)
+    raw = _stream_ollama(prompt, DIAGNOSIS_SCHEMA, num_predict=700,
+                         temperature=0.05, tag="DIAGNOSIS")
     data = _json_from(raw) or {}
+    data.setdefault("error_type", "unknown")
     data.setdefault("root_cause", "unknown")
+    data.setdefault("reasoning", "")
     data.setdefault("solution", "")
     data.setdefault("commit_message", "fix: auto-fixer change")
     try:
         data["confidence"] = float(data.get("confidence", 0.5))
     except (TypeError, ValueError):
         data["confidence"] = 0.5
-    print(f"[S2-CAUSE] {data['root_cause']} (confidence {data['confidence']:.0%})")
+    print(f"[DIAGNOSIS] {data['error_type']} → {data['root_cause'][:60]} "
+          f"(confidence {data['confidence']:.0%})")
     return data
 
 
-def ai_facts_and_cause(signal, context, stacks, hints) -> tuple:
-    """FAST_MODE: one call producing facts + cause together."""
-    schema = {"type": "object", "properties": {
-        **FACTS_SCHEMA["properties"], **CAUSE_SCHEMA["properties"]},
-        "required": ["error_type", "failing_files", "summary",
-                     "root_cause", "solution", "confidence", "commit_message"]}
-    system = (FACTS_SYSTEM.split("Output ONLY")[0] +
-              "Extract facts AND state the root cause in one JSON object. "
-              "Output ONLY one JSON object.\n"
-              '{"error_type":"...","failing_files":[...],"key_symbols":[...],'
-              '"summary":"...","root_cause":"...","solution":"...",'
-              '"confidence":0.0-1.0,"commit_message":"fix: short"}')
-    def rebuild(ctx):
-        return _context_block(signal, ctx, stacks, hints) + \
-               "\n\nRespond with the combined JSON."
-    prompt = _cap_prompt(system, rebuild(context), context, rebuild)
-    raw = _stream_ollama(prompt, schema, num_predict=1000, temperature=0.05, tag="S1S2")
-    data = _json_from(raw) or {}
-    facts = {"error_type": data.get("error_type", "unknown"),
-             "failing_files": data.get("failing_files", []) or [],
-             "key_symbols": data.get("key_symbols", []) or [],
-             "summary": data.get("summary", "")}
-    try:
-        conf = float(data.get("confidence", 0.5))
-    except (TypeError, ValueError):
-        conf = 0.5
-    cause = {"root_cause": data.get("root_cause", "unknown"),
-             "solution": data.get("solution", ""),
-             "confidence": conf,
-             "commit_message": data.get("commit_message", "fix: auto-fixer change")}
-    print(f"[S1S2] {facts['error_type']} → {cause['root_cause']} "
-          f"(confidence {conf:.0%})")
-    return facts, cause
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 3 — GENERATE FIX  (AI)  — flat issues contract + focused correct-the-line
+# PHASE 3: AI FIX GENERATION
 # ══════════════════════════════════════════════════════════════════════════════
 
 FIX_SCHEMA = {
@@ -782,154 +605,86 @@ FIX_SCHEMA = {
                 "problem":   {"type": "string"},
                 "evidence":  {"type": "string"},
                 "corrected": {"type": "string"},
+                "reasoning": {"type": "string"},
             },
             "required": ["file", "problem", "evidence", "corrected"]}},
+        "all_issues_found": {"type": "boolean"},
+        "reasoning":        {"type": "string"},
     },
-    "required": ["issues"],
+    "required": ["issues", "all_issues_found"],
 }
 
 FIX_SYSTEM = """\
-You are a senior CI/CD debugging engineer. You know the root cause. Now emit the FIX.
-Output ONLY one JSON object. No markdown fences. Start with { end with }.
+You are a senior engineer. You now know the root cause. Emit ALL FIXES — this is your only chance.
 
-"issues" = ONE ENTRY PER BUG. Each entry:
-  - "file": the ### header path of the file the bug is in
-  - "problem": one sentence describing this specific bug
-  - "evidence": the offending text COPIED EXACTLY, character-for-character, from the file contents. SHORT — the single wrong token or one wrong line. Never paraphrase; copy it.
-  - "corrected": the same text with ONLY the bug fixed. Everything else identical.
-
-Schema:
-{"issues":[{"file":"exact/path","problem":"...","evidence":"exact text copied from the file","corrected":"same text, bug fixed"}]}
-
-FINDING EVERY BUG:
-A file routinely contains MORE THAN ONE unrelated bug. Finding one and stopping is a FAILURE. Re-read EVERY shown file line by line. For each line naming a file, a version, or a port, check it independently:
-- File names: the "## Repo files" list is the truth. A referenced name NOT in it is a typo — corrected = the closest real name. NEVER create a missing file; fix the reference.
-- CRITICAL for Dockerfile COPY/ADD/CMD/ENTRYPOINT paths: these resolve against the Docker BUILD CONTEXT (the Dockerfile's own directory, e.g. if the file is at "sample_app/Dockerfile" the context is "sample_app/"), NOT the repo root. If the real file is at "sample_app/app.py", the correct in-container reference is "app.py" — NEVER "sample_app/app.py". Using the full repo-relative path here looks correct against the file list but breaks the container at runtime.
-- Python versions: valid 3.8–3.13. python:3.1 / python:3.2 / python-version "3.1"/"3.2" are INVALID — corrected uses 3.12.
-- Ports: if app.run(port=N) disagrees with Dockerfile EXPOSE M, correct the app to bind M.
-- If you change `if __name__ == "__main__":`, it must still start a long-running server.
-Add one issues[] entry for EVERY bug — two bugs in one file = two entries with the same "file".
-
-RULES:
-- evidence must literally appear in the file contents. If you cannot quote exact offending text, omit that issue.
-- evidence and corrected must differ, and be as short as unambiguous allows.
-- Only files with a ### header may be fixed."""
-
-
-def ai_generate_fix(facts, cause, signal, context, stacks, hints) -> list:
-    ctx_line = (f"## Root cause (already determined): {cause.get('root_cause')}\n"
-                f"## Solution direction: {cause.get('solution')}\n"
-                f"## Facts: error_type={facts.get('error_type')}, "
-                f"symbols={facts.get('key_symbols')}\n")
-    def rebuild(ctx):
-        return ctx_line + _context_block(signal, ctx, stacks, hints) + \
-               "\n\nEmit the issues JSON."
-    prompt = _cap_prompt(FIX_SYSTEM, rebuild(context), context, rebuild)
-    raw = _stream_ollama(prompt, FIX_SCHEMA, num_predict=2800,
-                         temperature=0.05, tag="S3-FIX")
-    data = _json_from(raw)
-    if data is None:
-        raise ValueError(f"No valid JSON in Stage 3 response:\n{raw[:400]}")
-    issues = data.get("issues", []) or []
-    # tolerate a model that drifts to fixes[] shape
-    if not issues and isinstance(data.get("fixes"), list):
-        issues = data["fixes"]
-    return _normalize_issue_keys(issues)
-
-
-CORRECT_LINE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "corrections": {"type": "array", "items": {
-            "type": "object",
-            "properties": {
-                "id":             {"type": "integer"},
-                "corrected_line": {"type": "string"},
-            },
-            "required": ["id", "corrected_line"]}}
+Output ONLY one JSON object (no markdown fences):
+{
+  "issues": [
+    {
+      "file": "### header path (exact)",
+      "problem": "one sentence: what is this specific bug",
+      "evidence": "exact text COPIED from the file — the offending part",
+      "corrected": "same text with ONLY the bug fixed, everything else identical",
+      "reasoning": "why this fix works (brief)"
     },
-    "required": ["corrections"],
+    ...
+  ],
+  "all_issues_found": true/false — CRITICAL: did you scan EVERY file and find EVERY bug?
+  "reasoning": "walk-through: how you scanned for bugs"
 }
 
+CRITICAL RULES:
 
-def ai_correct_lines(broken: list) -> list:
-    """Focused correct-the-line pass for reference typos. Returns
-    [{file, line_in_file, corrected_line}, ...]. Never edits anything itself.
+1. FIND EVERY BUG — A file often contains MORE THAN ONE unrelated bug.
+   Re-read every file line-by-line. Check independently:
+   • File names: "## Repo files" is truth. Not there? It's a typo.
+   • Versions: python:3.1 / python:3.2 invalid (no such CPython release)
+   • Ports: if Dockerfile EXPOSE 8080 but app.run(port=5000), fix the app
+   • Imports: if imports "missing_module", check requirements.txt
+   • If you find one bug and stop, YOU FAILED. Scan thoroughly.
 
-    Only operates on entries the scanner marked `fixable` — i.e. the closest
-    matching file actually lives inside the Dockerfile's own build context.
-    If the closest match is outside the context, no path string can fix it
-    (the file would need to be physically moved), so we don't hand the AI a
-    reference it can only "fix" by writing a path that resolves at the repo
-    level but breaks at container runtime."""
-    fixable = [b for b in broken if b.get("fixable", bool(b.get("closest_full")))]
-    fixable_ids = {id(b) for b in fixable}
-    unfixable = [b for b in broken if id(b) not in fixable_ids]
-    for b in unfixable:
-        print(f"[AI-LINES] skipping '{b['wrong_token']}' in {b['file']} — no match inside "
-              f"the build context ({b.get('docker_dir','?')}/); needs a human to relocate the file")
-    if not fixable:
-        return []
-    items = []
-    for i, b in enumerate(fixable, 1):
-        items.append(f'{i}. line: "{b["line"]}"\n'
-                     f'   contains the wrong filename "{b["wrong_token"]}"; '
-                     f'the correct path RELATIVE TO THE BUILD CONTEXT '
-                     f'({b.get("docker_dir","?")}/) is "{b["closest_full"]}" '
-                     f'(basename "{b["closest_basename"]}"). Do NOT prefix it with '
-                     f'"{b.get("docker_dir","?")}/" — that path only exists in the '
-                     f'repo, not inside the container.')
-    system = ("Correct-the-line task. Output ONLY JSON: "
-              '{"corrections":[{"id":N,"corrected_line":"..."}]}. '
-              "For each numbered line below, return the line with the wrong "
-              "filename replaced by the correct in-context filename shown. Keep "
-              "everything else on the line IDENTICAL — same indentation, directive, "
-              "quoting, trailing content. Do not add or remove lines. Do not add any "
-              "directory prefix that isn't explicitly given as the correct path.")
-    prompt = f"{system}\n\nLines to correct:\n" + "\n".join(items)
-    print(f"[AI-LINES] focused call: {len(fixable)} broken line(s)")
+2. evidence MUST literally appear in the file contents shown.
+   If you cannot quote exact offending text, omit that issue.
 
-    try:
-        raw = _stream_ollama(prompt, CORRECT_LINE_SCHEMA, num_predict=1200,
-                             temperature=0.0, num_ctx=4096, tag="AI-LINES", retries=1)
-    except Exception as exc:
-        print(f"[AI-LINES] failed: {exc}", file=sys.stderr)
-        return []
+3. evidence and corrected MUST differ, and be as SHORT as unambiguous allows.
+
+4. For Dockerfile COPY/ADD/CMD/ENTRYPOINT paths:
+   These resolve against the BUILD CONTEXT (Dockerfile's directory).
+   If Dockerfile is "sample_app/Dockerfile", build context is "sample_app/".
+   Correct reference is relative to that context, NOT the repo root.
+   Example: if real file is "sample_app/app.py", the reference is "app.py" — NEVER "sample_app/app.py".
+
+5. set "all_issues_found": false only if you know there are bugs you couldn't locate."""
+
+
+def ai_generate_fixes(diagnosis, signal, context, stacks) -> tuple:
+    """Generate comprehensive fix list. Returns (issues, all_found)."""
+    diag_line = (f"## Root cause (determined): {diagnosis['root_cause']}\n"
+                 f"## Solution: {diagnosis['solution']}\n")
+    def rebuild(ctx):
+        return diag_line + _context_block(signal, ctx, stacks) + \
+               "\n\nEmit ALL fixes as JSON."
+    prompt = _cap_prompt(FIX_SYSTEM, rebuild(context), context, rebuild, cap=11000)
+    raw = _stream_ollama(prompt, FIX_SCHEMA, num_predict=3000,
+                         temperature=0.05, tag="FIX-GEN")
     data = _json_from(raw)
-    if not data:
-        return []
-
-    out = []
-    for c in data.get("corrections", []) or []:
-        try:
-            idx = int(c.get("id", 0)) - 1
-        except (TypeError, ValueError):
-            continue
-        if not (0 <= idx < len(fixable)):
-            continue
-        b = fixable[idx]
-        new_line = c.get("corrected_line", "")
-        if not isinstance(new_line, str) or not new_line.strip() or b["line"] == new_line:
-            continue
-        if b["closest_basename"] and b["closest_basename"] not in new_line:
-            print(f"[AI-LINES] discarded id={idx+1}: missing real filename")
-            continue
-        # Reject if the AI re-added the repo-relative prefix we explicitly
-        # told it not to use — this is the exact regression we're fixing.
-        docker_dir = b.get("docker_dir", "")
-        if docker_dir and f"{docker_dir}/{b['closest_full']}" in new_line:
-            print(f"[AI-LINES] discarded id={idx+1}: reintroduced repo-relative "
-                  f"prefix '{docker_dir}/' — not valid inside the build context")
-            continue
-        if b["wrong_token"] in new_line:
-            print(f"[AI-LINES] discarded id={idx+1}: still contains wrong token")
-            continue
-        out.append({"file": b["file"], "line_in_file": b["line"],
-                    "corrected_line": new_line})
-    return out
+    if data is None:
+        raise ValueError(f"No valid JSON in fix generation:\n{raw[:400]}")
+    
+    issues = data.get("issues", []) or []
+    all_found = bool(data.get("all_issues_found", True))
+    
+    print(f"[FIX-GEN] {len(issues)} issues | all_found={all_found}")
+    for i, it in enumerate(issues[:5], 1):
+        print(f"  {i}. {it.get('file','?')}: {(it.get('problem') or '')[:70]}")
+    if len(issues) > 5:
+        print(f"  ... and {len(issues)-5} more")
+    
+    return _normalize_issue_keys(issues), all_found
 
 
 def _normalize_issue_keys(issues):
+    """Handle alternate key names from model drift."""
     KF = ("file_path", "path", "filename", "filepath", "name")
     KE = ("find", "wrong", "offending", "original", "bad", "before")
     KC = ("replace", "fix", "replacement", "correct", "fixed", "after")
@@ -948,126 +703,7 @@ def _normalize_issue_keys(issues):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 4 — SELF-VERIFY  (AI)
-# ══════════════════════════════════════════════════════════════════════════════
-
-VERIFY_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "verdicts": {"type": "array", "items": {
-            "type": "object",
-            "properties": {
-                "id":     {"type": "integer"},
-                "keep":   {"type": "boolean"},
-                "reason": {"type": "string"},
-            },
-            "required": ["id", "keep"]}},
-        "confidence": {"type": "number"},
-    },
-    "required": ["verdicts"],
-}
-
-VERIFY_SYSTEM = """\
-You are reviewing proposed fixes before they are applied. For each numbered issue, decide keep=true only if:
-  - the "evidence" text actually appears in the shown file contents, AND
-  - "corrected" is a genuine fix of a real bug (not a no-op, not a new bug).
-If evidence is not present, or the change looks wrong or invented, keep=false.
-Output ONLY one JSON object:
-{"verdicts":[{"id":N,"keep":true,"reason":"short"}],"confidence":0.0-1.0}"""
-
-
-def ai_self_verify(issues, context) -> tuple:
-    """Return (kept_issues, verify_confidence). On any failure, keep all (Python
-    validation remains the hard gate)."""
-    if SKIP_SELF_VERIFY or not issues:
-        return issues, None
-    listing = []
-    for i, it in enumerate(issues, 1):
-        listing.append(f'{i}. file="{it.get("file","")}"\n'
-                       f'   evidence: {(it.get("evidence") or "")[:160]!r}\n'
-                       f'   corrected: {(it.get("corrected") or "")[:160]!r}')
-    prompt = (f"{VERIFY_SYSTEM}\n\n## File contents:\n{context}\n\n"
-              f"## Proposed fixes:\n" + "\n".join(listing) +
-              "\n\nReturn the verdicts JSON.")
-    if len(prompt) > 11000:
-        prompt = prompt[:11000]
-    try:
-        raw = _stream_ollama(prompt, VERIFY_SCHEMA, num_predict=900,
-                             temperature=0.0, tag="S4-VERIFY", retries=1)
-    except Exception as exc:
-        print(f"[S4-VERIFY] failed ({exc}) — keeping all issues", file=sys.stderr)
-        return issues, None
-    data = _json_from(raw)
-    if not data:
-        return issues, None
-    drop = set()
-    for v in data.get("verdicts", []) or []:
-        try:
-            idx = int(v.get("id", 0)) - 1
-        except (TypeError, ValueError):
-            continue
-        if 0 <= idx < len(issues) and v.get("keep") is False:
-            drop.add(idx)
-            print(f"[S4-VERIFY] dropped #{idx+1}: {v.get('reason','')[:80]}")
-    kept = [it for i, it in enumerate(issues) if i not in drop]
-    try:
-        vc = float(data.get("confidence")) if data.get("confidence") is not None else None
-    except (TypeError, ValueError):
-        vc = None
-    if not kept and issues:
-        # verifier rejected everything — distrust the verifier, not Stage 3
-        print("[S4-VERIFY] verifier rejected all issues — keeping Stage 3 output "
-              "for Python validation to judge")
-        return issues, vc
-    return kept, vc
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAIR + LOCATE  (Python turns the AI's quotes into fixes)  — unchanged logic
-# ══════════════════════════════════════════════════════════════════════════════
-
-def issues_to_fixes(issues: list, included_contents: dict) -> tuple:
-    fixes_by_file, rejects = {}, []
-    for n, it in enumerate(issues, 1):
-        file = (it.get("file") or "").strip()
-        ev   = it.get("evidence")
-        cor  = it.get("corrected")
-        prob = (it.get("problem") or "").strip()
-
-        if not isinstance(ev, str) or not ev.strip():
-            rejects.append(f"issue #{n} ({file or '?'}): empty evidence")
-            continue
-        if not isinstance(cor, str) or cor == ev:
-            rejects.append(f"issue #{n} ({file or '?'}): corrected missing or identical")
-            continue
-
-        holders = [f for f, c in included_contents.items() if ev in c]
-        if file in included_contents and ev in included_contents[file]:
-            target = file
-        elif len(holders) == 1:
-            target = holders[0]
-            print(f"[LOCATE] issue #{n}: filed under '{file or '?'}' but evidence only "
-                  f"exists in '{target}' — relocating.")
-        elif len(holders) > 1:
-            rejects.append(f"issue #{n} ({file or '?'}): evidence in {len(holders)} files — ambiguous")
-            continue
-        else:
-            rejects.append(f"issue #{n} ({file or '?'}): evidence {ev[:80]!r} not found — rejected")
-            continue
-
-        entry = fixes_by_file.setdefault(
-            target, {"file": target, "reason": prob or "AI fix", "edits": []})
-        edit = {"find": ev, "replace": cor}
-        if edit not in entry["edits"]:
-            entry["edits"].append(edit)
-            if prob and prob not in entry["reason"]:
-                entry["reason"] = (entry["reason"] + "; " + prob).lstrip("; ")[:300]
-
-    return list(fixes_by_file.values()), rejects
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# APPLY + VALIDATE  (unchanged, proven)
+# PHASE 4: VALIDATION (Deterministic Safety Gates)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _salvage_fragment(content: str, find: str, replace: str):
@@ -1087,6 +723,7 @@ def _salvage_fragment(content: str, find: str, replace: str):
 
 
 def _apply_edits(original: str, edits: list) -> tuple:
+    """Apply find/replace edits with fallback strategies."""
     content = original
     for i, ed in enumerate(edits):
         find, repl = ed.get("find", ""), ed.get("replace", "")
@@ -1095,16 +732,11 @@ def _apply_edits(original: str, edits: list) -> tuple:
         if find in content:
             content = content.replace(find, repl)
             continue
-        # IDEMPOTENCY: multiple AI stages can independently diagnose the same
-        # underlying bug (e.g. Stage 3a's correct-the-line pass AND Stage 3's
-        # freeform fix both catching the same Dockerfile typo). Edits are
-        # applied sequentially, so by the time edit #2 runs, edit #1 may have
-        # already produced the exact text edit #2 was going to write. That is
-        # not a failure — it's confirmation the fix already landed. Only treat
-        # it as unresolved if the replacement text is not already there.
+        # Idempotency: if the replacement is already there, skip
         if isinstance(repl, str) and repl.strip() and repl in content:
-            print(f"[EDIT] edit #{i+1} already satisfied by a prior edit — skipping")
+            print(f"[EDIT] edit #{i+1} already satisfied — skipping")
             continue
+        # Try line-by-line normalization
         nf = "\n".join(l.strip() for l in find.splitlines())
         nc = "\n".join(l.strip() for l in content.splitlines())
         matched = False
@@ -1128,7 +760,7 @@ def _apply_edits(original: str, edits: list) -> tuple:
             print(f"[EDIT] Salvaged edit #{i+1} via unique-fragment match")
             content = salvaged
             continue
-        return None, (f"edit #{i+1} 'find' text not present — find: {find[:120]!r}")
+        return None, (f"edit #{i+1} 'find' not present — find: {find[:120]!r}")
     if content == original:
         return None, "edits produced no change"
     return content, "ok"
@@ -1148,6 +780,7 @@ def _resolve_content(fix: dict) -> tuple:
 
 
 def validate_fix(fix: dict) -> tuple:
+    """Gate: ensure fix passes all safety checks."""
     file = (fix.get("file") or "").strip()
     if not file:
         return False, "missing 'file'"
@@ -1157,6 +790,7 @@ def validate_fix(fix: dict) -> tuple:
         return False, f"blocked path: {file}"
     if not Path(file).exists():
         return False, f"file does not exist: {file}"
+    
     original_text = Path(file).read_text(encoding="utf-8", errors="replace")
     content, reason = _resolve_content(fix)
     if content is None:
@@ -1168,11 +802,12 @@ def validate_fix(fix: dict) -> tuple:
     added = _added_lines(original_text, content)
     if len(added) > MAX_ADDED_LINES_PER_FIX:
         return False, (f"fix adds {len(added)} lines (max {MAX_ADDED_LINES_PER_FIX}) "
-                       "— too large for an auto-fix, needs human review")
+                       "— too large for an auto-fix")
     secret_hits = scan_text_for_secrets("\n".join(added))
     if secret_hits:
         return False, f"potential secret in fix ({', '.join(secret_hits)}) — blocked"
 
+    # Syntax validation
     if file.endswith(".py"):
         try:
             ast.parse(content)
@@ -1192,14 +827,51 @@ def validate_fix(fix: dict) -> tuple:
     return True, "ok"
 
 
+def issues_to_fixes(issues: list, included_contents: dict) -> tuple:
+    """Convert AI issues to fixes. Checks evidence exists; returns fixes + rejects."""
+    fixes_by_file, rejects = {}, []
+    for n, it in enumerate(issues, 1):
+        file = (it.get("file") or "").strip()
+        ev   = it.get("evidence")
+        cor  = it.get("corrected")
+        prob = (it.get("problem") or "").strip()
+
+        if not isinstance(ev, str) or not ev.strip():
+            rejects.append(f"issue #{n} ({file or '?'}): empty evidence")
+            continue
+        if not isinstance(cor, str) or cor == ev:
+            rejects.append(f"issue #{n} ({file or '?'}): corrected missing or identical")
+            continue
+
+        holders = [f for f, c in included_contents.items() if ev in c]
+        if file in included_contents and ev in included_contents[file]:
+            target = file
+        elif len(holders) == 1:
+            target = holders[0]
+            print(f"[LOCATE] issue #{n}: evidence found in '{target}' (not '{file}')")
+        elif len(holders) > 1:
+            rejects.append(f"issue #{n} ({file or '?'}): evidence in {len(holders)} files — ambiguous")
+            continue
+        else:
+            rejects.append(f"issue #{n}: evidence {ev[:80]!r} not found")
+            continue
+
+        entry = fixes_by_file.setdefault(target, {"file": target, "reason": prob or "AI fix", "edits": []})
+        edit = {"find": ev, "replace": cor}
+        if edit not in entry["edits"]:
+            entry["edits"].append(edit)
+
+    return list(fixes_by_file.values()), rejects
+
+
 def write_fixes(fixes: list) -> tuple:
+    """Apply validated fixes to disk."""
     written, originals, reasons = [], {}, []
     for fix in fixes[:MAX_FILES_FIXED]:
         ok, reason = validate_fix(fix)
         file = fix.get("file", "").strip()
         if not ok:
             print(f"  ✗ {file or '?'} — {reason}")
-            print(f"  ✗ {file or '?'} — {reason}", file=sys.stderr)
             reasons.append(f"{file or '?'}: {reason}")
             continue
         originals[file] = Path(file).read_text(encoding="utf-8", errors="replace")
@@ -1210,13 +882,14 @@ def write_fixes(fixes: list) -> tuple:
         tmp = p.with_suffix(p.suffix + ".tmp")
         tmp.write_text(content, encoding="utf-8")
         tmp.replace(p)
-        print(f"  ✓ {file} — {fix.get('reason','')[:100]}")
+        print(f"  ✓ {file}")
         written.append(file)
     written = list(dict.fromkeys(written))
     return written, originals, reasons
 
 
 def revert_files(originals: dict):
+    """Restore files to original state."""
     for file, content in originals.items():
         try:
             Path(file).write_text(content, encoding="utf-8")
@@ -1226,7 +899,7 @@ def revert_files(originals: dict):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RUN TESTS  (unchanged)
+# PHASE 5: EXECUTION (Deterministic)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def detect_test_commands(stacks: set) -> list:
@@ -1264,10 +937,6 @@ def run_tests(stacks: set) -> bool:
             print(f"[TEST] {cmd[0]} timed out — skipping")
     return ok_all
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# COMMIT + PUSH + PR  /  CREATE ISSUE  (unchanged)
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _git(*args, check=True):
     return subprocess.run(["git", *args], check=check, capture_output=True, text=True)
@@ -1349,17 +1018,19 @@ def _gh(token):
             "X-GitHub-Api-Version": "2022-11-28"}
 
 
-def open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
-            error_analysis="", solution="") -> str:
-    details = "".join(f"\n**`{f.get('file','?')}`** — {f.get('reason','')}\n" for f in fixes)
-    diag = ""
-    if error_analysis or solution:
-        diag = (f"### AI diagnosis\n**Error:** {error_analysis or 'n/a'}\n\n"
-                f"**Solution:** {solution or 'n/a'}\n\n")
-    body = (f"## 🤖 AI Auto-Fix\n\n{diag}"
-            f"**Root cause:** {root_cause}\n\n"
-            f"**Files changed:** {', '.join(f'`{f}`' for f in written)}\n\n"
-            f"## What changed{details}\n\n> Auto-generated — review before merge.")
+def open_pr(token, repo, branch, commit_msg, diagnosis, written, issues) -> str:
+    """Open PR with diagnosis details."""
+    body = (f"## 🤖 AI Auto-Fix\n\n"
+            f"**Root Cause:** {diagnosis['root_cause']}\n\n"
+            f"**Solution:** {diagnosis['solution'] or '(see reasoning)'}\n\n"
+            f"**Files Changed:** {', '.join(f'`{f}`' for f in written)}\n\n"
+            f"**Issues Fixed:**\n")
+    for i in issues[:5]:
+        body += f"- `{i.get('file','?')}`: {(i.get('problem') or '')[:80]}\n"
+    if len(issues) > 5:
+        body += f"- ... and {len(issues)-5} more\n"
+    body += f"\n> Auto-generated by AI auto-fixer — review before merge."
+    
     r = requests.post(f"https://api.github.com/repos/{repo}/pulls",
                       json={"title": f"🤖 {commit_msg}", "head": branch,
                             "base": GIT_TARGET_BRANCH, "body": body},
@@ -1394,8 +1065,6 @@ def open_issue(token, repo, reason, run_url=""):
                       headers=_gh(token), timeout=30)
     if r.status_code in (200, 201):
         print(f"[ISSUE] {r.json().get('html_url','')}")
-    else:
-        print(f"[ISSUE] failed {r.status_code}: {r.text[:200]}", file=sys.stderr)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1403,7 +1072,7 @@ def open_issue(token, repo, reason, run_url=""):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    ap = argparse.ArgumentParser(description="AI CI/CD auto-fixer (staged)")
+    ap = argparse.ArgumentParser(description="AI CI/CD auto-fixer (AI-centric architecture)")
     ap.add_argument("--input", required=True, help="Path to CI failure log")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--skip-tests", action="store_true")
@@ -1418,7 +1087,7 @@ def main():
         print(f"[ERROR] Log not found: {args.input}", file=sys.stderr)
         sys.exit(1)
 
-    # loop guards
+    # Loop guards
     if last_commit_was_bot():
         sys.exit(0)
     if count_recent_bot_commits() >= MAX_BOT_ATTEMPTS:
@@ -1429,150 +1098,84 @@ def main():
     if token and repo:
         url = pending_bot_pr(token, repo)
         if url:
-            print(f"[GUARD] A fix PR is already open: {url} — skipping model call.")
+            print(f"[GUARD] A fix PR is already open: {url} — skipping.")
             sys.exit(0)
 
-    # ── COLLECT LOGS + CONTEXT ──
-    print("\n━━━ COLLECT LOGS + CONTEXT ━━━")
+    # ── PHASE 1: COLLECT LOGS + CONTEXT ──
+    print("\n━━━ PHASE 1: COLLECTION ━━━")
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
     redacted = scan_text_for_secrets(log_text)
     if redacted:
-        print(f"[SECURITY] redacting {len(redacted)} potential secret pattern(s) from log: "
+        print(f"[SECURITY] redacting {len(redacted)} potential secret pattern(s): "
               f"{', '.join(redacted)}")
     log_text = redact_secrets(log_text)
+    
     signal = extract_error_signal(log_text)
     stacks = fingerprint_stack(log_text)
     if not signal.strip():
-        print("[DETECT] No error signal — nothing to fix.")
+        print("[COLLECT] No error signal — nothing to fix.")
         sys.exit(0)
 
     forced = extract_referenced_paths(log_text)
-    if not forced:
-        wf = find_ci_workflow_files()
-        if wf:
-            print(f"[DISCOVER] No source file referenced — falling back to CI workflow: {wf}")
-            forced = wf
     context, included, included_contents = discover_context(signal, stacks, forced)
     if not included:
-        print("[DISCOVER] WARNING: no files resolved.")
-    broken_lines, hints = _scan_reference_details(included_contents)
-    version_issues = scan_python_base_image(included_contents)
+        print("[COLLECT] WARNING: no files resolved.")
 
-    # ── AI STAGE 1 + 2 ──
-    print("\n━━━ AI STAGE 1: FACTS / STAGE 2: ROOT CAUSE ━━━")
+    # ── PHASE 2: AI DIAGNOSIS ──
+    print("\n━━━ PHASE 2: AI DIAGNOSIS ━━━")
     try:
-        if FAST_MODE:
-            facts, cause = ai_facts_and_cause(signal, context, stacks, hints)
-        else:
-            facts = ai_extract_facts(signal, context, stacks, hints)
-            cause = ai_root_cause(facts, signal, context, stacks, hints)
+        diagnosis = ai_diagnose(signal, context, stacks)
     except Exception as exc:
-        print(f"[ERROR] AI stage 1/2 failed: {exc}", file=sys.stderr)
+        print(f"[ERROR] AI diagnosis failed: {exc}", file=sys.stderr)
         if token and repo:
             open_issue(token, repo, f"AI diagnosis failed: {exc}", run_url)
         sys.exit(2)
 
-    root_cause = cause["root_cause"]
-    solution   = cause["solution"]
-    commit_msg = cause["commit_message"]
-    confidence = cause["confidence"]
+    print(f"  error_type  : {diagnosis['error_type']}")
+    print(f"  root_cause  : {diagnosis['root_cause']}")
+    print(f"  reasoning   : {diagnosis['reasoning'][:100]}...")
+    print(f"  confidence  : {diagnosis['confidence']:.0%}")
+    print(f"  solution    : {diagnosis['solution'][:100] if diagnosis['solution'] else '(none)'}...")
 
-    print("\n  ── diagnosis ──")
-    print(f"  CAUSE      : {root_cause}")
-    print(f"  SOLUTION   : {solution or '(none)'}")
-    print(f"  confidence : {confidence:.0%}")
-
-    # ── STAGE 3a: focused correct-the-line (reference typos, AI) +
-    #             deterministic Dockerfile base-image version fix (Python) ──
-    # Both are static-scan-driven, so both get applied here regardless of
-    # what Stage 3's freeform pass finds — a file with N independent static
-    # bugs gets all N fixed, not just whichever one the 3B model noticed first.
-    by_file = {}
-
-    def _add_prefilled_edit(file, find, replace, reason):
-        entry = by_file.setdefault(file, {"file": file, "reason": reason, "edits": []})
-        edit = {"find": find, "replace": replace}
-        if edit not in entry["edits"]:
-            entry["edits"].append(edit)
-        if reason and reason not in entry["reason"]:
-            entry["reason"] = (entry["reason"] + "; " + reason).lstrip("; ")[:300]
-
-    if broken_lines:
-        print("\n━━━ STAGE 3a: CORRECT-THE-LINE (reference typos) ━━━")
-        corrections = ai_correct_lines(broken_lines)
-        for c in corrections:
-            _add_prefilled_edit(c["file"], c["line_in_file"], c["corrected_line"],
-                                "AI-corrected reference typo(s)")
-        print(f"[AI-LINES] {len(corrections)} corrected line(s)")
-
-    if version_issues:
-        print("\n━━━ STAGE 3a: BASE IMAGE VERSION (deterministic) ━━━")
-        for v in version_issues:
-            _add_prefilled_edit(v["file"], v["line_in_file"], v["corrected_line"], v["reason"])
-
-    prefilled_fixes = list(by_file.values())
-    print(f"[STAGE 3a] {sum(len(f['edits']) for f in prefilled_fixes)} deterministic fix(es) "
-          f"across {len(prefilled_fixes)} file(s)")
-
-    # ── AI STAGE 3b: freeform diagnosis fix ──
-    print("\n━━━ AI STAGE 3: GENERATE FIX ━━━")
+    # ── PHASE 3: AI FIX GENERATION ──
+    print("\n━━━ PHASE 3: FIX GENERATION ━━━")
     try:
-        issues = ai_generate_fix(facts, cause, signal, context, stacks, hints)
+        issues, all_found = ai_generate_fixes(diagnosis, signal, context, stacks)
     except Exception as exc:
-        print(f"[ERROR] AI stage 3 failed: {exc}", file=sys.stderr)
+        print(f"[ERROR] AI fix generation failed: {exc}", file=sys.stderr)
         if token and repo:
             open_issue(token, repo, f"AI fix generation failed: {exc}", run_url)
         sys.exit(2)
 
-    print(f"  issues reported: {len(issues)}")
-    for n, it in enumerate(issues, 1):
-        print(f"    {n}. {it.get('file','?')}: {it.get('problem','')[:80]}")
-        print(f"       {(it.get('evidence') or '')[:60]!r} → {(it.get('corrected') or '')[:60]!r}")
-
-    # ── AI STAGE 4: self-verify ──
-    verify_conf = None
-    if issues and not SKIP_SELF_VERIFY:
-        print("\n━━━ AI STAGE 4: SELF-VERIFY ━━━")
-        issues, verify_conf = ai_self_verify(issues, context)
-        print(f"  issues after verify: {len(issues)}"
-              + (f" | verify confidence {verify_conf:.0%}" if verify_conf is not None else ""))
+    if not all_found:
+        print(f"[WARNING] AI reports it may not have found all issues")
+    for i, it in enumerate(issues, 1):
+        print(f"  {i}. {it.get('file','?')}: {(it.get('problem') or '')[:70]}")
 
     # ── CONFIDENCE GATE ──
-    combined = confidence if verify_conf is None else (confidence + verify_conf) / 2
-    if combined < 0.5:
-        print(f"[GATE] Confidence {combined:.0%} too low — escalating instead of guessing.")
+    if diagnosis['confidence'] < 0.5:
+        print(f"[GATE] Confidence {diagnosis['confidence']:.0%} too low — escalating.")
         if token and repo:
             open_issue(token, repo,
-                       f"AI confidence too low ({combined:.0%}). Root cause: {root_cause}", run_url)
+                       f"AI confidence too low ({diagnosis['confidence']:.0%}). "
+                       f"Root cause: {diagnosis['root_cause']}", run_url)
         sys.exit(0)
 
-    # ── PAIR + LOCATE, merge with prefilled ──
-    freeform_fixes, pair_rejects = issues_to_fixes(issues, included_contents)
-    for rej in pair_rejects:
+    # ── PHASE 4: VALIDATION ──
+    print("\n━━━ PHASE 4: VALIDATION ━━━")
+    fixes, rejects = issues_to_fixes(issues, included_contents)
+    for rej in rejects:
         print(f"  ✗ {rej}", file=sys.stderr)
 
-    merged = {}
-    for f in prefilled_fixes + freeform_fixes:
-        entry = merged.setdefault(f["file"], {"file": f["file"],
-                 "reason": f.get("reason", ""), "edits": []})
-        for e in f.get("edits", []) or []:
-            if e not in entry["edits"]:
-                entry["edits"].append(e)
-        if f.get("reason") and f["reason"] not in entry["reason"]:
-            entry["reason"] = (entry["reason"] + "; " + f["reason"]).lstrip("; ")[:300]
-    fixes = list(merged.values())
-
     if not fixes:
-        detail = "; ".join(pair_rejects) or "model reported no locatable issues"
-        print(f"[ERROR] AI produced no usable fixes. {detail}", file=sys.stderr)
+        detail = "; ".join(rejects) or "model reported no locatable issues"
+        print(f"[ERROR] No usable fixes. {detail}", file=sys.stderr)
         if token and repo:
-            open_issue(token, repo,
-                       f"AI produced no usable fixes. Root cause: {root_cause}\n\nDetail: {detail}",
-                       run_url)
+            open_issue(token, repo, f"AI produced no usable fixes.\n\nDetail: {detail}", run_url)
         sys.exit(3)
 
-    # ── APPLY + VALIDATE ──
-    print("\n━━━ APPLY + VALIDATE ━━━")
+    # ── PHASE 5: EXECUTION ──
+    print("\n━━━ PHASE 5: EXECUTION ━━━")
     if args.dry_run:
         for fix in fixes:
             ok, reason = validate_fix(fix)
@@ -1581,87 +1184,37 @@ def main():
 
     written, originals, reject_reasons = write_fixes(fixes)
     if not written:
-        detail = "; ".join(reject_reasons) or "no detail captured"
+        detail = "; ".join(reject_reasons) or "no detail"
         print(f"[ERROR] No valid fix applied. {detail}", file=sys.stderr)
         if token and repo:
-            open_issue(token, repo,
-                       f"AI fix failed validation. Root cause: {root_cause}\n\nDetail: {detail}",
-                       run_url)
+            open_issue(token, repo, f"AI fix failed validation.\n\nDetail: {detail}", run_url)
         sys.exit(3)
 
-    # ── ADDITIONAL ROUNDS (static rescan) ──
-    # Checks BOTH static-scan classes each round (reference typos + base-image
-    # version) so a file with several independent static bugs keeps getting
-    # revisited until it's clean, instead of stopping once one class is fixed.
-    prev_signature = None
-    for round_no in range(2, MAX_AI_ROUNDS + 1):
-        _, r_included, r_contents = discover_context(signal, stacks, forced)
-        r_broken, r_hints = _scan_reference_details(r_contents)
-        r_versions = scan_python_base_image(r_contents)
-        if not r_hints and not r_versions:
-            print(f"[LOOP] Static scan clean after round {round_no-1}.")
-            break
-        signature = r_hints + "\n" + "|".join(v["line_in_file"] for v in r_versions)
-        if signature == prev_signature:
-            print(f"[LOOP] Round {round_no-1} left the same issue(s) — stopping.")
-            break
-        prev_signature = signature
-        print(f"\n━━━ ROUND {round_no}/{MAX_AI_ROUNDS}: CORRECT-THE-LINE + BASE IMAGE VERSION ━━━")
-        by_file = {}
-
-        def _add_round_edit(file, find, replace, reason):
-            entry = by_file.setdefault(file, {"file": file, "reason": reason, "edits": []})
-            edit = {"find": find, "replace": replace}
-            if edit not in entry["edits"]:
-                entry["edits"].append(edit)
-
-        if r_broken:
-            corrections = ai_correct_lines(r_broken)
-            for c in corrections:
-                _add_round_edit(c["file"], c["line_in_file"], c["corrected_line"],
-                                "AI-corrected reference typo(s)")
-        for v in r_versions:
-            _add_round_edit(v["file"], v["line_in_file"], v["corrected_line"], v["reason"])
-
-        fixes_r = list(by_file.values())
-        if not fixes_r:
-            print(f"[LOOP] Nothing more to apply — stopping.")
-            break
-        written_r, originals_r, _ = write_fixes(fixes_r)
-        if not written_r:
-            print(f"[LOOP] Round {round_no} produced no valid fix — stopping.")
-            break
-        for f in written_r:
-            originals.setdefault(f, originals_r[f])
-        written = list(dict.fromkeys(written + written_r))
-        fixes = fixes + fixes_r
-
-    # ── RUN TESTS ──
-    print("\n━━━ RUN TESTS ━━━")
+    # Run tests
+    print("\n━━━ TESTS ━━━")
     if not args.skip_tests:
         if not run_tests(stacks):
             revert_files(originals)
             if token and repo:
                 open_issue(token, repo,
-                           f"Fix applied but tests failed — reverted. Root cause: {root_cause}",
-                           run_url)
+                           f"Fix applied but tests failed — reverted.\n"
+                           f"Root cause: {diagnosis['root_cause']}", run_url)
             sys.exit(5)
     else:
         print("[TEST] Skipped (--skip-tests)")
 
-    # ── COMMIT + PR ──
-    print("\n━━━ COMMIT + PR ━━━")
-    branch = commit_to_branch(commit_msg, written)
+    # Commit + PR
+    print("\n━━━ GIT ━━━")
+    branch = commit_to_branch(diagnosis["commit_message"], written)
     if not branch:
         sys.exit(4)
     if token and repo:
-        open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
-                facts.get("summary", ""), solution)
+        open_pr(token, repo, branch, diagnosis["commit_message"], diagnosis, written, issues)
     else:
         print(f"[PR] No token — merge {branch} manually.")
 
     print("\n━━━ ✅ DONE ━━━")
-    print(f"  root cause : {root_cause}")
+    print(f"  root cause : {diagnosis['root_cause']}")
     print(f"  fixed      : {', '.join(written)}")
     print(f"  branch     : {branch} → {GIT_TARGET_BRANCH}")
 
