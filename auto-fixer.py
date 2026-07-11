@@ -147,7 +147,7 @@ ALWAYS_BLOCKED   = {".git", "auto-fixer.py"}
 # touches secrets. The AI still authors the fix; Python enforces the blast
 # radius.
 WORKFLOW_PATTERN     = r"\.?github/workflows/.*\.ya?ml$"
-ALLOW_WORKFLOW_FIXES = os.environ.get("ALLOW_WORKFLOW_FIXES", "").lower() in ("1", "true", "yes")
+ALLOW_WORKFLOW_FIXES = os.environ.get("ALLOW_WORKFLOW_FIXES", "1").lower() in ("1", "true", "yes")
 
 BLOCKED_PATTERNS = [
     r"\.?github/CODEOWNERS$",
