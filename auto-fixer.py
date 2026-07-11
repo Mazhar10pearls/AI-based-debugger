@@ -130,11 +130,26 @@ BOT_PREFIX = "fix:"
 MAX_BOT_ATTEMPTS = 3
 
 ALWAYS_BLOCKED   = {".git", "auto-fixer.py"}
+
+# Workflow files are handled separately from the flat block-list below. A blind
+# "fix" to a workflow is a privilege-escalation vector (it can change
+# permissions, add a secret-exfiltrating run step, swap a pinned action) and
+# reads like a normal diff to a reviewer — so by default they are BLOCKED and
+# breakage escalates to a human via open_issue().
+#
+# BUT: the single most common real CI failure is a typo IN the workflow itself
+# — a bad `python-version`, a mistyped `-r requirementsss.txt`, a wrong test
+# path. Refusing all workflow edits makes the auto-fixer useless for exactly
+# that class. So workflow editing is OPT-IN via ALLOW_WORKFLOW_FIXES=1, and when
+# enabled it is NOT a free-for-all: validate_workflow_rewrite() lets ONLY safe,
+# value-level edits through (version strings, file paths) and rejects anything
+# that changes permissions, adds/removes steps, changes `uses:` actions, or
+# touches secrets. The AI still authors the fix; Python enforces the blast
+# radius.
+WORKFLOW_PATTERN     = r"\.?github/workflows/.*\.ya?ml$"
+ALLOW_WORKFLOW_FIXES = os.environ.get("ALLOW_WORKFLOW_FIXES", "").lower() in ("1", "true", "yes")
+
 BLOCKED_PATTERNS = [
-    # ALL workflow files — a "fix" to a deploy/CI workflow is a privilege-
-    # escalation vector. Workflow breakage escalates to a human via
-    # open_issue(), never through auto-fix.
-    r"\.?github/workflows/.*\.ya?ml$",
     r"\.?github/CODEOWNERS$",
     r"(^|/)\.env(\..*)?$",
     r".*\.pem$", r".*\.key$", r".*id_rsa.*", r".*id_ed25519.*",
@@ -252,8 +267,17 @@ HIGH_VALUE = {"dockerfile", "requirements.txt", "package.json", "pom.xml",
 
 
 def _relstrip(rel): return rel[2:] if rel.startswith("./") else rel
+
+
+def _is_workflow(fp: str) -> bool:
+    return bool(re.search(WORKFLOW_PATTERN, fp))
+
+
 def _is_blocked(fp):
     if any(fp == b or fp.startswith(b.rstrip("/") + "/") for b in ALWAYS_BLOCKED):
+        return True
+    # workflows: editable only when explicitly opted in
+    if _is_workflow(fp) and not ALLOW_WORKFLOW_FIXES:
         return True
     return any(re.search(p, fp) for p in BLOCKED_PATTERNS)
 
@@ -416,6 +440,38 @@ DOCKERFILE_REF_PATTERNS = [
 DOCKERFILE_FROM_PYTHON = re.compile(r'^\s*FROM\s+python:([^\s]+)', re.I | re.M)
 VALID_PYTHON_MINORS = set(range(8, 14))   # CPython 3.8 – 3.13 (update as releases land)
 
+# ── Workflow (.github/workflows/*.yml) observation patterns ──────────────────
+# Same "observe, don't pre-solve" contract: these state a verifiable fact
+# (this version doesn't exist / this referenced file isn't in the repo) and
+# leave the correction to the AI. They exist because a typo IN the workflow —
+# bad python-version, mistyped requirements path, wrong test path — is the most
+# common real CI failure, and it lives in a file the Dockerfile scanners never
+# look at.
+WF_PYTHON_VERSION = re.compile(r'python-version\s*:\s*["\']?([0-9]+(?:\.[0-9]+)*)["\']?', re.I)
+WF_FILE_REF = re.compile(
+    r'(?:-r\s+|pytest\s+|python\s+-m\s+\S+\s+|python\s+|black\s+|flake8\s+|mypy\s+|'
+    r'\bcat\s+|\bcp\s+\S+\s+|\bsource\s+)?'
+    r'([A-Za-z0-9_./-]+\.(?:py|txt|cfg|toml|ini|json|ya?ml|sh|lock))\b')
+
+
+def _repo_file_index() -> tuple:
+    """(set of repo-relative file paths, {basename_lower: [paths]}). Ground
+    truth for 'does this referenced file exist / what's the closest real one'."""
+    paths, by_name = set(), {}
+    for p in Path(".").rglob("*"):
+        if p.is_file() and not any(d in SKIP_DIRS for d in p.parts):
+            rel = _relstrip(str(p))
+            paths.add(rel)
+            by_name.setdefault(Path(rel).name.lower(), []).append(rel)
+    return paths, by_name
+
+
+def _closest_existing(ref: str, by_name: dict) -> str:
+    """Closest real basename to a broken reference, for grounding hints only."""
+    matches = difflib.get_close_matches(Path(ref).name.lower(),
+                                        list(by_name.keys()), n=1, cutoff=0.6)
+    return matches[0] if matches else ""
+
 
 def _build_context_files(docker_dir: Path) -> list:
     """Files that exist inside a Dockerfile's build context, as in-context
@@ -441,8 +497,58 @@ def scan_observations(included_contents: dict) -> list:
     which observations the AI resolved. Purely descriptive: no observation
     ever contains a corrected line."""
     obs = []
+    repo_paths, repo_by_name = _repo_file_index()
     for rel, content in included_contents.items():
         name = Path(rel).name.lower()
+
+        # ── workflow files ──────────────────────────────────────────────────
+        if _is_workflow(rel):
+            # invalid python-version (e.g. "3.1" — no such release)
+            for m in WF_PYTHON_VERSION.finditer(content):
+                ver = m.group(1)
+                vm = re.match(r'^(\d+)\.(\d+)', ver)
+                if not vm:
+                    continue
+                major, minor = int(vm.group(1)), int(vm.group(2))
+                # a bare "3" means "latest 3.x" and is valid; only flag X.Y with a bad minor
+                if major == 3 and "." in ver and minor not in VALID_PYTHON_MINORS:
+                    valid = ", ".join(f"3.{n}" for n in sorted(VALID_PYTHON_MINORS))
+                    obs.append({
+                        "key": (rel, "wf-pyver", ver),
+                        "file": rel,
+                        "text": (f"{rel}: python-version '{ver}' is not a real CPython "
+                                 f"release, so setup-python cannot install it. Valid "
+                                 f"minor releases: {valid}."),
+                    })
+            # referenced files that don't exist anywhere in the repo
+            seen_refs = set()
+            for m in WF_FILE_REF.finditer(content):
+                ref = m.group(1)
+                if ref in seen_refs or ref.startswith(("$", "-")):
+                    continue
+                seen_refs.add(ref)
+                ref_clean = _relstrip(ref)
+                if ref_clean in repo_paths or Path(ref_clean).is_file():
+                    continue
+                # ignore obvious non-repo paths (URLs, absolute system paths)
+                if ref_clean.startswith("/") or "://" in ref_clean:
+                    continue
+                closest = _closest_existing(ref_clean, repo_by_name)
+                real_paths = repo_by_name.get(closest, []) if closest else []
+                hint = (f" A file with a very similar name exists: "
+                        f"{', '.join(real_paths)} — this looks like a typo."
+                        if real_paths else
+                        " No similarly-named file exists in the repo either.")
+                obs.append({
+                    "key": (rel, "wf-ref", ref),
+                    "file": rel,
+                    "text": (f"{rel}: references '{ref}', but no such file exists in "
+                             f"the repository.{hint} (Workflow file paths are relative "
+                             f"to the repo root.)"),
+                })
+            continue
+
+        # ── Dockerfiles / compose ───────────────────────────────────────────
         is_dockerish = ("dockerfile" in name or "docker-compose" in name
                         or "compose.y" in name)
         if not is_dockerish:
@@ -929,6 +1035,73 @@ def validate_rewrite(rel: str, original: str, new: str) -> tuple:
             json.loads(new)
         except json.JSONDecodeError as e:
             return False, f"JSON error: {e}"
+
+    # Workflow edits get an extra blast-radius guard: the AI may fix VALUES
+    # (versions, paths) but must not change the workflow's security shape.
+    if _is_workflow(rel):
+        ok, why = validate_workflow_rewrite(original, new)
+        if not ok:
+            return False, why
+    return True, "ok"
+
+
+def _wf_permissions(doc) -> str:
+    return json.dumps(doc.get("permissions", {}), sort_keys=True) if isinstance(doc, dict) else "{}"
+
+
+def _wf_step_shape(doc) -> list:
+    """Structural fingerprint of every step: which action it `uses` and its
+    set of keys. Changes here (added/removed steps, swapped actions, a new
+    `run`/`env`/`with` key) are exactly the privilege-escalation surface, so
+    the shape must be identical before and after a value-only fix."""
+    shape = []
+    if not isinstance(doc, dict):
+        return shape
+    for job_name, job in sorted((doc.get("jobs") or {}).items()):
+        if not isinstance(job, dict):
+            continue
+        for i, step in enumerate(job.get("steps") or []):
+            if isinstance(step, dict):
+                shape.append((job_name, i, step.get("uses", ""),
+                              tuple(sorted(step.keys()))))
+    return shape
+
+
+# tokens that must never be INTRODUCED into a workflow by an auto-fix
+WF_FORBIDDEN_ADDITIONS = re.compile(
+    r"(?i)(secrets\.|\bcurl\b.*\|\s*(sh|bash)|base64\s+-d|eval\s|"
+    r"nc\s+-|/dev/tcp/|GITHUB_TOKEN|::add-mask::|actions/create-github-app-token)")
+
+
+def validate_workflow_rewrite(original: str, new: str) -> tuple:
+    """Allow value-level workflow fixes; reject anything that alters the
+    workflow's security posture. AI authors the fix, this bounds the blast."""
+    try:
+        old_doc = yaml.safe_load(original)
+        new_doc = yaml.safe_load(new)
+    except yaml.YAMLError as e:
+        return False, f"workflow YAML error: {e}"
+    if not isinstance(new_doc, dict):
+        return False, "workflow did not parse to a mapping"
+
+    if _wf_permissions(old_doc) != _wf_permissions(new_doc):
+        return False, "workflow rewrite changed `permissions:` — refused (privilege change)"
+
+    if _wf_step_shape(old_doc) != _wf_step_shape(new_doc):
+        return False, ("workflow rewrite changed step structure (added/removed a "
+                       "step, swapped a `uses:` action, or added a key) — refused; "
+                       "only value-level fixes are allowed")
+
+    # `on:` triggers and top-level `env` keys must not be restructured
+    if json.dumps(old_doc.get("on"), sort_keys=True, default=str) != \
+       json.dumps(new_doc.get("on"), sort_keys=True, default=str):
+        return False, "workflow rewrite changed `on:` triggers — refused"
+
+    added = _added_lines(original, new)
+    for line in added:
+        if WF_FORBIDDEN_ADDITIONS.search(line):
+            return False, (f"workflow rewrite introduces a sensitive token "
+                           f"(secrets/token/network-exec) — refused: {line.strip()[:80]!r}")
     return True, "ok"
 
 
@@ -1251,6 +1424,17 @@ def main():
         sys.exit(0)
 
     forced = extract_referenced_paths(log_text)
+    # When workflow fixing is enabled, the CI workflow is a prime suspect for
+    # the whole class of "typo in the pipeline" bugs (bad python-version,
+    # mistyped -r path, wrong test path). The referenced files in the log are
+    # often the *targets* of those typos, not where the fix goes — the fix goes
+    # in the workflow. So always pull the workflow(s) into context; observations
+    # will confirm whether they're actually broken.
+    if ALLOW_WORKFLOW_FIXES:
+        wf = find_ci_workflow_files()
+        if wf:
+            print(f"[DISCOVER] Workflow fixing enabled — including workflow(s): {wf}")
+            forced = list(dict.fromkeys(wf + forced))
     if not forced:
         wf = find_ci_workflow_files()
         if wf:
