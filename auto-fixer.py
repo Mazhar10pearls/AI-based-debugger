@@ -20,12 +20,11 @@ Pipeline:
         → on success: commit, push, open PR
 
 Design notes:
-  * The model defaults to gemma3:4b – a stronger model that handles multi-turn
-    reasoning better. Set OLLAMA_MODEL to override.
-  * Python now captures the exact command line that triggered the error (by
-    looking just above the error message) and includes it in the focused issue.
-    This gives the AI the missing context without any deterministic pre‑scan.
-  * No deterministic hint generator is ever used – the AI starts cold every time.
+  * Model defaults to gemma3:4b. Override with OLLAMA_MODEL.
+  * No deterministic pre‑scan ever. AI drives every investigation step.
+  * The focused issue block now includes the actual command line that triggered
+    the error (even if it's just the previous line) and strongly guides the AI
+    to check workflow YAML files when the error involves a missing file.
 """
 
 import argparse
@@ -44,7 +43,7 @@ import yaml
 
 # ── Ollama ────────────────────────────────────────────────────────────────────
 OLLAMA_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/api/generate")
-OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL",   "gemma3:4b")   # stronger default
+OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL",   "gemma3:4b")
 AI_TIMEOUT     = int(os.environ.get("AI_TIMEOUT", "210"))
 MAX_RETRIES    = int(os.environ.get("AI_MAX_RETRIES", "2"))
 RETRY_BACKOFF  = [20, 20]
@@ -321,10 +320,9 @@ def extract_focused_failure(log_text: str) -> dict:
                 file_refs.append(ref)
     file_refs = file_refs[:8]
 
-    # --- NEW: capture the command line(s) that triggered the error ---
+    # --- Improved command context extraction ---
     command_context_lines = []
     if primary_message:
-        # find the line index where the primary message first appears
         log_lines = log_text.splitlines()
         msg_line_idx = None
         for i, line in enumerate(log_lines):
@@ -332,30 +330,31 @@ def extract_focused_failure(log_text: str) -> dict:
                 msg_line_idx = i
                 break
         if msg_line_idx is not None:
-            # scan up to 5 lines before the error, looking for lines that contain the
-            # same filename as the one in the error (e.g., 'requiements.txt')
+            # 1) Try to find the line with the missing filename (if any)
             error_filename = None
             for ref in file_refs:
                 if ref in primary_message:
                     error_filename = ref
                     break
             if not error_filename:
-                # try extracting a filename from the primary message itself
-                # e.g., 'requiements.txt'
                 m = re.search(r"'([\w./\-]+)'", primary_message)
                 if m:
                     error_filename = m.group(1)
+
+            found_exact = False
             if error_filename:
                 for j in range(max(0, msg_line_idx - 5), msg_line_idx):
                     candidate = log_lines[j].strip()
-                    if candidate and not any(n in candidate.lower() for n in NOISE_KEYWORDS):
-                        if error_filename in candidate:
-                            command_context_lines.append(candidate)
-                # also include the line immediately before if not found above
-                if not command_context_lines and msg_line_idx > 0:
-                    prev = log_lines[msg_line_idx - 1].strip()
-                    if prev and not any(n in prev.lower() for n in NOISE_KEYWORDS):
-                        command_context_lines.append(prev)
+                    if candidate and error_filename in candidate:
+                        command_context_lines.append(candidate)
+                        found_exact = True
+            # 2) If exact match not found, grab the immediately preceding non‑empty line
+            if not found_exact and msg_line_idx > 0:
+                prev = log_lines[msg_line_idx - 1].strip()
+                if prev and not any(n in prev.lower() for n in NOISE_KEYWORDS):
+                    command_context_lines.append(prev)
+            # Keep at most 2 lines
+            command_context_lines = command_context_lines[:2]
 
     return {
         "primary_message": primary_message,
@@ -363,7 +362,7 @@ def extract_focused_failure(log_text: str) -> dict:
         "traceback": traceback_text,
         "file_refs": file_refs,
         "gh_errors": gh_errors[:5],
-        "command_context": command_context_lines[:2],  # at most 2 lines
+        "command_context": command_context_lines,
     }
 
 
@@ -585,7 +584,7 @@ def _json_from(raw: str):
     return None
 
 
-# ── AI INVESTIGATION AGENT ───────────────────────────────────────────────────
+# ── AI INVESTIGATION AGENT (updated system prompt) ─────────────────────────────
 INVESTIGATE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -625,6 +624,12 @@ Each turn, choose exactly one status:
 to up to 3 EXACT paths from the "## Repository tree" list.
   - "root_cause_confirmed": you are confident. Fill in "root_cause", "solution", \
 "confidence", "commit_message", AND "findings".
+
+**IMPORTANT HEURISTIC**: If the primary error is about a missing file (e.g., \
+"Could not open requirements file: 'requiements.txt'"), the command that \
+produced that error is almost certainly defined inside a CI workflow file \
+(usually a YAML file in `.github/workflows/`). Your first request should be \
+that workflow YAML file so you can see the exact `pip install -r ...` line.
 
 Schema when asking for more evidence:
 {"analysis":"...","status":"need_more_info","requested_files":["exact/path"]}
@@ -858,7 +863,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
     return result
 
 
-# ── PATCH GENERATION ────────────────────────────────────────────────────────
+# ── PATCH GENERATION (updated system prompt) ─────────────────────────────────
 PATCH_SCHEMA = {
     "type": "object",
     "properties": {
@@ -887,11 +892,13 @@ Output ONLY one JSON object. No markdown fences.
 "issues" = ONE ENTRY PER BUG. Each entry:
   - "file": exact ### header path
   - "problem": one sentence
-  - "evidence": EXACT text from the file contents below (short)
-  - "corrected": same text with ONLY the bug fixed.
+  - "evidence": EXACT text from the file contents below (short) – copy the WRONG text.
+  - "corrected": same text with ONLY the bug fixed. MUST be different from "evidence".
 
 Schema:
 {"issues":[{"file":"...","problem":"...","evidence":"...","corrected":"..."}]}
+
+CRITICAL: "evidence" and "corrected" must be DIFFERENT strings.
 """
 
 
@@ -1560,8 +1567,7 @@ def main():
         print("[EVIDENCE] No error signal — nothing to fix.")
         sys.exit(0)
 
-    # Distill the log into a compact, scoped issue statement — this heads
-    # every AI prompt from here on.
+    # Distill the log into a compact, scoped issue statement
     focused = extract_focused_failure(log_text)
     issue_block = format_focused_issue(focused, exit_code)
     supporting_signal = trim_supporting_signal(signal, focused)
