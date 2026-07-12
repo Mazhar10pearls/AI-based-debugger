@@ -148,10 +148,20 @@ MAX_ERROR_LINES   = 14
 # traceback, the "supporting" log lines only need to add what's NOT already
 # shown there — this is the ceiling on that supplementary context.
 MAX_SUPPORTING_LINES = 10
-MAX_FILE_CHARS    = int(os.environ.get("MAX_FILE_CHARS", "4000"))
-MAX_TOTAL_CONTEXT = int(os.environ.get("MAX_TOTAL_CONTEXT", "10000"))
+# NOTE: these ceilings are sized for what qwen2.5-coder:3b can actually
+# REASON over, not just what fits in num_ctx. A 3B measurably degrades past a
+# few thousand tokens of dense context — it stops following instructions and
+# emits minimal escape responses — and on this CPU box every extra 1K chars is
+# also ~real seconds of prefill. Lowered from 4000/10000 after a run where a
+# 14K prompt made the model prefill for 220s then answer with an empty
+# 'need_more_info'. Raise only alongside a bigger model / faster box.
+MAX_FILE_CHARS    = int(os.environ.get("MAX_FILE_CHARS", "2500"))
+MAX_TOTAL_CONTEXT = int(os.environ.get("MAX_TOTAL_CONTEXT", "5000"))
 MAX_FILES_FIXED   = 4
-MAX_PROMPT_CHARS  = int(os.environ.get("MAX_PROMPT_CHARS", "11000"))
+MAX_PROMPT_CHARS  = int(os.environ.get("MAX_PROMPT_CHARS", "8000"))
+# The full investigation prompt also carries a git diff; keep it short there
+# (it's rarely the decisive evidence, and it's the easiest big chunk to trim).
+INVESTIGATION_DIFF_CHARS = int(os.environ.get("INVESTIGATION_DIFF_CHARS", "1200"))
 MAX_TRACEBACK_LINES = 12
 
 # ── Git flow ──────────────────────────────────────────────────────────────────
@@ -331,6 +341,45 @@ EXCEPTION_LINE       = re.compile(r'^[A-Za-z_][A-Za-z0-9_.]*(Error|Exception|War
 # picking the ONE primary message the AI anchors on.
 GENERIC_GH_ERROR_ANNOTATION = re.compile(r'^Process completed with exit code', re.I)
 
+# Ranked, most-specific-first patterns for pulling ONE clear error line out of
+# a plain log when there's no GitHub annotation or Python traceback. Earlier
+# entries win — a "No such file" line is a better anchor than a generic
+# "error:" line. Each is matched against individual log lines.
+STRONG_ERROR_LINE_PATTERNS = [
+    re.compile(r'\bNo such file or directory\b', re.I),
+    re.compile(r'\bcan(?:no|\')t open file\b', re.I),
+    re.compile(r'\b(?:ModuleNotFoundError|ImportError)\b'),
+    re.compile(r'\bNo module named\b', re.I),
+    re.compile(r'\bERROR: Could not (?:open|find|install)\b', re.I),
+    re.compile(r'\bcould not find\b', re.I),
+    re.compile(r'\bnot found\b', re.I),
+    re.compile(r'^npm ERR!', re.I),
+    re.compile(r'\bfailed to solve\b', re.I),
+    re.compile(r'\bcommand not found\b', re.I),
+    re.compile(r'\bpermission denied\b', re.I),
+    re.compile(r'^\s*E\s+\w+Error\b'),           # pytest short-form error line
+    re.compile(r'\b\w+Error\b:'),                # any "SomethingError: ..."
+    re.compile(r'^\s*error\b[: ]', re.I),        # generic "error:"
+    re.compile(r'\bfatal\b', re.I),
+]
+
+
+def _best_error_line(log_text: str) -> str:
+    """Pick the single clearest error line from a plain-text log for use as
+    the 'Primary error' anchor when structured extraction found nothing.
+    Walks STRONG_ERROR_LINE_PATTERNS most-specific-first; within a pattern,
+    prefers the LAST match (errors usually surface near the end). Skips the
+    noise lines extract_error_signal already filters, and caps length so one
+    runaway line can't bloat the prompt."""
+    lines = [l.strip() for l in log_text.splitlines() if l.strip()]
+    lines = [l for l in lines if not any(n in l.lower() for n in NOISE_KEYWORDS)]
+    for pat in STRONG_ERROR_LINE_PATTERNS:
+        hits = [l for l in lines if pat.search(l)]
+        if hits:
+            best = hits[-1]
+            return best[:300]
+    return ""
+
 
 def extract_error_signal(log_text: str) -> str:
     lines = log_text.splitlines()
@@ -407,10 +456,19 @@ def extract_focused_failure(log_text: str) -> dict:
         primary_message = specific_gh_errors[-1]
     elif exc_lines:
         primary_message = exc_lines[-1]
-    elif gh_errors:
-        primary_message = gh_errors[-1]
     else:
-        primary_message = ""
+        # Before falling back to a generic "Process completed with exit code N"
+        # annotation (which names no file and no cause), try to pull a real
+        # error line out of the plain-text log — "No such file: requiements.txt"
+        # is a far better anchor than "exit code 1". Only use the generic
+        # annotation if even that finds nothing.
+        best_plain = _best_error_line(log_text)
+        if best_plain:
+            primary_message = best_plain
+        elif gh_errors:
+            primary_message = gh_errors[-1]
+        else:
+            primary_message = ""
 
     # 5. file:line references anywhere in the log — useful even without a
     #    Python traceback (linters, Dockerfile builders, etc).
@@ -904,15 +962,32 @@ def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
             "report EVERY verified hint as its own findings[] entry.\n"
         )
     issue_section = f"\n## ISSUE TO SOLVE\n{issue_block}\n" if issue_block else ""
-    return (
-        f"{INVESTIGATE_SYSTEM}{turn_note}{issue_section}{notes_section}{hint_section}\n"
-        f"## Supporting log lines (context only — the actual issue is above):\n```\n{signal}\n```\n"
-        f"## Exit code: {exit_code}\n"
-        f"## Git diff (most recent commit):\n```\n{git_diff}\n```\n"
-        f"## Repository tree (folders & filenames only — request only from this list):\n{repo_tree}\n"
-        f"## Evidence gathered so far:\n{ev_text}\n\n"
-        f"Respond with the JSON described above."
-    )
+    diff_trimmed = git_diff if len(git_diff) <= INVESTIGATION_DIFF_CHARS \
+        else git_diff[:INVESTIGATION_DIFF_CHARS] + "\n...(diff truncated to keep the prompt small)"
+
+    def _assemble(ev_block):
+        return (
+            f"{INVESTIGATE_SYSTEM}{turn_note}{issue_section}{notes_section}{hint_section}\n"
+            f"## Supporting log lines (context only — the actual issue is above):\n```\n{signal}\n```\n"
+            f"## Exit code: {exit_code}\n"
+            f"## Git diff (most recent commit):\n```\n{diff_trimmed}\n```\n"
+            f"## Repository tree (folders & filenames only — request only from this list):\n{repo_tree}\n"
+            f"## Evidence gathered so far:\n{ev_block}\n\n"
+            f"Respond with the JSON described above."
+        )
+
+    prompt = _assemble(ev_text)
+    # Hard ceiling — a 3B can't reason over a giant prompt no matter what.
+    # Evidence is the biggest, most variable chunk, so trim THAT (from the end)
+    # to fit rather than dropping the schema/instructions the model needs.
+    if len(prompt) > MAX_PROMPT_CHARS:
+        overflow = len(prompt) - MAX_PROMPT_CHARS
+        if overflow < len(ev_text):
+            ev_text = ev_text[:len(ev_text) - overflow] + "\n...(evidence truncated to fit the prompt budget)"
+        else:
+            ev_text = "(evidence omitted to fit the prompt budget — request the specific file you need)"
+        prompt = _assemble(ev_text)
+    return prompt
 
 
 def _finalize_investigation(data: dict, forced: bool) -> dict:
@@ -945,6 +1020,92 @@ def _finalize_investigation(data: dict, forced: bool) -> dict:
         "commit_message": data.get("commit_message") or "fix: auto-fixer change",
         "findings":       findings,
     }
+
+
+FOCUSED_HINT_SYSTEM = """\
+You are diagnosing a CI/CD failure. Static analysis has already found file \
+references in a config/workflow file that do NOT match any real file in the \
+repository, and for each one it found the closest real filename. These are the \
+likely cause of the failure.
+
+Your job: look at the suspicious references and the file they appear in, and \
+decide whether they explain the failure. They usually do. Output ONE JSON \
+object, no markdown, start with { end with }.
+
+If they explain the failure (a reference points at a file that doesn't exist \
+and there's an obvious correctly-spelled file it should point to), respond:
+{"status":"root_cause_confirmed","root_cause":"one sentence","confidence":0.0-1.0,"commit_message":"fix: short","findings":[{"issue":"short name","root_cause":"why THIS reference is wrong","solution":"what to change it to"}]}
+
+Put ONE findings entry per suspicious reference — do not merge them, do not \
+stop after the first.
+
+If the suspicious references do NOT explain the failure, respond:
+{"status":"need_more_info","analysis":"why the hints don't fit / what else you'd need"}
+"""
+
+
+def _build_focused_hint_prompt(issue_block: str, prescan: list,
+                               seed_evidence: dict) -> str:
+    """A deliberately SMALL prompt for the common case where the pre-scan
+    already localized broken file references. qwen2.5-coder:3b cannot reason
+    over the full ~14K-char agentic prompt (it prefills for minutes then
+    emits a minimal 'need_more_info' escape). This hands it only what it
+    needs: the issue, the specific suspicious lines, and the file(s) they're
+    in — usually well under 3K chars, so it both prefills fast AND stays
+    inside what a 3B can actually follow. The model still makes the call; we
+    just stop burying the decision under context it can't use."""
+    refs = "\n".join(
+        f"- in `{c['file']}` line {c['line_no']}: `{c['line']}`\n"
+        f"    the reference `{c['wrong_token']}` does not exist in the repo; "
+        f"closest real file is `{c['suggested']}` (similarity {c['similarity']:.0%})"
+        for c in prescan)
+    # Only include the file(s) named by the pre-scan, trimmed — not the whole
+    # repo tree or diff.
+    files_shown = []
+    for f in {c["file"] for c in prescan}:
+        content = seed_evidence.get(f) or ""
+        if len(content) > 1800:
+            content = content[:1800] + "\n...(truncated)"
+        files_shown.append(f"### {f}\n```\n{content}\n```")
+    files_block = "\n\n".join(files_shown) if files_shown else "(file contents unavailable)"
+    issue_section = f"## ISSUE TO SOLVE\n{issue_block}\n\n" if issue_block else ""
+    return (f"{FOCUSED_HINT_SYSTEM}\n\n{issue_section}"
+            f"## Suspicious references static analysis found:\n{refs}\n\n"
+            f"## The file(s) they appear in:\n{files_block}\n\n"
+            f"Respond with the JSON described above.")
+
+
+def investigate_with_hint(prescan: list, seed_evidence: dict, issue_block: str,
+                          evidence: dict) -> dict:
+    """Single compact call for the hinted case. Returns a finalized-shape dict
+    on a confident confirmation, or None to fall back to the full agentic
+    loop (e.g. the model says the hints don't fit, or the call fails)."""
+    prompt = _build_focused_hint_prompt(issue_block, prescan, seed_evidence)
+    print(f"[INVESTIGATE-HINT] compact focused prompt: {len(prompt)} chars "
+          f"(vs ~14K for the full agentic prompt) — sized for a 3B.")
+    try:
+        raw = _stream_ollama(
+            prompt, INVESTIGATE_SCHEMA, num_predict=700, temperature=0.05,
+            tag="INVESTIGATE-HINT",
+            timeout=INVESTIGATION_TIMEOUT + INVESTIGATION_FIRST_TURN_EXTRA,
+            retries=INVESTIGATION_RETRIES)
+    except Exception as exc:
+        print(f"[INVESTIGATE-HINT] focused call failed: {exc} — falling back to "
+              f"the full investigation loop.", file=sys.stderr)
+        return None
+    data = _json_from(raw) or {}
+    status = data.get("status", "")
+    print(f"[INVESTIGATE-HINT] status={status} | {(data.get('analysis') or '')[:160]}")
+    if status == "root_cause_confirmed":
+        result = _finalize_investigation(data, False)
+        result["evidence"] = dict(evidence)
+        result["investigation_log"] = [{"turn": 1, "status": status,
+                                        "analysis": (data.get("analysis") or "")[:200]}]
+        result["failure_mode"] = None
+        return result
+    print("[INVESTIGATE-HINT] model did not confirm from the hint alone — "
+          "falling back to the full investigation loop.")
+    return None
 
 
 def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
@@ -1976,8 +2137,20 @@ def main():
     # pay cold-load cost inside its own read-timeout — the exact failure that
     # was making runs escalate with a 0% "diagnosis" they never actually made.
     warm_up_model()
-    investigation = ai_investigate(supporting_signal, exit_code, repo_tree, git_diff,
-                                   allowed_files, seed_evidence, hint_text, issue_block)
+
+    investigation = None
+    # When the pre-scan localized broken references, try a COMPACT focused
+    # call first. The full agentic prompt is ~14K chars — too big for a 3B,
+    # which prefills it for minutes then emits a minimal 'need_more_info'.
+    # The focused prompt is <3K, so it's fast AND the model can actually
+    # follow it. The AI still decides; if it can't confirm from the hint, we
+    # fall through to the full loop below.
+    if prescan:
+        investigation = investigate_with_hint(prescan, seed_evidence,
+                                               issue_block, seed_evidence)
+    if investigation is None:
+        investigation = ai_investigate(supporting_signal, exit_code, repo_tree, git_diff,
+                                       allowed_files, seed_evidence, hint_text, issue_block)
     root_cause = investigation["root_cause"]
     solution   = investigation["solution"]
     commit_msg = investigation["commit_message"]
