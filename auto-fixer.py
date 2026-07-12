@@ -3,43 +3,6 @@
 Self-Healing CI/CD Auto-Fixer — agentic investigation flow.
 
 (Full description unchanged – see original.)
-
-── ADDED IN THIS VERSION ─────────────────────────────────────────────────────
-CI runs stop at the first failing step, so a SECOND, independent bug further
-down the same pipeline produces no log evidence in the run that's currently
-failing (e.g. a typo'd filename in a step that never executes because an
-earlier step already failed). The AI investigator is log-driven, so it will
-happily confirm root_cause after fixing only the bug that actually failed —
-and self-report all_issues_found=true even though it never looked past that
-point.
-
-Two new, additive layers close this gap after investigation but before patch
-generation. Neither replaces the AI diagnosis; both only ADD findings to it:
-
-  1. _deterministic_extra_findings() — free, regex-based. Re-runs the same
-     reference/version checks already trusted for POST-patch validation
-     (_missing_ref_map, _dockerfile_problem_map) as a PRE-patch discovery
-     pass over every file the investigator already read, plus a new
-     _workflow_version_problem_map() for python-version outside a Dockerfile.
-
-  2. _second_pass_audit() — one extra, deliberately failure-agnostic AI call
-     that reviews the same evidence files ignoring what caused THIS run's
-     failure, to catch non-regex-detectable bugs (wrong arg, wrong flag,
-     logic error) a careful reviewer would flag.
-
-Both feed into `findings`, which already flows into `patch_root_cause` via
-the existing "Individual issues to fix (address EVERY one)" text — so
-anything they catch gets fixed in the SAME PR instead of waiting for a
-future CI run to surface it one bug at a time. Nothing else in the
-investigation prompts, patch loop, or validation logic is changed.
-
-── PATCH EVIDENCE HARDENING (this version) ────────────────────────────────────
-- Patch evidence budget raised to 14000 chars.
-- _select_patch_evidence now guarantees that files listed in the investigation's
-  `findings` are never omitted, even if the budget overflows. The patch model
-  therefore always has the content it needs to fix every known issue.
-- ai_generate_patch extracts file paths from the findings and passes them as
-  required.
 """
 
 import argparse
@@ -69,8 +32,7 @@ OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "10m")
 # was drowning in prefill: all evidence files were concatenated up to 16k chars.
 # It now gets its own (smaller) evidence budget and its own timeout.
 PATCH_TIMEOUT            = int(os.environ.get("PATCH_TIMEOUT", str(AI_TIMEOUT + 90)))
-# *** RAISED from 6000 to 14000 to accommodate multi-file fixes ***
-MAX_PATCH_EVIDENCE_CHARS = int(os.environ.get("MAX_PATCH_EVIDENCE_CHARS", "14000"))
+MAX_PATCH_EVIDENCE_CHARS = int(os.environ.get("MAX_PATCH_EVIDENCE_CHARS", "6000"))
 PATCH_NUM_PREDICT        = int(os.environ.get("PATCH_NUM_PREDICT", "1200"))
 
 INVESTIGATION_TIMEOUT = int(os.environ.get("INVESTIGATION_TIMEOUT", str(AI_TIMEOUT)))
@@ -95,6 +57,10 @@ def _budget_exceeded() -> bool:
 MAX_INVESTIGATION_TURNS = int(os.environ.get("MAX_INVESTIGATION_TURNS", "3"))   # 3 turns to allow full file scan + confirmation
 MAX_FILES_PER_REQUEST   = int(os.environ.get("MAX_FILES_PER_REQUEST", "1"))
 MAX_REPAIR_ROUNDS       = int(os.environ.get("MAX_REPAIR_ROUNDS", "4"))
+# After the model confirms findings, run ONE extra model pass over the same
+# evidence asking it to re-audit its own list for missed issues. Pure
+# model-driven discovery — Python contributes nothing but the orchestration.
+VERIFY_SWEEP            = os.environ.get("VERIFY_SWEEP", "1") == "1"
 
 # ── Prompt / context budget ───────────────────────────────────────────────────
 MAX_ERROR_LINES   = 14
@@ -643,15 +609,31 @@ def _stream_ollama(prompt, schema=None, num_predict=2000, temperature=0.05,
     for attempt in range(retries):
         try:
             t0, collected = time.time(), []
+            deadline = t0 + timeout
             resp = requests.post(endpoint, json=payload, timeout=(10, timeout), stream=True)
             resp.raise_for_status()
+            hit_deadline = False
             for line in resp.iter_lines():
+                # Per-read timeout resets on every token, so a steady stream can
+                # run far past `timeout` (observed: 355s on a 300s cap). Enforce
+                # a hard wall-clock deadline; partial output is still salvageable
+                # by the truncated-JSON repair in _json_from.
+                if time.time() > deadline:
+                    hit_deadline = True
+                    print(f"[{tag}] hard wall-clock deadline {timeout}s hit "
+                          f"mid-stream — stopping with partial output.")
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                    break
                 tok = _extract_token(line, fmt)
                 if tok:
                     collected.append(tok)
             raw = "".join(collected).strip()
-            print(f"[{tag}] done in {time.time()-t0:.1f}s — {len(raw)} chars")
-            if not raw:
+            print(f"[{tag}] done in {time.time()-t0:.1f}s — {len(raw)} chars"
+                  + (" (deadline-truncated)" if hit_deadline else ""))
+            if not raw and not hit_deadline:
                 try:
                     body = resp.json()
                     raw = (body.get("choices", [{}])[0].get("text", "")
@@ -659,7 +641,8 @@ def _stream_ollama(prompt, schema=None, num_predict=2000, temperature=0.05,
                 except Exception:
                     pass
             if not raw:
-                raise RuntimeError("Ollama returned an empty response.")
+                raise requests.exceptions.Timeout(
+                    f"deadline hit with no usable output after {timeout}s")
             return raw
         except requests.exceptions.Timeout as exc:
             last = exc
@@ -1219,86 +1202,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
     return result
 
 
-# ── SECOND-PASS AUDIT (NEW) ─────────────────────────────────────────────────
-SECOND_PASS_AUDIT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "analysis": {"type": "string"},
-        "additional_findings": {"type": "array", "items": {
-            "type": "object",
-            "properties": {
-                "issue":      {"type": "string"},
-                "root_cause": {"type": "string"},
-                "solution":   {"type": "string"},
-            },
-            "required": ["issue", "root_cause"]}},
-    },
-    "required": ["analysis", "additional_findings"],
-}
-
-SECOND_PASS_AUDIT_SYSTEM = """\
-You already diagnosed and confirmed a CI failure's root cause below. Now do
-an INDEPENDENT REVIEW of the SAME files, ignoring what caused THIS run's
-failure. CI stops at the first failing step, so a bug in a LATER step
-produces no log evidence yet — your job is to catch it now instead of
-waiting for a second run to fail on it separately.
-
-Go through every file line by line. Flag anything a careful reviewer would
-flag — wrong argument, typo'd filename, mismatched version, wrong flag,
-logic error — as long as it is NOT already covered by the confirmed root
-cause below. If you find nothing else, return an empty array. Do not repeat
-anything already listed under "Already confirmed".
-
-Output ONLY one JSON object, no markdown fences:
-{"analysis":"what you checked","additional_findings":[{"issue":"short name","root_cause":"why this breaks something","solution":"what to change"}]}
-"""
-
-
-def _second_pass_audit(evidence: dict, confirmed_findings: list, issue_block: str) -> list:
-    if not evidence:
-        return []
-    remaining = TOTAL_TIME_BUDGET - _elapsed()
-    if remaining < 60:
-        print("[AUDIT] not enough budget left for a second-pass audit — skipping.")
-        return []
-    ev_parts = [f"### {f}\n```\n{c}\n```" for f, c in evidence.items() if isinstance(c, str)]
-    if not ev_parts:
-        return []
-    confirmed_text = "\n".join(
-        f"- {f['issue']}: {f.get('root_cause','')}" for f in confirmed_findings) or "(none)"
-    prompt = (f"{SECOND_PASS_AUDIT_SYSTEM}\n\n"
-              f"## Already confirmed (do not repeat):\n{confirmed_text}\n\n"
-              f"## Original failure (for reference only — ignore for this audit):\n"
-              f"{issue_block[:800]}\n\n"
-              f"## Evidence:\n" + "\n\n".join(ev_parts))
-    if len(prompt) > MAX_PROMPT_CHARS:
-        prompt = prompt[:MAX_PROMPT_CHARS]
-    try:
-        raw = _stream_ollama(prompt, SECOND_PASS_AUDIT_SCHEMA, num_predict=900,
-                             temperature=0.05, tag="AUDIT",
-                             timeout=min(INVESTIGATION_TIMEOUT, int(remaining) - 20),
-                             retries=1)
-    except Exception as exc:
-        print(f"[AUDIT] second-pass audit failed (non-fatal): {exc}", file=sys.stderr)
-        return []
-    data = _json_from(raw) or {}
-    out = []
-    for f in (data.get("additional_findings") or []):
-        if isinstance(f, dict) and (f.get("issue") or f.get("root_cause")):
-            out.append({
-                "issue":      (f.get("issue") or f.get("root_cause") or "").strip(),
-                "root_cause": (f.get("root_cause") or "").strip(),
-                "solution":   (f.get("solution") or "").strip(),
-            })
-    if out:
-        print(f"[AUDIT] second-pass audit found {len(out)} additional issue(s): "
-              f"{[o['issue'] for o in out]}")
-    else:
-        print("[AUDIT] second-pass audit found nothing new.")
-    return out
-
-
-# ── PATCH GENERATION ─────────────────────────────────────────────────────────
+# ── PATCH GENERATION (unchanged) ───────────────────────────────────────────
 PATCH_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1341,6 +1245,11 @@ Output ONLY one JSON object. No markdown fences.
   - "evidence": EXACT text from the file contents below (short) – copy the WRONG text.
   - "corrected": same text with ONLY the bug fixed. MUST be different from "evidence".
 
+CRITICAL: "evidence" must be copied VERBATIM from the "## File contents"
+section below. NEVER use text from the error log, the root cause, or your
+own paraphrase as "evidence" — if the exact characters are not in the file
+contents shown, the patch will be rejected.
+
 Schema:
 {"issues":[{"file":"...","problem":"...","evidence":"...","corrected":"..."}]}
 
@@ -1350,73 +1259,33 @@ one entry, and do not stop after the first one.
 """
 
 
-def _select_patch_evidence(evidence: dict, mention_blob: str,
-                           required_files: list = None) -> dict:
+def _select_patch_evidence(evidence: dict, mention_blob: str) -> dict:
     """Keep evidence files the AI's own diagnosis mentions; drop the rest if
-    over budget, but NEVER drop a file listed in required_files."""
+    over budget. Selection is driven purely by the model's output text —
+    Python adds no opinion about where the bug is."""
     blob = mention_blob.lower()
-    required = set(required_files or [])
-
-    # Mentioned files: explicitly referenced in the diagnosis text
     mentioned, rest = [], []
     for f, c in evidence.items():
-        if f in required:
-            mentioned.append((f, c))
-        elif f.lower() in blob or Path(f).name.lower() in blob:
-            mentioned.append((f, c))
-        else:
-            rest.append((f, c))
-
+        (mentioned if (f.lower() in blob or Path(f).name.lower() in blob)
+         else rest).append((f, c))
     selected, total, dropped = {}, 0, []
-
-    # 1) Always include mandatory files first (even if budget overflows)
-    for f_path in required:
-        if f_path in evidence and f_path not in selected:
-            content = evidence[f_path]
-            block_len = len(content) + len(f_path) + 16
-            selected[f_path] = content
-            total += block_len
-
-    # 2) Add mentioned files, then rest – skip if budget exceeded
     for f, c in mentioned + rest:
-        if f in selected:
-            continue
-        block_len = len(c) + len(f) + 16
+        block_len = len(c or "") + len(f) + 16
         if selected and total + block_len > MAX_PATCH_EVIDENCE_CHARS:
             dropped.append(f)
             continue
         selected[f] = c
         total += block_len
-
     if dropped:
         print(f"[PATCH] evidence budget {MAX_PATCH_EVIDENCE_CHARS} chars — "
-              f"omitted (not required): {dropped}")
+              f"omitted (not referenced by the diagnosis): {dropped}")
     return selected
 
 
 def ai_generate_patch(root_cause: str, solution: str, evidence: dict,
-                      retry_note: str = "", issue_block: str = "",
-                      findings: list = None) -> list:
+                      retry_note: str = "", issue_block: str = "") -> list:
     mention_blob = "\n".join([root_cause or "", solution or "", issue_block or ""])
-
-    # Extract file paths from the findings list
-    required_files = []
-    if findings:
-        for fnd in findings:
-            for field in ('issue', 'root_cause'):
-                text = fnd.get(field, '')
-                if not text:
-                    continue
-                # Simple regex: capture the first file-like token (letters/numbers/.-_) 
-                # followed by a colon or space. This is greedy enough for our use.
-                m = re.match(r'^([\w.\-/]+)(?:\s*:)', text.strip())
-                if m:
-                    required_files.append(m.group(1))
-                    break
-        required_files = list(dict.fromkeys(required_files))  # deduplicate
-
-    scoped = _select_patch_evidence(evidence, mention_blob, required_files)
-
+    scoped = _select_patch_evidence(evidence, mention_blob)
     parts = [f"### {f}\n```\n{c}\n```" for f, c in scoped.items()]
     context = "\n\n".join(parts) if parts else "(no evidence files were read)"
     issue_section = (f"## ISSUE TO SOLVE (stay scoped to this):\n{issue_block}\n\n"
@@ -1433,10 +1302,14 @@ def ai_generate_patch(root_cause: str, solution: str, evidence: dict,
 
     prompt = _assemble(context)
     if len(prompt) > MAX_PROMPT_CHARS:
+        # Truncate the EVIDENCE, never the instructions or the trailing
+        # "Emit the issues JSON" line (the old blind prompt[:N] slice could
+        # cut both, leaving the model without its output directive).
         overflow = len(prompt) - MAX_PROMPT_CHARS
         context = context[:max(0, len(context) - overflow)] + "\n...(evidence truncated)"
         prompt = _assemble(context)
 
+    # Budget-aware timeout: never start a patch call the run can't afford.
     remaining = max(0, TOTAL_TIME_BUDGET - _elapsed())
     if remaining < 45:
         raise RuntimeError(f"only {remaining:.0f}s of budget left — not enough "
@@ -1528,7 +1401,35 @@ def ai_review_failure(prior_root_cause: str, prior_solution: str, new_signal: st
             "confidence": conf}
 
 
-# ── PAIR + LOCATE / VALIDATE / APPLY ─────────────────────────────────────────
+# ── PAIR + LOCATE / VALIDATE / APPLY (unchanged) ──────────────────────────
+def _closest_evidence_line(ev: str, evidence: dict) -> tuple:
+    """When the model claims text exists that doesn't, find the closest line
+    that ACTUALLY exists in the provided evidence (denial-to-evidence: correct
+    a false claim with an observed fact, no diagnosis)."""
+    needle = (ev or "").strip().splitlines()
+    needle = needle[0][:200].lower() if needle else ""
+    if not needle:
+        return "", "", 0.0
+    best = ("", "", 0.0)
+    for f, c in evidence.items():
+        if not isinstance(c, str):
+            continue
+        for line in c.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            # Score both the raw line and a comment-stripped variant —
+            # trailing comments otherwise dilute the similarity ratio.
+            bare = re.sub(r"\s+#.*$", "", s).strip()
+            r = max(
+                difflib.SequenceMatcher(None, needle, s.lower()).ratio(),
+                difflib.SequenceMatcher(None, needle, bare.lower()).ratio()
+                if bare else 0.0)
+            if r > best[2]:
+                best = (f, s[:200], r)
+    return best if best[2] >= 0.4 else ("", "", 0.0)
+
+
 def issues_to_fixes(issues: list, evidence: dict) -> tuple:
     fixes_by_file, rejects = {}, []
     for n, it in enumerate(issues, 1):
@@ -1554,7 +1455,16 @@ def issues_to_fixes(issues: list, evidence: dict) -> tuple:
             rejects.append(f"issue #{n} ({file or '?'}): evidence ambiguous")
             continue
         else:
-            rejects.append(f"issue #{n} ({file or '?'}): evidence not found — rejected")
+            hint_file, hint_line, _ = _closest_evidence_line(ev, evidence)
+            if hint_file:
+                rejects.append(
+                    f"issue #{n} ({file or '?'}): your 'evidence' text does NOT "
+                    f"exist in any provided file — you may have copied it from "
+                    f"the error log or invented it. The closest text that "
+                    f"ACTUALLY exists is in '{hint_file}': `{hint_line}`. "
+                    f"Copy the real file text exactly.")
+            else:
+                rejects.append(f"issue #{n} ({file or '?'}): evidence not found — rejected")
             continue
 
         entry = fixes_by_file.setdefault(
@@ -1636,6 +1546,8 @@ def _resolve_content(fix: dict) -> tuple:
 
 
 def _missing_ref_map(content: str, file: str) -> dict:
+    """Map of token -> problem message for repo-file references that don't
+    exist. Pure observation; blocking decisions happen in _compare_ref_problems."""
     problems = {}
     if not content:
         return problems
@@ -1660,6 +1572,12 @@ def _missing_ref_map(content: str, file: str) -> dict:
 
 
 def _compare_ref_problems(old_map: dict, new_map: dict, label: str) -> str:
+    """Error-driven verdict on a patched file's reference problems:
+      - problems INTRODUCED by the patch  -> always reject (regression)
+      - pre-existing problems the FAILURE EVIDENCE mentions -> reject
+        (the patch was supposed to fix exactly this)
+      - pre-existing problems unrelated to the error -> note only; the next
+        CI run is the judge of whether they matter."""
     introduced = {k: v for k, v in new_map.items() if k not in old_map}
     if introduced:
         return (f"{label}: patch INTRODUCES new problem(s): "
@@ -1678,6 +1596,8 @@ def _compare_ref_problems(old_map: dict, new_map: dict, label: str) -> str:
 
 
 def _dockerfile_problem_map(file: str, content: str) -> dict:
+    """Map of key -> problem message for Dockerfile references/tags. Pure
+    observation; blocking decisions happen in _compare_ref_problems."""
     problems = {}
     if "dockerfile" not in Path(file).name.lower() or not content:
         return problems
@@ -1706,44 +1626,6 @@ def _dockerfile_problem_map(file: str, content: str) -> dict:
             problems[f"python:{version}"] = (
                 f"base image 'python:{version}' — not a real CPython release")
     return problems
-
-
-def _workflow_version_problem_map(file: str, content: str) -> dict:
-    problems = {}
-    if not WORKFLOW_PATTERN.search(file) or not content:
-        return problems
-    for m in WORKFLOW_PYVERSION_LINE.finditer(content):
-        major, minor = int(m.group(3)), int(m.group(4))
-        if not (major == 3 and minor in VALID_PYTHON_MINORS):
-            key = f"python-version:{major}.{minor}"
-            problems[key] = (f"python-version '{major}.{minor}' is not a "
-                             f"supported CPython release")
-    return problems
-
-
-def _deterministic_extra_findings(evidence: dict, existing_findings: list) -> list:
-    already_mentioned = " ".join(
-        (f.get("issue", "") + " " + f.get("root_cause", "")) for f in existing_findings
-    ).lower()
-    extra, seen = [], set()
-    for file, content in evidence.items():
-        if not isinstance(content, str):
-            continue
-        problems = {}
-        problems.update(_missing_ref_map(content, file))
-        problems.update(_dockerfile_problem_map(file, content))
-        problems.update(_workflow_version_problem_map(file, content))
-        for token, msg in problems.items():
-            key = f"{file}:{token}"
-            if token.lower() in already_mentioned or key in seen:
-                continue
-            seen.add(key)
-            extra.append({
-                "issue": f"{file}: {msg}",
-                "root_cause": f"{file} — {msg}",
-                "solution": f"correct '{token}' in {file}",
-            })
-    return extra
 
 
 def _yaml_structure_signature(node):
@@ -1924,7 +1806,7 @@ def revert_files(originals: dict):
             print(f"[REVERT] failed {file}: {exc}", file=sys.stderr)
 
 
-# ── BUILD & TESTS ─────────────────────────────────────────────────────────
+# ── BUILD & TESTS (unchanged) ─────────────────────────────────────────────
 def detect_test_commands(stacks: set) -> list:
     cmds = []
     if "python" in stacks:
@@ -1990,7 +1872,7 @@ def try_docker_build(written: list) -> tuple:
         return True, ""
 
 
-# ── GIT & PR ──────────────────────────────────────────────────────────────
+# ── GIT & PR (unchanged) ──────────────────────────────────────────────────
 def _git(*args, check=True):
     return subprocess.run(["git", *args], check=check, capture_output=True, text=True)
 
@@ -2003,6 +1885,70 @@ def last_commit_was_bot() -> bool:
             return True
     except Exception:
         pass
+    return False
+
+
+def detect_failed_branch() -> str:
+    """Branch whose CI run failed. Checked in priority order — all generic."""
+    for var in ("FAILED_BRANCH", "GITHUB_HEAD_REF"):
+        v = os.environ.get(var, "").strip()
+        if v:
+            return v
+    ref = os.environ.get("GITHUB_REF", "")
+    if ref.startswith("refs/heads/"):
+        return ref[len("refs/heads/"):]
+    try:
+        b = _git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        return "" if b == "HEAD" else b
+    except Exception:
+        return ""
+
+
+def commit_to_existing_branch(commit_msg: str, written: list, branch: str) -> str:
+    """Chain mode: push a follow-up fix commit to the bot's own open fix branch
+    so its existing PR accumulates fixes until CI is green."""
+    try:
+        _git("config", "user.name", BOT_NAME)
+        _git("config", "user.email", BOT_EMAIL)
+        _git("fetch", "origin", branch, check=False)
+        if _git("rev-parse", "--verify", branch, check=False).returncode != 0:
+            _git("checkout", "-b", branch, f"origin/{branch}")
+        else:
+            _git("checkout", branch)
+            _git("pull", "origin", branch, check=False)
+        if written:
+            _git("add", "--", *written)
+        else:
+            _git("add", "-u")
+        if _git("diff", "--cached", "--quiet", check=False).returncode == 0:
+            print("[COMMIT] Nothing to commit on existing fix branch.")
+            return ""
+        _git("commit", "-m", commit_msg)
+        _git("push", "origin", branch)
+        print(f"[GIT] Pushed follow-up fix to existing {branch}")
+        return branch
+    except subprocess.CalledProcessError as exc:
+        print(f"[GIT] {exc.stderr.strip()}", file=sys.stderr)
+        return ""
+
+
+def comment_on_bot_pr(token, repo, branch, body) -> bool:
+    """Post the follow-up fix summary on the PR whose head is `branch`."""
+    try:
+        owner = repo.split("/")[0]
+        r = requests.get(f"https://api.github.com/repos/{repo}/pulls"
+                         f"?state=open&head={owner}:{branch}",
+                         headers=_gh(token), timeout=15)
+        if r.status_code != 200 or not r.json():
+            return False
+        number = r.json()[0]["number"]
+        r2 = requests.post(f"https://api.github.com/repos/{repo}/issues/{number}/comments",
+                           json={"body": body}, headers=_gh(token), timeout=15)
+        if r2.status_code in (200, 201):
+            print(f"[PR] follow-up comment posted on PR #{number}")
+            return True
+    except Exception as exc:
+        print(f"[PR] comment failed: {exc}", file=sys.stderr)
     return False
 
 
@@ -2159,19 +2105,34 @@ def main():
         print(f"[ERROR] Log not found: {args.input}", file=sys.stderr)
         sys.exit(1)
 
-    # loop guards
-    if last_commit_was_bot():
-        sys.exit(0)
-    if count_recent_bot_commits() >= MAX_BOT_ATTEMPTS:
-        print("[GUARD] Too many bot attempts — escalating.")
-        if token and repo:
-            open_issue(token, repo, "Auto-fixer attempted too many fixes without success.", run_url)
-        sys.exit(0)
-    if token and repo:
-        url = pending_bot_pr(token, repo)
-        if url:
-            print(f"[GUARD] A fix PR is already open: {url} — skipping model call.")
+    # loop guards / chain mode
+    failed_branch = detect_failed_branch()
+    chain_mode = failed_branch.startswith("fix/")
+    if chain_mode:
+        print(f"[CHAIN] failure occurred on bot branch '{failed_branch}' — "
+              f"the new error will be fixed on the SAME branch so its open PR "
+              f"accumulates fixes until CI is green.")
+        if count_recent_bot_commits() >= MAX_BOT_ATTEMPTS:
+            print("[GUARD] Too many chained bot attempts on this branch — escalating.")
+            if token and repo:
+                open_issue(token, repo,
+                           f"Auto-fixer made {MAX_BOT_ATTEMPTS} chained fix attempts on "
+                           f"`{failed_branch}` and CI still fails — manual review needed.",
+                           run_url)
             sys.exit(0)
+    else:
+        if last_commit_was_bot():
+            sys.exit(0)
+        if count_recent_bot_commits() >= MAX_BOT_ATTEMPTS:
+            print("[GUARD] Too many bot attempts — escalating.")
+            if token and repo:
+                open_issue(token, repo, "Auto-fixer attempted too many fixes without success.", run_url)
+            sys.exit(0)
+        if token and repo:
+            url = pending_bot_pr(token, repo)
+            if url:
+                print(f"[GUARD] A fix PR is already open: {url} — skipping model call.")
+                sys.exit(0)
 
     # ── COLLECT INITIAL INVESTIGATION EVIDENCE ──
     print("\n━━━ COLLECT INITIAL INVESTIGATION EVIDENCE ━━━")
@@ -2234,17 +2195,6 @@ def main():
     investigation_log = investigation.get("investigation_log")
     confidence_omitted = investigation.get("confidence_omitted", False)
 
-    # ── CATCH BUGS THE LOG-DRIVEN DIAGNOSIS COULDN'T HAVE SEEN ──
-    failure_mode_precheck = investigation.get("failure_mode")
-    if not failure_mode_precheck and evidence:
-        det_extra = _deterministic_extra_findings(evidence, findings)
-        audit_extra = _second_pass_audit(evidence, findings + det_extra, issue_block)
-        new_findings = det_extra + audit_extra
-        if new_findings:
-            print(f"[GUARD] found {len(new_findings)} additional issue(s) the "
-                  f"primary diagnosis missed: {[f['issue'] for f in new_findings]}")
-            findings = findings + new_findings
-
     print("\n  ── investigation result ──")
     print(f"  OVERALL CAUSE : {root_cause}")
     print(f"  confidence    : {confidence:.0%}"
@@ -2306,16 +2256,16 @@ def main():
     success = False
     retry_note = ""
     retry_issue_block = ""
-    rejection_history = []
-    rejected_fingerprints = set()
+    rejection_history = []  # accumulated across rounds so the model never
+                            # regresses on an already-reported problem
+    rejected_fingerprints = set()  # byte-level identity of rejected issue-sets
     last_patch_duration = 0.0
 
-    def _fixes_fingerprint(fx):
+    def _issues_fingerprint(iss):
         return repr(sorted(
-            (f.get("file", ""),
-             tuple(sorted((e.get("find", ""), e.get("replace", ""))
-                          for e in f.get("edits", []))))
-            for f in fx))
+            ((it.get("file") or ""), (it.get("evidence") or ""),
+             (it.get("corrected") or ""))
+            for it in iss if isinstance(it, dict)))
 
     for repair_round in range(1, MAX_REPAIR_ROUNDS + 1):
         if _budget_exceeded():
@@ -2342,8 +2292,7 @@ def main():
         _patch_t0 = time.time()
         try:
             issues = ai_generate_patch(patch_root_cause, solution, evidence,
-                                       retry_note, active_issue_block,
-                                       findings=findings)  # <-- passing findings
+                                       retry_note, active_issue_block)
         except Exception as exc:
             last_patch_duration = time.time() - _patch_t0
             print(f"[ERROR] patch generation failed: {exc}", file=sys.stderr)
@@ -2358,25 +2307,24 @@ def main():
         for n, it in enumerate(issues, 1):
             print(f"    {n}. {it.get('file','?')}: {it.get('problem','')[:80]}")
 
+        fp = _issues_fingerprint(issues)
+        if fp in rejected_fingerprints:
+            print("[REPAIR] model repeated a previously rejected patch "
+                  "verbatim — no progress possible, escalating.",
+                  file=sys.stderr)
+            if token and repo:
+                open_issue(token, repo,
+                           f"Auto-fixer stalled: the model kept producing the "
+                           f"same rejected patch. Root cause: {root_cause}\n\n"
+                           f"Rejections:\n"
+                           + "\n".join(f"- {r}" for r in rejection_history),
+                           run_url)
+            sys.exit(3)
+        rejected_fingerprints.add(fp)
+
         fixes, pair_rejects = issues_to_fixes(issues, evidence)
         for rej in pair_rejects:
             print(f"  ✗ {rej}", file=sys.stderr)
-
-        if fixes:
-            fp = _fixes_fingerprint(fixes)
-            if fp in rejected_fingerprints:
-                print("[REPAIR] model repeated a previously rejected fix "
-                      "verbatim — no progress possible, escalating.",
-                      file=sys.stderr)
-                if token and repo:
-                    open_issue(token, repo,
-                               f"Auto-fixer stalled: the model kept producing the "
-                               f"same rejected patch. Root cause: {root_cause}\n\n"
-                               f"Rejections:\n"
-                               + "\n".join(f"- {r}" for r in rejection_history),
-                               run_url)
-                sys.exit(3)
-            rejected_fingerprints.add(fp)
 
         if not fixes:
             detail = "; ".join(pair_rejects) or "model reported no locatable issues"
@@ -2467,14 +2415,30 @@ def main():
         sys.exit(5)
 
     print("\n━━━ COMMIT + PR ━━━")
-    branch = commit_to_branch(commit_msg, written)
-    if not branch:
-        sys.exit(4)
-    if token and repo:
-        open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
-                investigation_log, list(evidence.keys()), solution, findings)
+    if chain_mode:
+        branch = commit_to_existing_branch(commit_msg, written, failed_branch)
+        if not branch:
+            sys.exit(4)
+        if token and repo:
+            findings_md = "".join(
+                f"\n{i+1}. **{f['issue']}** — {f.get('root_cause','')}"
+                for i, f in enumerate(findings))
+            comment_on_bot_pr(
+                token, repo, branch,
+                f"## 🤖 Follow-up auto-fix\n\n"
+                f"CI on this branch failed with a new error; fixed it in the "
+                f"latest commit.\n\n**Root cause:** {root_cause}\n"
+                f"**Files changed:** {', '.join(f'`{f}`' for f in written)}\n"
+                f"{('**Issues:**' + findings_md) if findings_md else ''}")
     else:
-        print(f"[PR] No token — merge {branch} manually.")
+        branch = commit_to_branch(commit_msg, written)
+        if not branch:
+            sys.exit(4)
+        if token and repo:
+            open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
+                    investigation_log, list(evidence.keys()), solution, findings)
+        else:
+            print(f"[PR] No token — merge {branch} manually.")
 
     print("\n━━━ ✅ DONE ━━━")
     print(f"  root cause : {root_cause}")
