@@ -53,6 +53,11 @@ def _budget_exceeded() -> bool:
     return _run_start_time is not None and _elapsed() >= TOTAL_TIME_BUDGET
 
 
+def _chunk_budget_exceeded() -> bool:
+    return (_run_start_time is not None
+            and (TOTAL_TIME_BUDGET - _elapsed()) < CHUNK_AUDIT_BUDGET_RESERVE)
+
+
 # ── Agentic-loop bounds (tightened for focused investigation) ──────────────────
 MAX_INVESTIGATION_TURNS = int(os.environ.get("MAX_INVESTIGATION_TURNS", "3"))   # 3 turns to allow full file scan + confirmation
 MAX_FILES_PER_REQUEST   = int(os.environ.get("MAX_FILES_PER_REQUEST", "1"))
@@ -71,6 +76,27 @@ MAX_TRACEBACK_LINES = 12
 # ── Deterministic-context-retrieval budget ───────────────────────────────────
 MAX_FILES_PER_CATEGORY = int(os.environ.get("MAX_FILES_PER_CATEGORY", "2"))
 MAX_PRELOADED_FILES    = int(os.environ.get("MAX_PRELOADED_FILES", "4"))
+
+# ── Chunked audit for large files ─────────────────────────────────────────────
+# A single "read the whole file, audit it line by line" prompt scales its
+# input AND expected output with file size — on a big file that means a long
+# generation against a fixed num_predict/timeout, which is exactly what times
+# out and forces the model to stop after finding just one issue. Instead,
+# files over LARGE_FILE_LINE_THRESHOLD lines are split into small, bounded
+# chunks and audited one chunk at a time (small prompt in, small JSON out,
+# short timeout, can't time out regardless of total file size). Findings from
+# every chunk are merged and handed to the main investigation as evidence
+# instead of the raw file text.
+LARGE_FILE_LINE_THRESHOLD  = int(os.environ.get("LARGE_FILE_LINE_THRESHOLD", "120"))
+CHUNK_LINES                = int(os.environ.get("CHUNK_LINES", "90"))
+CHUNK_OVERLAP_LINES        = int(os.environ.get("CHUNK_OVERLAP_LINES", "6"))
+MAX_CHUNKS_PER_FILE        = int(os.environ.get("MAX_CHUNKS_PER_FILE", "5"))
+CHUNK_AUDIT_TIMEOUT        = int(os.environ.get("CHUNK_AUDIT_TIMEOUT", "45"))
+CHUNK_AUDIT_NUM_PREDICT    = int(os.environ.get("CHUNK_AUDIT_NUM_PREDICT", "350"))
+# Stop starting new chunk-audit calls once less than this much wall-clock
+# budget remains, so a huge file can never eat the time patch-gen/tests need.
+CHUNK_AUDIT_BUDGET_RESERVE = int(os.environ.get("CHUNK_AUDIT_BUDGET_RESERVE", "240"))
+INVESTIGATE_NUM_PREDICT    = int(os.environ.get("INVESTIGATE_NUM_PREDICT", "1100"))
 
 # ── Git flow ──────────────────────────────────────────────────────────────────
 GIT_BASE_BRANCH   = os.environ.get("GIT_BASE_BRANCH",   "develop")
@@ -539,19 +565,6 @@ def repo_tree_text(limit: int = 300) -> tuple:
     return text, set(files)
 
 
-def _read_evidence_file(rel: str):
-    p = Path(rel)
-    if not p.is_file() or _is_read_blocked(rel) or not _is_text_file(p):
-        return None
-    try:
-        raw = p.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return None
-    if len(raw) > MAX_FILE_CHARS:
-        raw = raw[:MAX_FILE_CHARS] + "\n...(truncated)"
-    return raw
-
-
 # ── AI plumbing ──────────────────────────────────────────────────────────────
 def _detect_endpoint():
     url = OLLAMA_API_URL.rstrip("/")
@@ -685,6 +698,159 @@ def _json_from(raw: str):
             except json.JSONDecodeError:
                 pass
     return None
+
+
+# ── CHUNKED AUDIT FOR LARGE FILES ────────────────────────────────────────────
+# Rationale: asking the model to line-by-line audit an entire large file in
+# one call makes both the prompt AND the required output grow with file size,
+# against a FIXED timeout and a FIXED num_predict token budget. That is what
+# causes timeouts and "only found one issue" reports on big files. Splitting
+# the file into small, overlapping, line-numbered chunks and auditing each
+# chunk with its own small bounded call means no single call's cost depends
+# on total file size — coverage of a 2000-line file just becomes N cheap
+# calls instead of one expensive one that can blow the budget.
+CHUNK_AUDIT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "findings": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "issue":      {"type": "string"},
+                "root_cause": {"type": "string"},
+                "solution":   {"type": "string"},
+                "line":       {"type": "string"},
+            },
+            "required": ["issue", "root_cause"]}},
+    },
+    "required": ["findings"],
+}
+
+CHUNK_AUDIT_SYSTEM = """\
+You are auditing ONE chunk of a larger file (line numbers shown at the start \
+of each line, e.g. "42: some code"). Check every path, filename, version \
+string, command, flag, or reference that appears in THIS chunk against the \
+repository tree and the issue described below.
+
+Rules:
+- Report a finding for EVERY distinct problem you can directly see in this
+  chunk — do not merge separate problems into one finding.
+- Only report things you can verify from this chunk, the repository tree, or
+  the issue description. Do not guess about lines you cannot see.
+- If this chunk has no problems, return {"findings":[]} — that is a normal,
+  expected result for most chunks of a file.
+- "line" should be the line number (from the "N:" prefix) where the problem
+  is.
+
+Output ONLY one JSON object, no markdown fences:
+{"findings":[{"issue":"short name","root_cause":"why this breaks the build","solution":"exact text change needed","line":"42"}]}
+"""
+
+
+def _read_full_text(rel: str):
+    p = Path(rel)
+    if not p.is_file() or _is_read_blocked(rel) or not _is_text_file(p):
+        return None
+    try:
+        return p.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _split_into_chunks(content: str, chunk_lines: int = CHUNK_LINES,
+                       overlap: int = CHUNK_OVERLAP_LINES) -> list:
+    """Return [(start_line, numbered_chunk_text), ...]. Chunks overlap slightly
+    so a problem spanning a chunk boundary (e.g. a multi-line COPY) still
+    appears whole in at least one chunk."""
+    lines = content.splitlines()
+    if len(lines) <= chunk_lines:
+        return [(1, "\n".join(f"{i+1}: {l}" for i, l in enumerate(lines)))]
+    chunks, start = [], 0
+    while start < len(lines):
+        end = min(start + chunk_lines, len(lines))
+        numbered = "\n".join(f"{i+1}: {lines[i]}" for i in range(start, end))
+        chunks.append((start + 1, numbered))
+        if end == len(lines):
+            break
+        start = end - overlap
+    return chunks
+
+
+def _audit_large_file(path: str, content: str, issue_block: str, repo_tree: str) -> list:
+    chunks = _split_into_chunks(content)
+    total_chunks = len(chunks)
+    to_run = chunks[:MAX_CHUNKS_PER_FILE]
+    print(f"[CHUNK-AUDIT] {path}: {len(content.splitlines())} lines -> "
+          f"{total_chunks} chunk(s), auditing {len(to_run)}")
+
+    findings = []
+    for idx, (start_line, chunk_text) in enumerate(to_run, 1):
+        if _chunk_budget_exceeded():
+            print(f"[CHUNK-AUDIT] {path}: time budget getting tight — "
+                  f"stopping at chunk {idx}/{len(to_run)}")
+            break
+        prompt = (f"{CHUNK_AUDIT_SYSTEM}\n\n"
+                  f"## ISSUE TO SOLVE\n{issue_block}\n\n"
+                  f"## File: {path} (this chunk starts at line {start_line})\n"
+                  f"```\n{chunk_text}\n```\n\n"
+                  f"## Repository tree:\n{repo_tree}\n\n"
+                  f"Respond with the JSON.")
+        try:
+            raw = _stream_ollama(prompt, CHUNK_AUDIT_SCHEMA,
+                                 num_predict=CHUNK_AUDIT_NUM_PREDICT, temperature=0.05,
+                                 tag=f"CHUNK-{Path(path).name}-{idx}/{len(to_run)}",
+                                 timeout=CHUNK_AUDIT_TIMEOUT, retries=1)
+        except Exception as exc:
+            print(f"[CHUNK-AUDIT] {path} chunk {idx}/{len(to_run)} failed: {exc}",
+                  file=sys.stderr)
+            continue
+        data = _json_from(raw) or {}
+        chunk_findings = [f for f in (data.get("findings") or [])
+                          if isinstance(f, dict) and (f.get("issue") or f.get("root_cause"))]
+        if chunk_findings:
+            print(f"[CHUNK-AUDIT]   chunk {idx}/{len(to_run)} "
+                  f"(lines {start_line}+): {len(chunk_findings)} finding(s)")
+        for f in chunk_findings:
+            line = str(f.get("line") or "").strip()
+            label = f"{path}:{line}" if line else path
+            findings.append({
+                "issue":      f"[{label}] {(f.get('issue') or '').strip()}",
+                "root_cause": (f.get("root_cause") or "").strip(),
+                "solution":   (f.get("solution") or "").strip(),
+            })
+
+    if len(to_run) < total_chunks:
+        print(f"[CHUNK-AUDIT] {path}: only audited {len(to_run)}/{total_chunks} "
+              f"chunks (cap or budget) — coverage may be incomplete")
+    return findings
+
+
+def _load_evidence_for_file(rel: str, issue_block: str, repo_tree: str,
+                            chunk_findings_out: list) -> str:
+    """Evidence loader used by the investigation loop. Small files are
+    inlined verbatim (existing behavior). Large files are chunk-audited
+    instead of dumped whole, so no single investigation prompt ever scales
+    with file size — the raw text is replaced with a short excerpt plus a
+    pointer to the merged chunk-audit findings."""
+    raw = _read_full_text(rel)
+    if raw is None:
+        return None
+    line_count = raw.count("\n") + 1
+    if line_count <= LARGE_FILE_LINE_THRESHOLD:
+        if len(raw) > MAX_FILE_CHARS:
+            raw = raw[:MAX_FILE_CHARS] + "\n...(truncated)"
+        return raw
+
+    print(f"[EVIDENCE] {rel}: {line_count} lines — over the "
+          f"{LARGE_FILE_LINE_THRESHOLD}-line inline threshold, chunk-auditing "
+          f"instead of putting the whole file in one prompt.")
+    found = _audit_large_file(rel, raw, issue_block, repo_tree)
+    chunk_findings_out.extend(found)
+    lines = raw.splitlines()
+    head, tail = "\n".join(lines[:15]), "\n".join(lines[-15:])
+    return (f"(large file — {line_count} lines; chunk-audited automatically "
+            f"instead of being scanned in one prompt — {len(found)} finding(s) "
+            f"from that audit are listed in '## Chunk audit findings' below)\n\n"
+            f"First 15 lines:\n{head}\n...\nLast 15 lines:\n{tail}")
 
 
 # ── 🔥 HARDENED AI INVESTIGATION PROMPT ──────────────────────────────────────
@@ -839,7 +1005,8 @@ def _closest_allowed_file(requested: str, allowed_files: set) -> str:
 
 def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
                                 evidence: dict, last_turn: bool,
-                                notes: list = None, issue_block: str = "") -> str:
+                                notes: list = None, issue_block: str = "",
+                                chunk_findings: list = None) -> str:
     ev_parts, total = [], 0
     for f, c in evidence.items():
         block = f"### {f}\n```\n{c}\n```"
@@ -859,10 +1026,23 @@ def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
     issue_section = f"\n## ISSUE TO SOLVE\n{issue_block}\n" if issue_block else ""
     diff_trimmed = git_diff if len(git_diff) <= INVESTIGATION_DIFF_CHARS \
         else git_diff[:INVESTIGATION_DIFF_CHARS] + "\n...(diff truncated)"
+    chunk_section = ""
+    if chunk_findings:
+        items = "\n".join(f"- {f['issue']}: {f['root_cause']}"
+                          + (f" — fix: {f['solution']}" if f.get('solution') else "")
+                          for f in chunk_findings)
+        chunk_section = (
+            "\n## Chunk audit findings (from an automated line-by-line scan of\n"
+            "large files that were too big to inline in full above):\n"
+            f"{items}\n"
+            "These were already verified against real file content — include "
+            "EVERY one of them in your own `findings` array (you may merge "
+            "duplicates or refine the wording, but do not drop any of them).\n"
+        )
 
     def _assemble(ev_block):
         return (
-            f"{INVESTIGATE_SYSTEM}{turn_note}{issue_section}{notes_section}\n"
+            f"{INVESTIGATE_SYSTEM}{turn_note}{issue_section}{notes_section}{chunk_section}\n"
             f"## Supporting log lines:\n```\n{signal}\n```\n"
             f"## Exit code: {exit_code}\n"
             f"## Git diff:\n```\n{diff_trimmed}\n```\n"
@@ -882,7 +1062,8 @@ def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
     return prompt
 
 
-def _finalize_investigation(data: dict, forced: bool, evidence: dict) -> dict:
+def _finalize_investigation(data: dict, forced: bool, evidence: dict,
+                            chunk_findings: list = None) -> dict:
     raw_conf = data.get("confidence")
     confidence_omitted = raw_conf is None
     if confidence_omitted:
@@ -916,6 +1097,17 @@ def _finalize_investigation(data: dict, forced: bool, evidence: dict) -> dict:
                 "root_cause": (f.get("root_cause") or "").strip(),
                 "solution":   (f.get("solution") or "").strip(),
             })
+
+    # Chunk-audit findings are grounded in real file content the model never
+    # had to fit into its own context window — always keep them even if the
+    # model's own findings list forgot to restate one of them.
+    if chunk_findings:
+        seen = {f["issue"] for f in findings}
+        for cf in chunk_findings:
+            if cf["issue"] not in seen:
+                findings.append(cf)
+                seen.add(cf["issue"])
+
     if not findings:
         findings = [{"issue": data.get("root_cause") or "unknown",
                      "root_cause": data.get("root_cause") or "unknown",
@@ -951,11 +1143,12 @@ def _finalize_investigation(data: dict, forced: bool, evidence: dict) -> dict:
 def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                    issue_block: str = "", suggested_files: list = None) -> dict:
     evidence = {}
+    chunk_findings = []  # merged findings from chunk-audited large files
     preloaded = []
     for f in (suggested_files or []):
         if f in evidence:
             continue
-        content = _read_evidence_file(f)
+        content = _load_evidence_for_file(f, issue_block, repo_tree, chunk_findings)
         if content is not None:
             evidence[f] = content
             preloaded.append(f)
@@ -979,10 +1172,11 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                         if turn == 1 else INVESTIGATION_TIMEOUT)
         prompt = _build_investigation_prompt(signal, exit_code, repo_tree,
                                              git_diff, evidence, last_turn,
-                                             pending_notes, issue_block=issue_block)
+                                             pending_notes, issue_block=issue_block,
+                                             chunk_findings=chunk_findings)
         pending_notes = []
         try:
-            raw = _stream_ollama(prompt, INVESTIGATE_SCHEMA, num_predict=800,
+            raw = _stream_ollama(prompt, INVESTIGATE_SCHEMA, num_predict=INVESTIGATE_NUM_PREDICT,
                                  temperature=0.05, tag=f"INVESTIGATE-T{turn}",
                                  timeout=turn_timeout, retries=INVESTIGATION_RETRIES)
         except Exception as exc:
@@ -995,9 +1189,9 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                 print("[INVESTIGATE] first turn timed out — retrying with lean prompt.")
                 lean_prompt = _build_investigation_prompt(
                     "(omitted)", exit_code, repo_tree, "(omitted)", evidence,
-                    last_turn, None, issue_block=issue_block)
+                    last_turn, None, issue_block=issue_block, chunk_findings=chunk_findings)
                 try:
-                    raw = _stream_ollama(lean_prompt, INVESTIGATE_SCHEMA, num_predict=800,
+                    raw = _stream_ollama(lean_prompt, INVESTIGATE_SCHEMA, num_predict=INVESTIGATE_NUM_PREDICT,
                                          temperature=0.05, tag="INVESTIGATE-T1-LEAN",
                                          timeout=INVESTIGATION_TIMEOUT + INVESTIGATION_FIRST_TURN_EXTRA,
                                          retries=INVESTIGATION_RETRIES)
@@ -1023,7 +1217,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
         log.append({"turn": turn, "status": status, "analysis": analysis[:200]})
 
         if status == "root_cause_confirmed":
-            result = _finalize_investigation(data, False, evidence)
+            result = _finalize_investigation(data, False, evidence, chunk_findings)
             break
 
         if status == "need_more_info":
@@ -1048,7 +1242,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                     dead_ends.add(f)
                     pending_notes.append(f"'{f}' does not exist — do NOT request it again.")
             for f in to_read:
-                content = _read_evidence_file(f)
+                content = _load_evidence_for_file(f, issue_block, repo_tree, chunk_findings)
                 evidence[f] = content if content is not None else "(could not read)"
                 print(f"[INVESTIGATE]   + read {f} ({len(evidence[f])} chars)")
 
@@ -1060,14 +1254,14 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                 if stall_count >= 2 and not last_turn:
                     print("[INVESTIGATE] no new evidence for 2 turns — forcing final decision.")
                 if _budget_exceeded():
-                    result = _finalize_investigation(data, True, evidence)
+                    result = _finalize_investigation(data, True, evidence, chunk_findings)
                     break
                 final_prompt = _build_investigation_prompt(
                     signal, exit_code, repo_tree, git_diff, evidence, True,
-                    pending_notes, issue_block=issue_block)
+                    pending_notes, issue_block=issue_block, chunk_findings=chunk_findings)
                 try:
                     raw2 = _stream_ollama(final_prompt, INVESTIGATE_SCHEMA,
-                                          num_predict=800, temperature=0.05,
+                                          num_predict=INVESTIGATE_NUM_PREDICT, temperature=0.05,
                                           tag="INVESTIGATE-FINAL",
                                           timeout=INVESTIGATION_TIMEOUT,
                                           retries=INVESTIGATION_RETRIES)
@@ -1075,12 +1269,12 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                 except Exception as exc:
                     print(f"[INVESTIGATE] final turn failed: {exc}", file=sys.stderr)
                     data2 = data
-                result = _finalize_investigation(data2, True, evidence)
+                result = _finalize_investigation(data2, True, evidence, chunk_findings)
                 break
             continue
 
         if data.get("root_cause"):
-            result = _finalize_investigation(data, True, evidence)
+            result = _finalize_investigation(data, True, evidence, chunk_findings)
         break
 
     if result is None:
@@ -1090,10 +1284,13 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
         else:
             failure_mode = "not_converged"
             root_cause = "unknown — investigation did not converge"
+        # Even if the synthesizing call never converged, don't throw away
+        # findings the chunk audits already verified against real file
+        # content — they still show up in the escalation issue.
         result = {"root_cause": root_cause, "solution": "", "confidence": 0.0,
                   "confidence_omitted": True,
-                  "commit_message": "fix: auto-fixer change", "findings": [],
-                  "failure_mode": failure_mode}
+                  "commit_message": "fix: auto-fixer change",
+                  "findings": chunk_findings or [], "failure_mode": failure_mode}
     else:
         result["failure_mode"] = None
     result["evidence"] = evidence
