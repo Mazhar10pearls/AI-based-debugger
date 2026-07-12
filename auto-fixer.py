@@ -7,7 +7,7 @@ Pipeline:
     GitHub Actions Pipeline Failed
         → Python: collect initial evidence (logs, exit code, repo tree, git diff)
         → Python: distill a FOCUSED issue statement (primary error, failing
-              step, trimmed traceback, AND the command line that triggered it)
+              step, AND the command that triggered it)
         → AI Investigation Agent (multi-turn loop, ALWAYS runs):
               reads the focused issue + evidence → forms hypothesis →
               requests more files if needed → Python fetches requested files
@@ -22,9 +22,8 @@ Pipeline:
 Design notes:
   * Model defaults to gemma3:4b. Override with OLLAMA_MODEL.
   * No deterministic pre‑scan ever. AI drives every investigation step.
-  * The focused issue block now includes the actual command line that triggered
-    the error (even if it's just the previous line) and strongly guides the AI
-    to check workflow YAML files when the error involves a missing file.
+  * The investigation prompt now explicitly instructs the model to confirm
+    immediately when a workflow YAML shows a misspelled filename.
 """
 
 import argparse
@@ -260,7 +259,6 @@ def extract_error_signal(log_text: str) -> str:
 
 
 def extract_focused_failure(log_text: str) -> dict:
-    """Distill the raw log into the exact error, the step, and the command that triggered it."""
     gh_errors = [m.group(1).strip() for m in GH_ERROR_ANNOTATION.finditer(log_text)
                  if m.group(1).strip()]
 
@@ -320,7 +318,7 @@ def extract_focused_failure(log_text: str) -> dict:
                 file_refs.append(ref)
     file_refs = file_refs[:8]
 
-    # --- Improved command context extraction ---
+    # Command context: the line immediately before the error (best guess)
     command_context_lines = []
     if primary_message:
         log_lines = log_text.splitlines()
@@ -330,7 +328,12 @@ def extract_focused_failure(log_text: str) -> dict:
                 msg_line_idx = i
                 break
         if msg_line_idx is not None:
-            # 1) Try to find the line with the missing filename (if any)
+            # grab the line right before the error
+            if msg_line_idx > 0:
+                prev = log_lines[msg_line_idx - 1].strip()
+                if prev and not any(n in prev.lower() for n in NOISE_KEYWORDS):
+                    command_context_lines.append(prev)
+            # also try to find a line that contains the same filename
             error_filename = None
             for ref in file_refs:
                 if ref in primary_message:
@@ -340,21 +343,12 @@ def extract_focused_failure(log_text: str) -> dict:
                 m = re.search(r"'([\w./\-]+)'", primary_message)
                 if m:
                     error_filename = m.group(1)
-
-            found_exact = False
-            if error_filename:
-                for j in range(max(0, msg_line_idx - 5), msg_line_idx):
+            if error_filename and not command_context_lines:
+                for j in range(max(0, msg_line_idx - 3), msg_line_idx):
                     candidate = log_lines[j].strip()
                     if candidate and error_filename in candidate:
                         command_context_lines.append(candidate)
-                        found_exact = True
-            # 2) If exact match not found, grab the immediately preceding non‑empty line
-            if not found_exact and msg_line_idx > 0:
-                prev = log_lines[msg_line_idx - 1].strip()
-                if prev and not any(n in prev.lower() for n in NOISE_KEYWORDS):
-                    command_context_lines.append(prev)
-            # Keep at most 2 lines
-            command_context_lines = command_context_lines[:2]
+                        break
 
     return {
         "primary_message": primary_message,
@@ -584,7 +578,7 @@ def _json_from(raw: str):
     return None
 
 
-# ── AI INVESTIGATION AGENT (updated system prompt) ─────────────────────────────
+# ── AI INVESTIGATION AGENT (improved prompt) ─────────────────────────────────
 INVESTIGATE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -625,14 +619,11 @@ to up to 3 EXACT paths from the "## Repository tree" list.
   - "root_cause_confirmed": you are confident. Fill in "root_cause", "solution", \
 "confidence", "commit_message", AND "findings".
 
-**IMPORTANT HEURISTIC**: If the primary error is about a missing file (e.g., \
-"Could not open requirements file: 'requiements.txt'"), the command that \
-produced that error is almost certainly defined inside a CI workflow file \
-(usually a YAML file in `.github/workflows/`). Your first request should be \
-that workflow YAML file so you can see the exact `pip install -r ...` line.
-
-Schema when asking for more evidence:
-{"analysis":"...","status":"need_more_info","requested_files":["exact/path"]}
+**CRITICAL RULE**: If the primary error mentions a missing file (e.g., \
+`requiements.txt`) and you have already read a workflow YAML file that contains \
+that misspelled filename on a `pip install -r ...` line, you MUST answer with \
+`root_cause_confirmed` immediately. Do NOT request more files. The typo is the \
+root cause. Report every misspelled filename you see as a separate finding.
 
 Schema when confirming:
 {"analysis":"...","status":"root_cause_confirmed","root_cause":"...","solution":"...","confidence":0.0-1.0,"commit_message":"fix: short","findings":[{"issue":"...","root_cause":"...","solution":"..."}]}
@@ -780,10 +771,16 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
         if data:
             got_any_model_response = True
         status = data.get("status", "")
+        analysis = data.get("analysis", "")
         print(f"[INVESTIGATE] turn {turn}: status={status} | "
-              f"{(data.get('analysis') or '')[:160]}")
-        log.append({"turn": turn, "status": status,
-                    "analysis": (data.get("analysis") or "")[:200]})
+              f"{analysis[:160] if analysis else '(no analysis)'}")
+
+        # If the model returned an empty or malformed response, force final decision
+        if not status and turn > 1:
+            print("[INVESTIGATE] empty status from model — treating as stall.")
+            stall_count += 2  # force final decision below
+
+        log.append({"turn": turn, "status": status, "analysis": analysis[:200]})
 
         if status == "root_cause_confirmed":
             result = _finalize_investigation(data, False)
@@ -863,7 +860,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
     return result
 
 
-# ── PATCH GENERATION (updated system prompt) ─────────────────────────────────
+# ── PATCH GENERATION (improved prompt) ──────────────────────────────────────
 PATCH_SCHEMA = {
     "type": "object",
     "properties": {
@@ -898,7 +895,7 @@ Output ONLY one JSON object. No markdown fences.
 Schema:
 {"issues":[{"file":"...","problem":"...","evidence":"...","corrected":"..."}]}
 
-CRITICAL: "evidence" and "corrected" must be DIFFERENT strings.
+**REMEMBER**: "evidence" and "corrected" must be DIFFERENT strings.
 """
 
 
@@ -1567,7 +1564,6 @@ def main():
         print("[EVIDENCE] No error signal — nothing to fix.")
         sys.exit(0)
 
-    # Distill the log into a compact, scoped issue statement
     focused = extract_focused_failure(log_text)
     issue_block = format_focused_issue(focused, exit_code)
     supporting_signal = trim_supporting_signal(signal, focused)
@@ -1701,7 +1697,6 @@ def main():
                 sys.exit(3)
             continue
 
-        # ── EXECUTE BUILD & TESTS ──
         print("\n━━━ EXECUTE BUILD & TESTS ━━━")
         if not args.skip_tests:
             tests_ok, test_output = run_tests(stacks)
@@ -1748,7 +1743,6 @@ def main():
     if not success:
         sys.exit(5)
 
-    # ── COMMIT + PR ──
     print("\n━━━ COMMIT + PR ━━━")
     branch = commit_to_branch(commit_msg, written)
     if not branch:
