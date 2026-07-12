@@ -2,30 +2,23 @@
 """
 Self-Healing CI/CD Auto-Fixer — agentic investigation flow.
 
+Uses a generic, powerful investigation prompt that lets the AI diagnose ANY
+CI failure.  Automatically pre‑loads files mentioned in the log to save one
+request turn, but never decides what the fix is.
+
 Pipeline:
     GitHub Actions Pipeline Failed
         → Python: collect initial evidence (logs, exit code, repo tree, git diff)
-        → Python: distill a FOCUSED issue statement (primary error, failing step,
-              AND the command that triggered it)
-        → AI Investigation Agent (multi-turn loop, ALWAYS runs):
-              reads the focused issue + evidence → forms hypothesis →
-              requests more files if needed → Python fetches requested files
-              (read-only) → loop → confirms root cause
-        → AI Patch Generation Agent: emits the concrete fix
-        → Python Validation Engine: format/path/syntax/YAML/JSON checks,
-              secret scanning, dangerous-command detection, AND a check that
-              the patched file no longer references any missing files.
+        → Python: distill a FOCUSED issue statement (primary error, failing step)
+        → AI Investigation Agent (2 turns max):
+              receives focused issue + evidence → forms hypothesis →
+              requests more files if needed → Python fetches them →
+              loop → confirms root cause
+        → AI Patch Generation Agent: emits concrete fix
+        → Python Validation Engine: safety checks + missing‑reference scan
         → Apply changes → Execute build & tests
-        → on failure: collect new failure evidence → AI reviews it → retry or stop
+        → on failure: collect new evidence → AI reviews → retry or stop
         → on success: commit, push, open PR
-
-Design notes:
-  * Model defaults to gemma3:4b. Override with OLLAMA_MODEL.
-  * No deterministic pre‑scan ever. AI drives every investigation step.
-  * Investigation is limited to 2 turns (enough for "read workflow → confirm").
-  * The prompt explicitly instructs the model to look for ALL misspelled file references
-    in the CI configuration and confirm immediately after reading it.
-  * A post‑patch validator rejects fixes that still contain missing file references.
 """
 
 import argparse
@@ -67,15 +60,15 @@ def _budget_exceeded() -> bool:
     return _run_start_time is not None and _elapsed() >= TOTAL_TIME_BUDGET
 
 
-# ── Agentic-loop bounds (tighter for focused investigation) ──────────────────
-MAX_INVESTIGATION_TURNS = int(os.environ.get("MAX_INVESTIGATION_TURNS", "2"))   # 2 turns max
-MAX_FILES_PER_REQUEST   = int(os.environ.get("MAX_FILES_PER_REQUEST", "1"))     # force focus
+# ── Agentic-loop bounds ──────────────────────────────────────────────────────
+MAX_INVESTIGATION_TURNS = int(os.environ.get("MAX_INVESTIGATION_TURNS", "2"))
+MAX_FILES_PER_REQUEST   = int(os.environ.get("MAX_FILES_PER_REQUEST", "2"))  # allow 2 to speed up
 MAX_REPAIR_ROUNDS       = int(os.environ.get("MAX_REPAIR_ROUNDS", "2"))
 
 # ── Prompt / context budget ───────────────────────────────────────────────────
 MAX_ERROR_LINES   = 14
 MAX_SUPPORTING_LINES = 10
-MAX_FILE_CHARS    = int(os.environ.get("MAX_FILE_CHARS", "2000"))  # smaller for faster prefill
+MAX_FILE_CHARS    = int(os.environ.get("MAX_FILE_CHARS", "2000"))
 MAX_TOTAL_CONTEXT = int(os.environ.get("MAX_TOTAL_CONTEXT", "5000"))
 MAX_FILES_FIXED   = 4
 MAX_PROMPT_CHARS  = int(os.environ.get("MAX_PROMPT_CHARS", "8000"))
@@ -145,7 +138,7 @@ DEFAULT_PYTHON_VERSION = os.environ.get("DEFAULT_PYTHON_VERSION", "3.12")
 WORKFLOW_PYVERSION_LINE = re.compile(
     r'^(\s*python-version\s*:\s*)([\'"]?)(\d+)\.(\d+)([\'"]?)(.*)$', re.M)
 
-# ── Pattern for post‑patch "missing reference" validation ────────────────────
+# Pattern for post‑patch "missing reference" validation
 REPO_REF_EXT_PATTERN = re.compile(
     r'(?<![\w./\-])((?:[\w.\-]+/)*[\w\-]+\.(?:py|txt|ya?ml|json|toml|cfg|ini|'
     r'js|jsx|ts|tsx|go|java|rb|sh))(?![\w./\-])')
@@ -325,7 +318,7 @@ def extract_focused_failure(log_text: str) -> dict:
                 file_refs.append(ref)
     file_refs = file_refs[:8]
 
-    # Command context: the line immediately before the error (best guess)
+    # Command context: lines just before the error
     command_context_lines = []
     if primary_message:
         log_lines = log_text.splitlines()
@@ -446,6 +439,31 @@ def _read_evidence_file(rel: str):
     if len(raw) > MAX_FILE_CHARS:
         raw = raw[:MAX_FILE_CHARS] + "\n...(truncated)"
     return raw
+
+
+# ── Minimal, generic evidence pre‑loader ─────────────────────────────────────
+def preload_mentioned_files(focused: dict, allowed_files: set) -> dict:
+    """Load any files whose names appear verbatim in the error or failing step.
+    Never decides what the bug is – just gives the AI a head start."""
+    evidence = {}
+    search_text = " ".join([
+        focused.get("primary_message", ""),
+        focused.get("failing_step", ""),
+        " ".join(focused.get("command_context", [])),
+        " ".join(focused.get("file_refs", [])),
+    ])
+    for f in sorted(allowed_files):
+        if f in evidence:
+            continue
+        # Simple check: does the filename (or its basename) appear in the log?
+        if f in search_text or Path(f).name in search_text:
+            content = _read_evidence_file(f)
+            if content:
+                evidence[f] = content
+                print(f"[EVIDENCE] Pre‑loaded {f} (mentioned in log)")
+        if len(evidence) >= 3:
+            break
+    return evidence
 
 
 # ── AI plumbing ──────────────────────────────────────────────────────────────
@@ -583,7 +601,7 @@ def _json_from(raw: str):
     return None
 
 
-# ── AI INVESTIGATION AGENT (strict, focused prompt) ──────────────────────────
+# ── AI INVESTIGATION AGENT (generic, powerful prompt) ────────────────────────
 INVESTIGATE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -607,30 +625,39 @@ INVESTIGATE_SCHEMA = {
 }
 
 INVESTIGATE_SYSTEM = """\
-You are a DevOps investigation agent. Your job is to find the root cause of a CI failure quickly.
+You are a senior DevOps engineer debugging a CI pipeline failure. Your job is to
+find the ROOT CAUSE of the error shown in "## ISSUE TO SOLVE". Do not guess –
+use the evidence.
 
-**RULES (follow strictly):**
+Follow this systematic approach:
+1. **Understand the error**: Read the primary error message and the failing step.
+   - What command produced the error?
+   - Is it a file not found, syntax error, test failure, docker error, etc.?
+2. **Trace the error upstream**: Where does the failing command come from?
+   - If it's a `pip install` or `pytest` command, it's probably in a workflow YAML.
+   - If it involves `/app/` paths or "container" mentions, check Dockerfiles and
+     docker‑compose files.
+   - If it's a shell script, check `.sh` files.
+3. **Request the relevant files**: Look at the repository tree and ask for the
+   EXACT files that contain the command or configuration that caused the error.
+   You may request up to 2 files per turn.
+4. **After reading the files, confirm the root cause immediately**. List every
+   distinct bug you find in the "findings" array.
 
-1. The "## ISSUE TO SOLVE" section tells you exactly what broke.
-2. If the error says "No such file or directory: 'X'", the problem is **not** inside X.
-   X does not exist. The problem is in the CI configuration file (workflow YAML) or script
-   that **calls** X with a misspelled name.
-3. If you have not yet read the CI workflow YAML, request it NOW. The workflow YAML is
-   almost always named like `.github/workflows/ci*.yml` – pick the one from the repository tree.
-4. After reading the workflow YAML:
-   a) Scan **every** `run:` line and **every** command argument that looks like a file path.
-   b) For each such path, check if it exists in the "## Repository tree". If it does NOT exist
-      (but a similar file does), you have found a typo.
-   c) **Immediately respond with status `root_cause_confirmed`** – DO NOT request more files.
-      List each misspelled file as a separate finding.
-5. Do NOT request the missing file itself – it doesn't exist. Request the file that
-   **references** it (the workflow YAML, Dockerfile, shell script, etc.).
-6. Confidence must be 0.9 or higher if you see the typo directly in the evidence.
+CRITICAL RULES:
+- Never request a file you've already seen.
+- If you see an obvious typo (e.g., misspelled filename) in the evidence, confirm
+  it right away – no need for more files.
+- If a command references a file that doesn't exist in the repository tree,
+  the bug is the WRONG REFERENCE, not the missing file itself.
+- Confidence must be 0.9 or higher if you directly observe the bug in the evidence.
 
 Output ONLY one JSON object. No markdown fences.
 
-Schema when confirming (use for findings):
-{"analysis":"…","status":"root_cause_confirmed","root_cause":"one-sentence summary","solution":"…","confidence":0.9,"commit_message":"fix: correct typos in workflow file","findings":[{"issue":"short name","root_cause":"why this typo breaks the build","solution":"what to change"}]}
+Respond with:
+{"analysis":"…","status":"need_more_info","requested_files":["path1","path2"]}
+OR
+{"analysis":"…","status":"root_cause_confirmed","root_cause":"…","solution":"…","confidence":0.9,"commit_message":"fix: …","findings":[{"issue":"…","root_cause":"…","solution":"…"}]}
 """
 
 
@@ -662,8 +689,7 @@ def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
     ev_text = "\n\n".join(ev_parts) if ev_parts else "(none read yet)"
     turn_note = ("\n## THIS IS YOUR FINAL TURN. You MUST return "
                  "status \"root_cause_confirmed\" now, using your best "
-                 "hypothesis from the evidence so far. Lower your confidence "
-                 "if you're not fully sure.\n" if last_turn else "")
+                 "hypothesis from the evidence so far.\n" if last_turn else "")
     notes_section = ""
     if notes:
         notes_section = ("\n## Notes on your last request:\n"
@@ -725,8 +751,8 @@ def _finalize_investigation(data: dict, forced: bool) -> dict:
 
 
 def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
-                   issue_block: str = "") -> dict:
-    evidence = {}
+                   issue_block: str = "", initial_evidence: dict = None) -> dict:
+    evidence = dict(initial_evidence) if initial_evidence else {}
     log, result = [], None
     dead_ends = set()
     pending_notes = []
@@ -1106,9 +1132,6 @@ def _resolve_content(fix: dict) -> tuple:
 
 
 def _any_reference_missing(content: str, file: str) -> str:
-    """Check if any file-like references in the patched content don't exist in the repo.
-    Returns a reason string, or '' if all referenced files exist.
-    """
     if not content:
         return ""
     all_repo = [_relstrip(str(p)) for p in Path(".").rglob("*")
@@ -1294,7 +1317,6 @@ def validate_fix(fix: dict) -> tuple:
     if docker_reason:
         return False, f"safe patch verification failed: {docker_reason}"
 
-    # Post-patch missing-reference check (catches leftover typos)
     ref_reason = _any_reference_missing(content, file)
     if ref_reason:
         return False, ref_reason
@@ -1601,10 +1623,6 @@ def main():
     focused = extract_focused_failure(log_text)
     issue_block = format_focused_issue(focused, exit_code)
 
-    # Dynamic hint: if the error is "No such file", nudge the AI toward the workflow file
-    if "No such file" in focused.get("primary_message", ""):
-        issue_block += "\n(Hint: the command that caused this error almost certainly lives in a .github/workflows/*.yml file. Start there.)"
-
     supporting_signal = trim_supporting_signal(signal, focused)
     print(f"[EVIDENCE] Focused issue: {(focused.get('primary_message') or '(none)')[:160]}")
     if focused.get("failing_step"):
@@ -1616,12 +1634,16 @@ def main():
     repo_tree, allowed_files = repo_tree_text()
     print(f"[EVIDENCE] exit_code={exit_code} | {len(allowed_files)} readable file(s) in tree")
 
+    # ── Generic evidence pre‑loader ──
+    seed_evidence = preload_mentioned_files(focused, allowed_files)
+
     # ── AI INVESTIGATION AGENT ──
     print("\n━━━ AI INVESTIGATION AGENT ━━━")
     warm_up_model()
 
     investigation = ai_investigate(supporting_signal, exit_code, repo_tree, git_diff,
-                                   allowed_files, issue_block=issue_block)
+                                   allowed_files, issue_block=issue_block,
+                                   initial_evidence=seed_evidence)
     root_cause = investigation["root_cause"]
     solution   = investigation["solution"]
     commit_msg = investigation["commit_message"]
