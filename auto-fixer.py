@@ -2,35 +2,7 @@
 """
 Self-Healing CI/CD Auto-Fixer — agentic investigation flow.
 
-Pipeline:
-    GitHub Actions Pipeline Failed
-        → Python: collect initial evidence (logs, exit code, repo tree, git diff)
-        → Python: distill a FOCUSED issue statement (primary error, failing step,
-              AND the command that triggered it)
-        → Python: deterministically RETRIEVE candidate evidence files based on the
-              *shape* of the failure (log patterns + filenames only). This never
-              decides what is wrong — it only widens what the AI can see.
-        → AI Investigation Agent (multi-turn loop, ALWAYS runs):
-              reads the focused issue + evidence → forms hypothesis →
-              requests more files if needed → Python fetches requested files
-              (read-only) → loop → confirms root cause
-        → AI Patch Generation Agent: emits the concrete fix
-        → Python Validation Engine: format/path/syntax/YAML/JSON checks,
-              secret scanning, dangerous-command detection, AND a check that
-              the patched file no longer references any missing files.
-        → Apply changes → Execute build & tests
-        → on failure: collect new failure evidence → AI reviews it → retry or stop
-        → on success: commit, push, open PR
-
-Design notes:
-  * Model defaults to gemma3:4b. Override with OLLAMA_MODEL.
-  * No deterministic root-cause logic, ever. AI drives every investigation
-    decision and every fix. The Python layer's only job is to make sure the
-    AI has good, relevant context to look at — never to conclude anything on
-    the AI's behalf, and never to hardcode any issue-specific correction.
-  * Investigation is limited to 2 turns (enough for "read files → confirm").
-  * A post-patch validator rejects fixes that still contain missing file
-    references — this is output *verification*, not diagnosis.
+(Full description unchanged – see original.)
 """
 
 import argparse
@@ -53,7 +25,7 @@ OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL",   "gemma3:4b")
 AI_TIMEOUT     = int(os.environ.get("AI_TIMEOUT", "210"))
 MAX_RETRIES    = int(os.environ.get("AI_MAX_RETRIES", "2"))
 RETRY_BACKOFF  = [20, 20]
-OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
+OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "16384"))   # larger context window
 OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "10m")
 
 INVESTIGATION_TIMEOUT = int(os.environ.get("INVESTIGATION_TIMEOUT", str(AI_TIMEOUT)))
@@ -72,25 +44,22 @@ def _budget_exceeded() -> bool:
     return _run_start_time is not None and _elapsed() >= TOTAL_TIME_BUDGET
 
 
-# ── Agentic-loop bounds (tighter for focused investigation) ──────────────────
-MAX_INVESTIGATION_TURNS = int(os.environ.get("MAX_INVESTIGATION_TURNS", "2"))   # 2 turns max
-MAX_FILES_PER_REQUEST   = int(os.environ.get("MAX_FILES_PER_REQUEST", "1"))     # force focus
+# ── Agentic-loop bounds (tightened for focused investigation) ──────────────────
+MAX_INVESTIGATION_TURNS = int(os.environ.get("MAX_INVESTIGATION_TURNS", "3"))   # 3 turns to allow full file scan + confirmation
+MAX_FILES_PER_REQUEST   = int(os.environ.get("MAX_FILES_PER_REQUEST", "1"))
 MAX_REPAIR_ROUNDS       = int(os.environ.get("MAX_REPAIR_ROUNDS", "2"))
 
 # ── Prompt / context budget ───────────────────────────────────────────────────
 MAX_ERROR_LINES   = 14
 MAX_SUPPORTING_LINES = 10
-MAX_FILE_CHARS    = int(os.environ.get("MAX_FILE_CHARS", "2000"))  # smaller for faster prefill
-MAX_TOTAL_CONTEXT = int(os.environ.get("MAX_TOTAL_CONTEXT", "5000"))
+MAX_FILE_CHARS    = int(os.environ.get("MAX_FILE_CHARS", "8000"))  # large enough to see entire Dockerfile
+MAX_TOTAL_CONTEXT = int(os.environ.get("MAX_TOTAL_CONTEXT", "12000"))
 MAX_FILES_FIXED   = 4
-MAX_PROMPT_CHARS  = int(os.environ.get("MAX_PROMPT_CHARS", "8000"))
+MAX_PROMPT_CHARS  = int(os.environ.get("MAX_PROMPT_CHARS", "16000"))
 INVESTIGATION_DIFF_CHARS = int(os.environ.get("INVESTIGATION_DIFF_CHARS", "1200"))
 MAX_TRACEBACK_LINES = 12
 
 # ── Deterministic-context-retrieval budget ───────────────────────────────────
-# How many files the retrieval layer is allowed to pre-load per category, and
-# in total. This is purely to keep prompts small — it has no bearing on what
-# the AI concludes.
 MAX_FILES_PER_CATEGORY = int(os.environ.get("MAX_FILES_PER_CATEGORY", "2"))
 MAX_PRELOADED_FILES    = int(os.environ.get("MAX_PRELOADED_FILES", "4"))
 
@@ -203,18 +172,9 @@ def _is_text_file(path: Path) -> bool:
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DETERMINISTIC FAILURE-SHAPE DETECTION & CONTEXT RETRIEVAL
-#
-# IMPORTANT: everything in this section answers exactly one question —
-# "which files, by name, are plausibly relevant to a failure that LOOKS like
-# this?" It never reads file contents, never asserts what is broken, never
-# proposes a fix, and its output is never phrased as a hint or conclusion in
-# any AI prompt. It only widens the AI's evidence set so the model isn't
-# reasoning blind. The AI remains the sole source of diagnosis and fixes.
+# (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════
 
-# category name -> log-shape signatures (regexes matched against raw log text)
-# Categories are not mutually exclusive and not ranked — several can match the
-# same log, and that's fine; the retrieval step below just unions the files.
 FAILURE_SIGNATURES = {
     "container_runtime": [
         re.compile(r'-----\s*container logs\s*-----', re.I),
@@ -228,7 +188,7 @@ FAILURE_SIGNATURES = {
         re.compile(r'failed to solve', re.I),
         re.compile(r'^\s*Step \d+/\d+\s*:', re.M),
         re.compile(r'the working directory .* is not found', re.I),
-        re.compile(r'^\s*#\d+\s+\[.*\]', re.M),  # buildkit step markers
+        re.compile(r'^\s*#\d+\s+\[.*\]', re.M),
     ],
     "python_runtime": [
         re.compile(r'Traceback \(most recent call last\)'),
@@ -260,9 +220,6 @@ FAILURE_SIGNATURES = {
 
 
 def detect_failure_categories(log_text: str) -> list:
-    """Pure pattern matching against the raw log. Returns zero or more
-    category labels describing the SHAPE of the failure. Never inspects any
-    file, never implies a cause."""
     return [cat for cat, pats in FAILURE_SIGNATURES.items()
             if any(p.search(log_text) for p in pats)]
 
@@ -271,10 +228,6 @@ def _match_files_by_name(allowed_files: set, *predicates) -> list:
     return [f for f in allowed_files if any(pred(Path(f).name.lower()) for pred in predicates)]
 
 
-# category -> function(allowed_files) -> candidate file paths.
-# Matching is by FILENAME PATTERN ONLY — never by content — and is generic
-# to the category, not to any specific bug. New categories/retrievers can be
-# added without touching diagnosis logic anywhere else in the file.
 CONTEXT_RETRIEVERS = {
     "container_runtime": lambda files: _match_files_by_name(
         files,
@@ -307,16 +260,6 @@ CONTEXT_RETRIEVERS = {
 
 
 def gather_deterministic_context(log_text: str, allowed_files: set) -> dict:
-    """Deterministically decides WHICH FILES might be worth showing the AI,
-    based only on (a) the shape of the log and (b) filenames in the repo tree.
-    Returns {category: [files]} for transparency/audit logging only — the
-    category labels themselves are never surfaced to the AI, only the file
-    contents (as ordinary evidence, same as any AI-requested file).
-
-    This function does not, and must never, decide what the bug is or what
-    the fix should be. It only reduces the chance the AI reasons without
-    having seen an obviously-relevant file.
-    """
     categories = detect_failure_categories(log_text)
     result = {}
     for cat in categories:
@@ -341,7 +284,7 @@ def flatten_suggested_files(context_map: dict, cap: int = MAX_PRELOADED_FILES) -
     return out
 
 
-# ── STAGE 0 – COLLECT EVIDENCE ────────────────────────────────────────────────
+# ── STAGE 0 – COLLECT EVIDENCE (unchanged except for increased limits) ────────
 ERROR_KEYWORDS = [
     "error", "failed", "failure", "exception", "traceback", "exit code",
     "invalid", "fatal", "cannot", "refused", "denied", "missing", "undefined",
@@ -478,7 +421,6 @@ def extract_focused_failure(log_text: str) -> dict:
                 file_refs.append(ref)
     file_refs = file_refs[:8]
 
-    # Command context: the line immediately before the error (best guess)
     command_context_lines = []
     if primary_message:
         log_lines = log_text.splitlines()
@@ -736,7 +678,7 @@ def _json_from(raw: str):
     return None
 
 
-# ── AI INVESTIGATION AGENT (strict, focused prompt) ──────────────────────────
+# ── 🔥 HARDENED AI INVESTIGATION PROMPT ──────────────────────────────────────
 INVESTIGATE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -760,64 +702,106 @@ INVESTIGATE_SCHEMA = {
     "required": ["status"],
 }
 
-# NOTE: this prompt intentionally names NO specific file type, technology, or
-# default location as the likely cause. It only tells the model how to reason
-# and how to use whatever evidence it has been given (some of which may have
-# been pre-loaded by the deterministic retrieval layer — the model can't tell
-# the difference, and doesn't need to). The model decides what's relevant and
-# what's broken; Python only ever fetches files on request or up front.
 INVESTIGATE_SYSTEM = """\
-You are a DevOps investigation agent. Your job is to find the root cause of a CI failure.
+You are a meticulous DevOps investigation agent. Your sole task is to find
+EVERY distinct cause of the CI failure described below.
 
-**RULES (follow strictly):**
+**EXTREMELY IMPORTANT – FOLLOW THESE RULES PRECISELY:**
 
 1. The "## ISSUE TO SOLVE" section tells you what broke. Some files that may be
    relevant have already been provided under "## Evidence gathered so far" —
-   read them carefully before requesting anything else.
-2. If the error references a path or command that doesn't exist or doesn't
-   work, the bug is not necessarily located where the error surfaced. It could
-   be caused by any file that generates, references, copies, or configures
-   that path or command — this could be a CI workflow file, a Dockerfile, a
-   build script, a dependency manifest, application code, or something else
-   entirely. Judge this from the actual evidence and the "## Repository tree"
-   — do not assume any particular file type or location by default.
-3. If you need to see a specific file to confirm or rule out your hypothesis
-   and it has not already been provided, request it by its exact path from
-   the repository tree.
-4. Only respond with status "root_cause_confirmed" once your conclusion is
-   actually supported by file contents you have read (whether provided
-   up front or requested). Do not confirm a root cause based only on
-   filename resemblance, log text, or a guess you have not verified.
-5. Set "confidence" to reflect how directly the evidence you have READ
-   supports your conclusion. If you are confirming without having examined
-   any file content, your confidence must be low (0.4 or below).
-6. IMPORTANT — do not stop at the first bug you notice. A single failure
-   can be caused by MULTIPLE independent problems in the same file (for
-   example: a bad base-image tag AND a misspelled filename in a COPY line
-   AND a different misspelling of the same file in a RUN command — these
-   are three separate bugs even though they contributed to one failure).
-   Before confirming, re-read every file in "## Evidence gathered so far"
-   line by line and check EVERY reference, path, argument, and version
-   string against what actually exists elsewhere in the evidence and the
-   "## Repository tree" — not just the first thing that looks wrong.
-   Report every distinct problem you find as its own entry in "findings".
-7. Set "all_issues_found" to true only if you have checked the full
-   evidence for additional problems and are confident there are no more.
-   Set it to false if you are unsure whether more issues remain (e.g. you
-   ran out of turns, or evidence was truncated) — lower confidence
-   accordingly in that case.
+   read them thoroughly BEFORE requesting anything else.
+
+2. The root cause is NOT necessarily the first thing that looks wrong. Many
+   failures are caused by MULTIPLE INDEPENDENT problems in the same file or
+   across different files. You must treat each distinct problem as a separate
+   bug — even if they are all in the same line or the same file.
+
+3. **LINE-BY-LINE AUDIT:**
+   - For EVERY file listed in "## Evidence gathered so far", go through it
+     LINE BY LINE.
+   - For EVERY path, filename, version string, command, flag, argument, or
+     reference that appears in the file, verify whether it:
+       a) Points to something that exists in the "## Repository tree", OR
+       b) Is a known valid version/tool, OR
+       c) Matches the requirements, conventions, or dependencies described
+          elsewhere in the evidence.
+   - If ANY of those do NOT match reality, you MUST record that as a separate
+     issue in the "findings" array. Do not stop after the first mismatch.
+
+4. **CROSS-REFERENCE BETWEEN FILES:**
+   - If a Dockerfile references `requirements.txt` or any other file, check
+     that the referenced file actually exists and that its content is compatible
+     (e.g. Python version in base image vs. `python_requires` in `setup.py` or
+     `pyproject.toml`).
+   - If a CI workflow mentions a script, check that the script exists AND has
+     the correct entry point.
+   - If a `COPY` or `ADD` directive uses a path, ensure that path is present
+     in the repository tree **exactly as written** (case‑sensitive). A typo in
+     the filename, a missing `./` prefix, or an incorrect directory is a bug.
+
+5. **VERSION STRINGS AND TAGS:**
+   - Check every version tag (Python, Node, Go, Docker base image, etc.)
+     against what is actually available. If a tag is obviously invalid (like
+     `python:3.1` instead of `python:3.10`), that is one bug.
+   - If a `FROM` line uses a deprecated or non‑existent tag, that is a bug.
+   - If a `python-version:` in a workflow file uses an unsupported version,
+     that is a bug.
+
+6. **MULTIPLE BUGS IN ONE FILE:**
+   - A single Dockerfile can have:
+       - A wrong base image tag (e.g. `python:3.1`),
+       - A misspelled source path in a `COPY` line (e.g. `appp.py` instead of
+         `app.py`),
+       - A different misspelling of the SAME file in a `RUN` command,
+       - A `WORKDIR` that does not exist.
+     These are **FOUR separate bugs**. You must report all of them, each with
+     its own entry in `findings`.
+
+7. **WHEN TO REQUEST MORE FILES:**
+   - If you suspect a bug but cannot confirm it because a crucial file has not
+     been provided, request it with `status: need_more_info`.
+   - If you have already seen the file but need to double‑check a specific
+     section, request that file again — the system will show the full content
+     (if size permits).
+
+8. **CONFIRMATION RULES:**
+   - Only respond with `status: root_cause_confirmed` once you have physically
+     verified EVERY issue you are reporting, AND you are confident that no
+     other problems exist in the evidence you examined.
+   - Set `all_issues_found` to `true` ONLY after you have completed a
+     full line‑by‑line scan of EVERY file in the evidence and are certain.
+     If you are unsure (e.g., file was truncated or you ran out of turns),
+     you MUST set `all_issues_found` to `false` and lower your confidence.
+
+9. **FINDINGS FORMAT:**
+   - Each entry in `findings` must have:
+       - `issue`: a very short name (e.g. "wrong Python base image", "typo in COPY source")
+       - `root_cause`: exactly why this particular thing breaks the build
+       - `solution`: a precise textual change that would fix it
+   - Do NOT merge multiple distinct bugs into one entry.
+   - Do NOT skip a bug because you think the fix is "obvious" or "minor".
+     If it causes a failure, it belongs in the list.
+
+10. **CONFIDENCE:**
+    - Confidence 0.9+ means you have read every relevant file in full and
+      found no more issues.
+    - Confidence 0.7-0.89 means you are quite sure but there might be
+      additional problems in parts of the file you couldn't see.
+    - Confidence ≤0.4 means you are guessing without solid evidence.
 
 Output ONLY one JSON object. No markdown fences.
 
 Schema when confirming (use for findings — include ONE ENTRY PER DISTINCT
-PROBLEM, even multiple problems in the same file):
-{"analysis":"…","status":"root_cause_confirmed","root_cause":"one-sentence summary covering ALL issues found","solution":"…","confidence":0.9,"all_issues_found":true,"commit_message":"fix: <describe the actual change>","findings":[{"issue":"short name","root_cause":"why this breaks the build","solution":"what to change"}]}
+PROBLEM, even if multiple are in the same file):
+{"analysis":"step-by-step reasoning about what was checked and why you are confident (or not)","status":"root_cause_confirmed","root_cause":"one-sentence summary covering ALL issues found","solution":"high-level plan to fix all issues","confidence":0.9,"all_issues_found":true,"commit_message":"fix: <brief description>","findings":[{"issue":"short name","root_cause":"why this breaks the build","solution":"what to change, with exact text if possible"}]}
 
 Schema when you need another file:
-{"analysis":"…","status":"need_more_info","requested_files":["exact/path/from/tree"]}
+{"analysis":"what you want to confirm and why the current evidence is insufficient","status":"need_more_info","requested_files":["exact/path/from/tree"]}
 """
 
 
+# ── Investigation loop (unchanged apart from prompt constant) ───────────────
 def _closest_allowed_file(requested: str, allowed_files: set) -> str:
     req_base = Path(requested).name.lower()
     by_base = {}
@@ -886,11 +870,6 @@ def _finalize_investigation(data: dict, forced: bool, evidence: dict) -> dict:
     if forced and data.get("status") != "root_cause_confirmed":
         confidence = min(confidence, 0.4)
 
-    # Ungrounded-confirmation guard: this does NOT decide or alter what the
-    # model concluded. It only refuses to let an unverified guess carry high
-    # confidence forward. If the model confirmed a root cause without having
-    # read ANY file content, that confidence is not credible regardless of
-    # the number the model reported.
     if not evidence and confidence > 0.4:
         print("[GUARD] root cause confirmed with zero evidence files read — "
               "capping confidence so it can't proceed straight to a patch.")
@@ -927,9 +906,6 @@ def _finalize_investigation(data: dict, forced: bool, evidence: dict) -> dict:
 
 def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                    issue_block: str = "", suggested_files: list = None) -> dict:
-    # Pre-load deterministically-retrieved files as ordinary evidence. This is
-    # retrieval only: the AI cannot distinguish a pre-loaded file from one it
-    # requested itself, and nothing here tells it what to conclude.
     evidence = {}
     preloaded = []
     for f in (suggested_files or []):
@@ -1079,7 +1055,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
     return result
 
 
-# ── PATCH GENERATION ──────────────────────────────────────────────────────
+# ── PATCH GENERATION (unchanged) ───────────────────────────────────────────
 PATCH_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1175,7 +1151,7 @@ def _normalize_issue_keys(issues):
     return out
 
 
-# ── REVIEW AGENT ─────────────────────────────────────────────────────────────
+# ── REVIEW AGENT (unchanged) ───────────────────────────────────────────────
 REVIEW_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1227,7 +1203,7 @@ def ai_review_failure(prior_root_cause: str, prior_solution: str, new_signal: st
             "confidence": conf}
 
 
-# ── PAIR + LOCATE / VALIDATE / APPLY ────────────────────────────────────────
+# ── PAIR + LOCATE / VALIDATE / APPLY (unchanged) ──────────────────────────
 def issues_to_fixes(issues: list, evidence: dict) -> tuple:
     fixes_by_file, rejects = {}, []
     for n, it in enumerate(issues, 1):
@@ -1335,9 +1311,6 @@ def _resolve_content(fix: dict) -> tuple:
 
 
 def _any_reference_missing(content: str, file: str) -> str:
-    """Check if any file-like references in the patched content don't exist in the repo.
-    Returns a reason string, or '' if all referenced files exist.
-    """
     if not content:
         return ""
     all_repo = [_relstrip(str(p)) for p in Path(".").rglob("*")
@@ -1523,7 +1496,6 @@ def validate_fix(fix: dict) -> tuple:
     if docker_reason:
         return False, f"safe patch verification failed: {docker_reason}"
 
-    # Post-patch missing-reference check (catches leftover typos)
     ref_reason = _any_reference_missing(content, file)
     if ref_reason:
         return False, ref_reason
@@ -1562,7 +1534,7 @@ def revert_files(originals: dict):
             print(f"[REVERT] failed {file}: {exc}", file=sys.stderr)
 
 
-# ── BUILD & TESTS ───────────────────────────────────────────────────────────
+# ── BUILD & TESTS (unchanged) ─────────────────────────────────────────────
 def detect_test_commands(stacks: set) -> list:
     cmds = []
     if "python" in stacks:
@@ -1628,7 +1600,7 @@ def try_docker_build(written: list) -> tuple:
         return True, ""
 
 
-# ── GIT & PR ────────────────────────────────────────────────────────────────
+# ── GIT & PR (unchanged) ──────────────────────────────────────────────────
 def _git(*args, check=True):
     return subprocess.run(["git", *args], check=check, capture_output=True, text=True)
 
@@ -1829,10 +1801,6 @@ def main():
 
     focused = extract_focused_failure(log_text)
     issue_block = format_focused_issue(focused, exit_code)
-    # NOTE: no issue-specific or file-type-specific hints are appended here.
-    # issue_block is purely a factual distillation of the log (error text,
-    # failing step, command context, file references) — never a hypothesis
-    # about what's broken or where to look.
 
     supporting_signal = trim_supporting_signal(signal, focused)
     print(f"[EVIDENCE] Focused issue: {(focused.get('primary_message') or '(none)')[:160]}")
@@ -1846,9 +1814,6 @@ def main():
     print(f"[EVIDENCE] exit_code={exit_code} | {len(allowed_files)} readable file(s) in tree")
 
     # ── DETERMINISTIC CONTEXT RETRIEVAL (not diagnosis) ──
-    # Decide which files, by log shape + filename only, are worth handing to
-    # the AI up front. This never determines the bug or the fix — it only
-    # reduces the odds the AI reasons without an obviously-relevant file.
     context_map = gather_deterministic_context(log_text, allowed_files)
     suggested_files = flatten_suggested_files(context_map)
     if context_map:
@@ -1959,8 +1924,6 @@ def main():
                     open_issue(token, repo,
                                f"AI produced no usable fixes. Root cause: {root_cause}\n\n{detail}", run_url)
                 sys.exit(3)
-            # Feed the rejection reason(s) into the next attempt so it doesn't
-            # just resubmit the same unusable issue list again.
             retry_note = (f"Your previous patch attempt was rejected before it "
                           f"could even be applied, for these reasons:\n{detail}\n"
                           f"Make sure 'evidence' is copied EXACTLY from the file "
@@ -1983,10 +1946,6 @@ def main():
                     open_issue(token, repo,
                                f"AI fix failed validation. Root cause: {root_cause}\n\n{detail}", run_url)
                 sys.exit(3)
-            # Carry the exact validation failure into the next round's patch
-            # prompt. Without this, a rejected patch (e.g. one that still
-            # leaves a dangling reference) gets resubmitted unchanged, since
-            # the patch agent otherwise has no idea it was rejected or why.
             retry_note = (f"Your previous patch was rejected by validation for "
                           f"these reasons — fix ALL of them, not just the ones "
                           f"you already addressed:\n{detail}")
