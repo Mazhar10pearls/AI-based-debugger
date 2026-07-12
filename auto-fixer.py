@@ -53,15 +53,14 @@ def _budget_exceeded() -> bool:
     return _run_start_time is not None and _elapsed() >= TOTAL_TIME_BUDGET
 
 
-def _chunk_budget_exceeded() -> bool:
-    return (_run_start_time is not None
-            and (TOTAL_TIME_BUDGET - _elapsed()) < CHUNK_AUDIT_BUDGET_RESERVE)
-
-
 # ── Agentic-loop bounds (tightened for focused investigation) ──────────────────
 MAX_INVESTIGATION_TURNS = int(os.environ.get("MAX_INVESTIGATION_TURNS", "3"))   # 3 turns to allow full file scan + confirmation
 MAX_FILES_PER_REQUEST   = int(os.environ.get("MAX_FILES_PER_REQUEST", "1"))
 MAX_REPAIR_ROUNDS       = int(os.environ.get("MAX_REPAIR_ROUNDS", "4"))
+# After the model confirms findings, run ONE extra model pass over the same
+# evidence asking it to re-audit its own list for missed issues. Pure
+# model-driven discovery — Python contributes nothing but the orchestration.
+VERIFY_SWEEP            = os.environ.get("VERIFY_SWEEP", "1") == "1"
 
 # ── Prompt / context budget ───────────────────────────────────────────────────
 MAX_ERROR_LINES   = 14
@@ -76,27 +75,6 @@ MAX_TRACEBACK_LINES = 12
 # ── Deterministic-context-retrieval budget ───────────────────────────────────
 MAX_FILES_PER_CATEGORY = int(os.environ.get("MAX_FILES_PER_CATEGORY", "2"))
 MAX_PRELOADED_FILES    = int(os.environ.get("MAX_PRELOADED_FILES", "4"))
-
-# ── Chunked audit for large files ─────────────────────────────────────────────
-# A single "read the whole file, audit it line by line" prompt scales its
-# input AND expected output with file size — on a big file that means a long
-# generation against a fixed num_predict/timeout, which is exactly what times
-# out and forces the model to stop after finding just one issue. Instead,
-# files over LARGE_FILE_LINE_THRESHOLD lines are split into small, bounded
-# chunks and audited one chunk at a time (small prompt in, small JSON out,
-# short timeout, can't time out regardless of total file size). Findings from
-# every chunk are merged and handed to the main investigation as evidence
-# instead of the raw file text.
-LARGE_FILE_LINE_THRESHOLD  = int(os.environ.get("LARGE_FILE_LINE_THRESHOLD", "120"))
-CHUNK_LINES                = int(os.environ.get("CHUNK_LINES", "90"))
-CHUNK_OVERLAP_LINES        = int(os.environ.get("CHUNK_OVERLAP_LINES", "6"))
-MAX_CHUNKS_PER_FILE        = int(os.environ.get("MAX_CHUNKS_PER_FILE", "5"))
-CHUNK_AUDIT_TIMEOUT        = int(os.environ.get("CHUNK_AUDIT_TIMEOUT", "45"))
-CHUNK_AUDIT_NUM_PREDICT    = int(os.environ.get("CHUNK_AUDIT_NUM_PREDICT", "350"))
-# Stop starting new chunk-audit calls once less than this much wall-clock
-# budget remains, so a huge file can never eat the time patch-gen/tests need.
-CHUNK_AUDIT_BUDGET_RESERVE = int(os.environ.get("CHUNK_AUDIT_BUDGET_RESERVE", "240"))
-INVESTIGATE_NUM_PREDICT    = int(os.environ.get("INVESTIGATE_NUM_PREDICT", "1100"))
 
 # ── Git flow ──────────────────────────────────────────────────────────────────
 GIT_BASE_BRANCH   = os.environ.get("GIT_BASE_BRANCH",   "develop")
@@ -165,6 +143,12 @@ WORKFLOW_PYVERSION_LINE = re.compile(
 REPO_REF_EXT_PATTERN = re.compile(
     r'(?<![\w./\-])((?:[\w.\-]+/)*[\w\-]+\.(?:py|txt|ya?ml|json|toml|cfg|ini|'
     r'js|jsx|ts|tsx|go|java|rb|sh))(?![\w./\-])')
+
+# Set in main() to the actual failure evidence (issue block + log signal).
+# Validators use it ONLY to decide whether a pre-existing broken reference is
+# part of the error being fixed (blocking) or unrelated noise (non-blocking).
+# This keeps validation error-driven, not file-driven.
+CURRENT_FAILURE_CONTEXT = ""
 
 
 def scan_text_for_secrets(text: str) -> list:
@@ -565,6 +549,19 @@ def repo_tree_text(limit: int = 300) -> tuple:
     return text, set(files)
 
 
+def _read_evidence_file(rel: str):
+    p = Path(rel)
+    if not p.is_file() or _is_read_blocked(rel) or not _is_text_file(p):
+        return None
+    try:
+        raw = p.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    if len(raw) > MAX_FILE_CHARS:
+        raw = raw[:MAX_FILE_CHARS] + "\n...(truncated)"
+    return raw
+
+
 # ── AI plumbing ──────────────────────────────────────────────────────────────
 def _detect_endpoint():
     url = OLLAMA_API_URL.rstrip("/")
@@ -612,15 +609,31 @@ def _stream_ollama(prompt, schema=None, num_predict=2000, temperature=0.05,
     for attempt in range(retries):
         try:
             t0, collected = time.time(), []
+            deadline = t0 + timeout
             resp = requests.post(endpoint, json=payload, timeout=(10, timeout), stream=True)
             resp.raise_for_status()
+            hit_deadline = False
             for line in resp.iter_lines():
+                # Per-read timeout resets on every token, so a steady stream can
+                # run far past `timeout` (observed: 355s on a 300s cap). Enforce
+                # a hard wall-clock deadline; partial output is still salvageable
+                # by the truncated-JSON repair in _json_from.
+                if time.time() > deadline:
+                    hit_deadline = True
+                    print(f"[{tag}] hard wall-clock deadline {timeout}s hit "
+                          f"mid-stream — stopping with partial output.")
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                    break
                 tok = _extract_token(line, fmt)
                 if tok:
                     collected.append(tok)
             raw = "".join(collected).strip()
-            print(f"[{tag}] done in {time.time()-t0:.1f}s — {len(raw)} chars")
-            if not raw:
+            print(f"[{tag}] done in {time.time()-t0:.1f}s — {len(raw)} chars"
+                  + (" (deadline-truncated)" if hit_deadline else ""))
+            if not raw and not hit_deadline:
                 try:
                     body = resp.json()
                     raw = (body.get("choices", [{}])[0].get("text", "")
@@ -628,7 +641,8 @@ def _stream_ollama(prompt, schema=None, num_predict=2000, temperature=0.05,
                 except Exception:
                     pass
             if not raw:
-                raise RuntimeError("Ollama returned an empty response.")
+                raise requests.exceptions.Timeout(
+                    f"deadline hit with no usable output after {timeout}s")
             return raw
         except requests.exceptions.Timeout as exc:
             last = exc
@@ -671,6 +685,51 @@ def warm_up_model() -> bool:
         return False
 
 
+def _close_truncated_json(text: str):
+    """Generic repair for JSON cut off mid-generation (num_predict cap):
+    close any open string, strip a trailing incomplete token, and close all
+    open brackets. Falls back to backtracking to the last complete value."""
+    def _close(t: str) -> str:
+        stack, in_str, esc = [], False, False
+        for ch in t:
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch in "{[":
+                    stack.append(ch)
+                elif ch in "}]":
+                    if stack:
+                        stack.pop()
+        out = t
+        if in_str:
+            out += '"'
+        out = re.sub(r",\s*$", "", out)
+        while stack:
+            out += "}" if stack.pop() == "{" else "]"
+        return out
+
+    for candidate in (text, ):
+        try:
+            return json.loads(_close(candidate))
+        except json.JSONDecodeError:
+            pass
+    # Backtrack: drop the trailing incomplete key/value and try again.
+    for cut in range(len(text) - 1, max(0, len(text) - 2000), -1):
+        if text[cut] == ",":
+            try:
+                return json.loads(_close(text[:cut]))
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
 def _json_from(raw: str):
     cleaned = re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
     try:
@@ -697,160 +756,14 @@ def _json_from(raw: str):
                 return json.loads(best + "}" * (best.count("{") - best.count("}")))
             except json.JSONDecodeError:
                 pass
+    # Last resort: the output was probably truncated mid-generation.
+    start = cleaned.find("{")
+    if start != -1:
+        repaired = _close_truncated_json(cleaned[start:])
+        if repaired is not None:
+            print("[JSON] recovered a truncated JSON object from model output.")
+            return repaired
     return None
-
-
-# ── CHUNKED AUDIT FOR LARGE FILES ────────────────────────────────────────────
-# Rationale: asking the model to line-by-line audit an entire large file in
-# one call makes both the prompt AND the required output grow with file size,
-# against a FIXED timeout and a FIXED num_predict token budget. That is what
-# causes timeouts and "only found one issue" reports on big files. Splitting
-# the file into small, overlapping, line-numbered chunks and auditing each
-# chunk with its own small bounded call means no single call's cost depends
-# on total file size — coverage of a 2000-line file just becomes N cheap
-# calls instead of one expensive one that can blow the budget.
-CHUNK_AUDIT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "findings": {"type": "array", "items": {
-            "type": "object",
-            "properties": {
-                "issue":      {"type": "string"},
-                "root_cause": {"type": "string"},
-                "solution":   {"type": "string"},
-                "line":       {"type": "string"},
-            },
-            "required": ["issue", "root_cause"]}},
-    },
-    "required": ["findings"],
-}
-
-CHUNK_AUDIT_SYSTEM = """\
-You are auditing ONE chunk of a larger file (line numbers shown at the start \
-of each line, e.g. "42: some code"). Check every path, filename, version \
-string, command, flag, or reference that appears in THIS chunk against the \
-repository tree and the issue described below.
-
-Rules:
-- Report a finding for EVERY distinct problem you can directly see in this
-  chunk — do not merge separate problems into one finding.
-- Only report things you can verify from this chunk, the repository tree, or
-  the issue description. Do not guess about lines you cannot see.
-- If this chunk has no problems, return {"findings":[]} — that is a normal,
-  expected result for most chunks of a file.
-- "line" should be the line number (from the "N:" prefix) where the problem
-  is.
-
-Output ONLY one JSON object, no markdown fences:
-{"findings":[{"issue":"short name","root_cause":"why this breaks the build","solution":"exact text change needed","line":"42"}]}
-"""
-
-
-def _read_full_text(rel: str):
-    p = Path(rel)
-    if not p.is_file() or _is_read_blocked(rel) or not _is_text_file(p):
-        return None
-    try:
-        return p.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return None
-
-
-def _split_into_chunks(content: str, chunk_lines: int = CHUNK_LINES,
-                       overlap: int = CHUNK_OVERLAP_LINES) -> list:
-    """Return [(start_line, numbered_chunk_text), ...]. Chunks overlap slightly
-    so a problem spanning a chunk boundary (e.g. a multi-line COPY) still
-    appears whole in at least one chunk."""
-    lines = content.splitlines()
-    if len(lines) <= chunk_lines:
-        return [(1, "\n".join(f"{i+1}: {l}" for i, l in enumerate(lines)))]
-    chunks, start = [], 0
-    while start < len(lines):
-        end = min(start + chunk_lines, len(lines))
-        numbered = "\n".join(f"{i+1}: {lines[i]}" for i in range(start, end))
-        chunks.append((start + 1, numbered))
-        if end == len(lines):
-            break
-        start = end - overlap
-    return chunks
-
-
-def _audit_large_file(path: str, content: str, issue_block: str, repo_tree: str) -> list:
-    chunks = _split_into_chunks(content)
-    total_chunks = len(chunks)
-    to_run = chunks[:MAX_CHUNKS_PER_FILE]
-    print(f"[CHUNK-AUDIT] {path}: {len(content.splitlines())} lines -> "
-          f"{total_chunks} chunk(s), auditing {len(to_run)}")
-
-    findings = []
-    for idx, (start_line, chunk_text) in enumerate(to_run, 1):
-        if _chunk_budget_exceeded():
-            print(f"[CHUNK-AUDIT] {path}: time budget getting tight — "
-                  f"stopping at chunk {idx}/{len(to_run)}")
-            break
-        prompt = (f"{CHUNK_AUDIT_SYSTEM}\n\n"
-                  f"## ISSUE TO SOLVE\n{issue_block}\n\n"
-                  f"## File: {path} (this chunk starts at line {start_line})\n"
-                  f"```\n{chunk_text}\n```\n\n"
-                  f"## Repository tree:\n{repo_tree}\n\n"
-                  f"Respond with the JSON.")
-        try:
-            raw = _stream_ollama(prompt, CHUNK_AUDIT_SCHEMA,
-                                 num_predict=CHUNK_AUDIT_NUM_PREDICT, temperature=0.05,
-                                 tag=f"CHUNK-{Path(path).name}-{idx}/{len(to_run)}",
-                                 timeout=CHUNK_AUDIT_TIMEOUT, retries=1)
-        except Exception as exc:
-            print(f"[CHUNK-AUDIT] {path} chunk {idx}/{len(to_run)} failed: {exc}",
-                  file=sys.stderr)
-            continue
-        data = _json_from(raw) or {}
-        chunk_findings = [f for f in (data.get("findings") or [])
-                          if isinstance(f, dict) and (f.get("issue") or f.get("root_cause"))]
-        if chunk_findings:
-            print(f"[CHUNK-AUDIT]   chunk {idx}/{len(to_run)} "
-                  f"(lines {start_line}+): {len(chunk_findings)} finding(s)")
-        for f in chunk_findings:
-            line = str(f.get("line") or "").strip()
-            label = f"{path}:{line}" if line else path
-            findings.append({
-                "issue":      f"[{label}] {(f.get('issue') or '').strip()}",
-                "root_cause": (f.get("root_cause") or "").strip(),
-                "solution":   (f.get("solution") or "").strip(),
-            })
-
-    if len(to_run) < total_chunks:
-        print(f"[CHUNK-AUDIT] {path}: only audited {len(to_run)}/{total_chunks} "
-              f"chunks (cap or budget) — coverage may be incomplete")
-    return findings
-
-
-def _load_evidence_for_file(rel: str, issue_block: str, repo_tree: str,
-                            chunk_findings_out: list) -> str:
-    """Evidence loader used by the investigation loop. Small files are
-    inlined verbatim (existing behavior). Large files are chunk-audited
-    instead of dumped whole, so no single investigation prompt ever scales
-    with file size — the raw text is replaced with a short excerpt plus a
-    pointer to the merged chunk-audit findings."""
-    raw = _read_full_text(rel)
-    if raw is None:
-        return None
-    line_count = raw.count("\n") + 1
-    if line_count <= LARGE_FILE_LINE_THRESHOLD:
-        if len(raw) > MAX_FILE_CHARS:
-            raw = raw[:MAX_FILE_CHARS] + "\n...(truncated)"
-        return raw
-
-    print(f"[EVIDENCE] {rel}: {line_count} lines — over the "
-          f"{LARGE_FILE_LINE_THRESHOLD}-line inline threshold, chunk-auditing "
-          f"instead of putting the whole file in one prompt.")
-    found = _audit_large_file(rel, raw, issue_block, repo_tree)
-    chunk_findings_out.extend(found)
-    lines = raw.splitlines()
-    head, tail = "\n".join(lines[:15]), "\n".join(lines[-15:])
-    return (f"(large file — {line_count} lines; chunk-audited automatically "
-            f"instead of being scanned in one prompt — {len(found)} finding(s) "
-            f"from that audit are listed in '## Chunk audit findings' below)\n\n"
-            f"First 15 lines:\n{head}\n...\nLast 15 lines:\n{tail}")
 
 
 # ── 🔥 HARDENED AI INVESTIGATION PROMPT ──────────────────────────────────────
@@ -863,14 +776,20 @@ def _load_evidence_for_file(rel: str, issue_block: str, repo_tree: str,
 INVESTIGATE_SCHEMA = {
     "type": "object",
     "properties": {
-        "analysis":        {"type": "string"},
+        # ORDER MATTERS: llama.cpp emits keys in this declared order under a
+        # grammar-constrained `format`. Decision fields go FIRST so a slow /
+        # truncated generation still yields status + confidence + findings.
+        # The verbose `analysis` prose goes LAST and is optional — it must
+        # never be the thing that eats the token/time budget before the
+        # decision is emitted (that is exactly what escalated a correct
+        # diagnosis as "0 issues found").
         "status":          {"type": "string"},
-        "requested_files": {"type": "array", "items": {"type": "string"}},
+        "confidence":      {"type": "number"},
         "root_cause":      {"type": "string"},
         "solution":        {"type": "string"},
-        "confidence":      {"type": "number"},
-        "commit_message":  {"type": "string"},
         "all_issues_found": {"type": "boolean"},
+        "commit_message":  {"type": "string"},
+        "requested_files": {"type": "array", "items": {"type": "string"}},
         "findings": {"type": "array", "items": {
             "type": "object",
             "properties": {
@@ -879,8 +798,9 @@ INVESTIGATE_SCHEMA = {
                 "solution":   {"type": "string"},
             },
             "required": ["issue", "root_cause"]}},
+        "analysis":        {"type": "string"},
     },
-    "required": ["status", "analysis", "confidence"],
+    "required": ["status", "confidence"],
 }
 
 INVESTIGATE_SYSTEM = """\
@@ -978,12 +898,20 @@ EVERY distinct cause of the CI failure described below.
 
 Output ONLY one JSON object. No markdown fences.
 
-Schema when confirming (use for findings — include ONE ENTRY PER DISTINCT
-PROBLEM, even if multiple are in the same file):
-{"analysis":"step-by-step reasoning about what was checked and why you are confident (or not)","status":"root_cause_confirmed","root_cause":"one-sentence summary covering ALL issues found","solution":"high-level plan to fix all issues","confidence":0.9,"all_issues_found":true,"commit_message":"fix: <brief description>","findings":[{"issue":"short name","root_cause":"why this breaks the build","solution":"what to change, with exact text if possible"}]}
+**FIELD ORDER IS CRITICAL — EMIT KEYS IN EXACTLY THIS ORDER:**
+`status`, `confidence`, then `root_cause`, `findings`, and finally a SHORT
+`analysis` LAST. Put your decision (status + confidence + findings) BEFORE any
+long reasoning. Keep `analysis` to ONE sentence — it is optional context, not
+the place to think out loud. Emitting a long analysis first will get your
+response cut off before the decision is recorded.
+
+Schema when confirming (findings = ONE ENTRY PER DISTINCT PROBLEM, even if
+several are in the same file, and even across DIFFERENT files — a Dockerfile
+bug AND a workflow bug AND a source-file typo are separate entries):
+{"status":"root_cause_confirmed","confidence":0.9,"root_cause":"one-sentence summary covering ALL issues found","solution":"high-level plan to fix all issues","all_issues_found":true,"commit_message":"fix: <brief description>","findings":[{"issue":"short name","root_cause":"why this breaks the build","solution":"exact text change"}],"analysis":"one short sentence"}
 
 Schema when you need another file:
-{"analysis":"what you want to confirm and why the current evidence is insufficient","status":"need_more_info","requested_files":["exact/path/from/tree"],"confidence":0.2}
+{"status":"need_more_info","confidence":0.2,"requested_files":["exact/path/from/tree"],"analysis":"one short sentence on what you need"}
 """
 
 
@@ -1005,8 +933,7 @@ def _closest_allowed_file(requested: str, allowed_files: set) -> str:
 
 def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
                                 evidence: dict, last_turn: bool,
-                                notes: list = None, issue_block: str = "",
-                                chunk_findings: list = None) -> str:
+                                notes: list = None, issue_block: str = "") -> str:
     ev_parts, total = [], 0
     for f, c in evidence.items():
         block = f"### {f}\n```\n{c}\n```"
@@ -1026,23 +953,10 @@ def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
     issue_section = f"\n## ISSUE TO SOLVE\n{issue_block}\n" if issue_block else ""
     diff_trimmed = git_diff if len(git_diff) <= INVESTIGATION_DIFF_CHARS \
         else git_diff[:INVESTIGATION_DIFF_CHARS] + "\n...(diff truncated)"
-    chunk_section = ""
-    if chunk_findings:
-        items = "\n".join(f"- {f['issue']}: {f['root_cause']}"
-                          + (f" — fix: {f['solution']}" if f.get('solution') else "")
-                          for f in chunk_findings)
-        chunk_section = (
-            "\n## Chunk audit findings (from an automated line-by-line scan of\n"
-            "large files that were too big to inline in full above):\n"
-            f"{items}\n"
-            "These were already verified against real file content — include "
-            "EVERY one of them in your own `findings` array (you may merge "
-            "duplicates or refine the wording, but do not drop any of them).\n"
-        )
 
     def _assemble(ev_block):
         return (
-            f"{INVESTIGATE_SYSTEM}{turn_note}{issue_section}{notes_section}{chunk_section}\n"
+            f"{INVESTIGATE_SYSTEM}{turn_note}{issue_section}{notes_section}\n"
             f"## Supporting log lines:\n```\n{signal}\n```\n"
             f"## Exit code: {exit_code}\n"
             f"## Git diff:\n```\n{diff_trimmed}\n```\n"
@@ -1062,8 +976,7 @@ def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
     return prompt
 
 
-def _finalize_investigation(data: dict, forced: bool, evidence: dict,
-                            chunk_findings: list = None) -> dict:
+def _finalize_investigation(data: dict, forced: bool, evidence: dict) -> dict:
     raw_conf = data.get("confidence")
     confidence_omitted = raw_conf is None
     if confidence_omitted:
@@ -1097,17 +1010,6 @@ def _finalize_investigation(data: dict, forced: bool, evidence: dict,
                 "root_cause": (f.get("root_cause") or "").strip(),
                 "solution":   (f.get("solution") or "").strip(),
             })
-
-    # Chunk-audit findings are grounded in real file content the model never
-    # had to fit into its own context window — always keep them even if the
-    # model's own findings list forgot to restate one of them.
-    if chunk_findings:
-        seen = {f["issue"] for f in findings}
-        for cf in chunk_findings:
-            if cf["issue"] not in seen:
-                findings.append(cf)
-                seen.add(cf["issue"])
-
     if not findings:
         findings = [{"issue": data.get("root_cause") or "unknown",
                      "root_cause": data.get("root_cause") or "unknown",
@@ -1143,12 +1045,11 @@ def _finalize_investigation(data: dict, forced: bool, evidence: dict,
 def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                    issue_block: str = "", suggested_files: list = None) -> dict:
     evidence = {}
-    chunk_findings = []  # merged findings from chunk-audited large files
     preloaded = []
     for f in (suggested_files or []):
         if f in evidence:
             continue
-        content = _load_evidence_for_file(f, issue_block, repo_tree, chunk_findings)
+        content = _read_evidence_file(f)
         if content is not None:
             evidence[f] = content
             preloaded.append(f)
@@ -1162,6 +1063,8 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
     stall_count = 0
     got_any_model_response = False
     timed_out_cold = False
+    parse_failures = 0
+    turn_num_predict = 800
 
     for turn in range(1, MAX_INVESTIGATION_TURNS + 1):
         if _budget_exceeded():
@@ -1172,11 +1075,10 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                         if turn == 1 else INVESTIGATION_TIMEOUT)
         prompt = _build_investigation_prompt(signal, exit_code, repo_tree,
                                              git_diff, evidence, last_turn,
-                                             pending_notes, issue_block=issue_block,
-                                             chunk_findings=chunk_findings)
+                                             pending_notes, issue_block=issue_block)
         pending_notes = []
         try:
-            raw = _stream_ollama(prompt, INVESTIGATE_SCHEMA, num_predict=INVESTIGATE_NUM_PREDICT,
+            raw = _stream_ollama(prompt, INVESTIGATE_SCHEMA, num_predict=turn_num_predict,
                                  temperature=0.05, tag=f"INVESTIGATE-T{turn}",
                                  timeout=turn_timeout, retries=INVESTIGATION_RETRIES)
         except Exception as exc:
@@ -1189,9 +1091,9 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                 print("[INVESTIGATE] first turn timed out — retrying with lean prompt.")
                 lean_prompt = _build_investigation_prompt(
                     "(omitted)", exit_code, repo_tree, "(omitted)", evidence,
-                    last_turn, None, issue_block=issue_block, chunk_findings=chunk_findings)
+                    last_turn, None, issue_block=issue_block)
                 try:
-                    raw = _stream_ollama(lean_prompt, INVESTIGATE_SCHEMA, num_predict=INVESTIGATE_NUM_PREDICT,
+                    raw = _stream_ollama(lean_prompt, INVESTIGATE_SCHEMA, num_predict=800,
                                          temperature=0.05, tag="INVESTIGATE-T1-LEAN",
                                          timeout=INVESTIGATION_TIMEOUT + INVESTIGATION_FIRST_TURN_EXTRA,
                                          retries=INVESTIGATION_RETRIES)
@@ -1202,8 +1104,23 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                 break
 
         data = _json_from(raw) or {}
-        if data:
+        if raw:
             got_any_model_response = True
+        if not data:
+            parse_failures += 1
+            print(f"[INVESTIGATE] turn {turn}: model produced {len(raw)} chars "
+                  f"but NOT valid JSON (likely truncated at the token cap).")
+            log.append({"turn": turn, "status": "unparseable",
+                        "analysis": raw[:200]})
+            if last_turn or parse_failures >= 2:
+                break
+            pending_notes.append(
+                "Your previous response was NOT valid JSON — it appears to have "
+                "been cut off before completion. Respond again with ONLY the "
+                "JSON object. Keep 'analysis' to at most 2 short sentences and "
+                "each finding brief so the output fits.")
+            turn_num_predict = 1500  # give the retry more room to finish
+            continue
         status = data.get("status", "")
         analysis = data.get("analysis", "")
         print(f"[INVESTIGATE] turn {turn}: status={status} | "
@@ -1217,7 +1134,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
         log.append({"turn": turn, "status": status, "analysis": analysis[:200]})
 
         if status == "root_cause_confirmed":
-            result = _finalize_investigation(data, False, evidence, chunk_findings)
+            result = _finalize_investigation(data, False, evidence)
             break
 
         if status == "need_more_info":
@@ -1242,7 +1159,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                     dead_ends.add(f)
                     pending_notes.append(f"'{f}' does not exist — do NOT request it again.")
             for f in to_read:
-                content = _load_evidence_for_file(f, issue_block, repo_tree, chunk_findings)
+                content = _read_evidence_file(f)
                 evidence[f] = content if content is not None else "(could not read)"
                 print(f"[INVESTIGATE]   + read {f} ({len(evidence[f])} chars)")
 
@@ -1254,14 +1171,14 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                 if stall_count >= 2 and not last_turn:
                     print("[INVESTIGATE] no new evidence for 2 turns — forcing final decision.")
                 if _budget_exceeded():
-                    result = _finalize_investigation(data, True, evidence, chunk_findings)
+                    result = _finalize_investigation(data, True, evidence)
                     break
                 final_prompt = _build_investigation_prompt(
                     signal, exit_code, repo_tree, git_diff, evidence, True,
-                    pending_notes, issue_block=issue_block, chunk_findings=chunk_findings)
+                    pending_notes, issue_block=issue_block)
                 try:
                     raw2 = _stream_ollama(final_prompt, INVESTIGATE_SCHEMA,
-                                          num_predict=INVESTIGATE_NUM_PREDICT, temperature=0.05,
+                                          num_predict=800, temperature=0.05,
                                           tag="INVESTIGATE-FINAL",
                                           timeout=INVESTIGATION_TIMEOUT,
                                           retries=INVESTIGATION_RETRIES)
@@ -1269,28 +1186,30 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                 except Exception as exc:
                     print(f"[INVESTIGATE] final turn failed: {exc}", file=sys.stderr)
                     data2 = data
-                result = _finalize_investigation(data2, True, evidence, chunk_findings)
+                result = _finalize_investigation(data2, True, evidence)
                 break
             continue
 
         if data.get("root_cause"):
-            result = _finalize_investigation(data, True, evidence, chunk_findings)
+            result = _finalize_investigation(data, True, evidence)
         break
 
     if result is None:
         if not got_any_model_response:
             failure_mode = "infra_timeout" if timed_out_cold else "no_model_response"
             root_cause = ("model did not return any usable response (infra/latency problem)")
+        elif parse_failures:
+            failure_mode = "unparseable_output"
+            root_cause = ("model responded but its output was not valid JSON "
+                          "even after truncation repair (likely cut off "
+                          "mid-generation)")
         else:
             failure_mode = "not_converged"
             root_cause = "unknown — investigation did not converge"
-        # Even if the synthesizing call never converged, don't throw away
-        # findings the chunk audits already verified against real file
-        # content — they still show up in the escalation issue.
         result = {"root_cause": root_cause, "solution": "", "confidence": 0.0,
                   "confidence_omitted": True,
-                  "commit_message": "fix: auto-fixer change",
-                  "findings": chunk_findings or [], "failure_mode": failure_mode}
+                  "commit_message": "fix: auto-fixer change", "findings": [],
+                  "failure_mode": failure_mode}
     else:
         result["failure_mode"] = None
     result["evidence"] = evidence
@@ -1304,13 +1223,16 @@ PATCH_SCHEMA = {
     "properties": {
         "issues": {"type": "array", "items": {
             "type": "object",
+            # file → evidence → corrected first (the machine-actionable parts);
+            # the human-readable "problem" prose comes last so a truncated
+            # issue still carries a usable find/replace pair.
             "properties": {
                 "file":      {"type": "string"},
-                "problem":   {"type": "string"},
                 "evidence":  {"type": "string"},
                 "corrected": {"type": "string"},
+                "problem":   {"type": "string"},
             },
-            "required": ["file", "problem", "evidence", "corrected"]}},
+            "required": ["file", "evidence", "corrected"]}},
     },
     "required": ["issues"],
 }
@@ -1340,6 +1262,11 @@ Output ONLY one JSON object. No markdown fences.
   - "problem": one sentence
   - "evidence": EXACT text from the file contents below (short) – copy the WRONG text.
   - "corrected": same text with ONLY the bug fixed. MUST be different from "evidence".
+
+CRITICAL: "evidence" must be copied VERBATIM from the "## File contents"
+section below. NEVER use text from the error log, the root cause, or your
+own paraphrase as "evidence" — if the exact characters are not in the file
+contents shown, the patch will be rejected.
 
 Schema:
 {"issues":[{"file":"...","problem":"...","evidence":"...","corrected":"..."}]}
@@ -1493,6 +1420,34 @@ def ai_review_failure(prior_root_cause: str, prior_solution: str, new_signal: st
 
 
 # ── PAIR + LOCATE / VALIDATE / APPLY (unchanged) ──────────────────────────
+def _closest_evidence_line(ev: str, evidence: dict) -> tuple:
+    """When the model claims text exists that doesn't, find the closest line
+    that ACTUALLY exists in the provided evidence (denial-to-evidence: correct
+    a false claim with an observed fact, no diagnosis)."""
+    needle = (ev or "").strip().splitlines()
+    needle = needle[0][:200].lower() if needle else ""
+    if not needle:
+        return "", "", 0.0
+    best = ("", "", 0.0)
+    for f, c in evidence.items():
+        if not isinstance(c, str):
+            continue
+        for line in c.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            # Score both the raw line and a comment-stripped variant —
+            # trailing comments otherwise dilute the similarity ratio.
+            bare = re.sub(r"\s+#.*$", "", s).strip()
+            r = max(
+                difflib.SequenceMatcher(None, needle, s.lower()).ratio(),
+                difflib.SequenceMatcher(None, needle, bare.lower()).ratio()
+                if bare else 0.0)
+            if r > best[2]:
+                best = (f, s[:200], r)
+    return best if best[2] >= 0.4 else ("", "", 0.0)
+
+
 def issues_to_fixes(issues: list, evidence: dict) -> tuple:
     fixes_by_file, rejects = {}, []
     for n, it in enumerate(issues, 1):
@@ -1518,7 +1473,16 @@ def issues_to_fixes(issues: list, evidence: dict) -> tuple:
             rejects.append(f"issue #{n} ({file or '?'}): evidence ambiguous")
             continue
         else:
-            rejects.append(f"issue #{n} ({file or '?'}): evidence not found — rejected")
+            hint_file, hint_line, _ = _closest_evidence_line(ev, evidence)
+            if hint_file:
+                rejects.append(
+                    f"issue #{n} ({file or '?'}): your 'evidence' text does NOT "
+                    f"exist in any provided file — you may have copied it from "
+                    f"the error log or invented it. The closest text that "
+                    f"ACTUALLY exists is in '{hint_file}': `{hint_line}`. "
+                    f"Copy the real file text exactly.")
+            else:
+                rejects.append(f"issue #{n} ({file or '?'}): evidence not found — rejected")
             continue
 
         entry = fixes_by_file.setdefault(
@@ -1599,15 +1563,17 @@ def _resolve_content(fix: dict) -> tuple:
     return None, "no 'edits' or 'fixed_content'"
 
 
-def _any_reference_missing(content: str, file: str) -> str:
+def _missing_ref_map(content: str, file: str) -> dict:
+    """Map of token -> problem message for repo-file references that don't
+    exist. Pure observation; blocking decisions happen in _compare_ref_problems."""
+    problems = {}
     if not content:
-        return ""
+        return problems
     all_repo = [_relstrip(str(p)) for p in Path(".").rglob("*")
                 if p.is_file() and not any(d in SKIP_DIRS for d in p.parts)]
     all_repo_set = set(all_repo)
     parent_dir = Path(file).parent
 
-    problems = []
     seen_tokens = set()
     for m in REPO_REF_EXT_PATTERN.finditer(content):
         token = m.group(1)
@@ -1619,20 +1585,44 @@ def _any_reference_missing(content: str, file: str) -> str:
         candidates = {token, _relstrip(str(parent_dir / token))}
         if any(c in all_repo_set or Path(c).is_file() for c in candidates):
             continue
-        problems.append(f"patched file still references missing '{token}'")
-    # Report EVERY missing reference so a retry can fix them all at once
-    # instead of discovering them one rejection at a time.
-    return "; ".join(problems)
+        problems[token] = f"references missing '{token}'"
+    return problems
 
 
-def _dockerfile_still_broken(file: str, content: str) -> str:
-    if "dockerfile" not in Path(file).name.lower():
-        return ""
+def _compare_ref_problems(old_map: dict, new_map: dict, label: str) -> str:
+    """Error-driven verdict on a patched file's reference problems:
+      - problems INTRODUCED by the patch  -> always reject (regression)
+      - pre-existing problems the FAILURE EVIDENCE mentions -> reject
+        (the patch was supposed to fix exactly this)
+      - pre-existing problems unrelated to the error -> note only; the next
+        CI run is the judge of whether they matter."""
+    introduced = {k: v for k, v in new_map.items() if k not in old_map}
+    if introduced:
+        return (f"{label}: patch INTRODUCES new problem(s): "
+                + "; ".join(introduced.values()))
+    ctx = CURRENT_FAILURE_CONTEXT.lower()
+    persisting = {k: v for k, v in new_map.items() if k in old_map}
+    blocking = {k: v for k, v in persisting.items() if k.lower() in ctx}
+    if blocking:
+        return (f"{label}: the failure evidence mentions these and the patch "
+                f"leaves them broken: " + "; ".join(blocking.values()))
+    if persisting:
+        print(f"[VALIDATE] note ({label}): pre-existing issues NOT mentioned "
+              f"in the failure evidence — left for a future run to judge: "
+              + "; ".join(persisting.values()))
+    return ""
+
+
+def _dockerfile_problem_map(file: str, content: str) -> dict:
+    """Map of key -> problem message for Dockerfile references/tags. Pure
+    observation; blocking decisions happen in _compare_ref_problems."""
+    problems = {}
+    if "dockerfile" not in Path(file).name.lower() or not content:
+        return problems
     all_repo = [_relstrip(str(p)) for p in Path(".").rglob("*")
                 if p.is_file() and not any(d in SKIP_DIRS for d in p.parts)]
     all_repo_set = set(all_repo)
     docker_dir = Path(file).parent
-    problems = []
     for pat, label in DOCKERFILE_REF_PATTERNS:
         for m in pat.finditer(content):
             ref = m.group(1).strip().strip("'\"")
@@ -1642,7 +1632,7 @@ def _dockerfile_still_broken(file: str, content: str) -> str:
             candidates = {ref_clean, _relstrip(str(docker_dir / ref_clean))}
             if any(Path(c).is_file() or c in all_repo_set for c in candidates):
                 continue
-            problems.append(f"{label} still references missing '{ref}' after the patch")
+            problems[ref_clean] = f"{label} references missing '{ref}'"
     for m in DOCKERFILE_FROM_PYTHON.finditer(content):
         version = m.group(2)
         base = version.split("-", 1)[0]
@@ -1651,10 +1641,9 @@ def _dockerfile_still_broken(file: str, content: str) -> str:
             continue
         major, minor = int(vm.group(1)), int(vm.group(2))
         if not (major == 3 and minor in VALID_PYTHON_MINORS):
-            problems.append(f"base image still 'python:{version}' — not a real CPython release")
-    # Report EVERY remaining problem in one rejection so the retry prompt
-    # contains the complete picture, not just the first hit.
-    return "; ".join(dict.fromkeys(problems))
+            problems[f"python:{version}"] = (
+                f"base image 'python:{version}' — not a real CPython release")
+    return problems
 
 
 def _yaml_structure_signature(node):
@@ -1787,11 +1776,17 @@ def validate_fix(fix: dict) -> tuple:
         except json.JSONDecodeError as e:
             return False, f"JSON error: {e}"
 
-    docker_reason = _dockerfile_still_broken(file, content)
+    docker_reason = _compare_ref_problems(
+        _dockerfile_problem_map(file, original_text),
+        _dockerfile_problem_map(file, content),
+        "dockerfile check")
     if docker_reason:
-        return False, f"safe patch verification failed: {docker_reason}"
+        return False, docker_reason
 
-    ref_reason = _any_reference_missing(content, file)
+    ref_reason = _compare_ref_problems(
+        _missing_ref_map(original_text, file),
+        _missing_ref_map(content, file),
+        "reference check")
     if ref_reason:
         return False, ref_reason
 
@@ -1908,6 +1903,70 @@ def last_commit_was_bot() -> bool:
             return True
     except Exception:
         pass
+    return False
+
+
+def detect_failed_branch() -> str:
+    """Branch whose CI run failed. Checked in priority order — all generic."""
+    for var in ("FAILED_BRANCH", "GITHUB_HEAD_REF"):
+        v = os.environ.get(var, "").strip()
+        if v:
+            return v
+    ref = os.environ.get("GITHUB_REF", "")
+    if ref.startswith("refs/heads/"):
+        return ref[len("refs/heads/"):]
+    try:
+        b = _git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        return "" if b == "HEAD" else b
+    except Exception:
+        return ""
+
+
+def commit_to_existing_branch(commit_msg: str, written: list, branch: str) -> str:
+    """Chain mode: push a follow-up fix commit to the bot's own open fix branch
+    so its existing PR accumulates fixes until CI is green."""
+    try:
+        _git("config", "user.name", BOT_NAME)
+        _git("config", "user.email", BOT_EMAIL)
+        _git("fetch", "origin", branch, check=False)
+        if _git("rev-parse", "--verify", branch, check=False).returncode != 0:
+            _git("checkout", "-b", branch, f"origin/{branch}")
+        else:
+            _git("checkout", branch)
+            _git("pull", "origin", branch, check=False)
+        if written:
+            _git("add", "--", *written)
+        else:
+            _git("add", "-u")
+        if _git("diff", "--cached", "--quiet", check=False).returncode == 0:
+            print("[COMMIT] Nothing to commit on existing fix branch.")
+            return ""
+        _git("commit", "-m", commit_msg)
+        _git("push", "origin", branch)
+        print(f"[GIT] Pushed follow-up fix to existing {branch}")
+        return branch
+    except subprocess.CalledProcessError as exc:
+        print(f"[GIT] {exc.stderr.strip()}", file=sys.stderr)
+        return ""
+
+
+def comment_on_bot_pr(token, repo, branch, body) -> bool:
+    """Post the follow-up fix summary on the PR whose head is `branch`."""
+    try:
+        owner = repo.split("/")[0]
+        r = requests.get(f"https://api.github.com/repos/{repo}/pulls"
+                         f"?state=open&head={owner}:{branch}",
+                         headers=_gh(token), timeout=15)
+        if r.status_code != 200 or not r.json():
+            return False
+        number = r.json()[0]["number"]
+        r2 = requests.post(f"https://api.github.com/repos/{repo}/issues/{number}/comments",
+                           json={"body": body}, headers=_gh(token), timeout=15)
+        if r2.status_code in (200, 201):
+            print(f"[PR] follow-up comment posted on PR #{number}")
+            return True
+    except Exception as exc:
+        print(f"[PR] comment failed: {exc}", file=sys.stderr)
     return False
 
 
@@ -2064,19 +2123,34 @@ def main():
         print(f"[ERROR] Log not found: {args.input}", file=sys.stderr)
         sys.exit(1)
 
-    # loop guards
-    if last_commit_was_bot():
-        sys.exit(0)
-    if count_recent_bot_commits() >= MAX_BOT_ATTEMPTS:
-        print("[GUARD] Too many bot attempts — escalating.")
-        if token and repo:
-            open_issue(token, repo, "Auto-fixer attempted too many fixes without success.", run_url)
-        sys.exit(0)
-    if token and repo:
-        url = pending_bot_pr(token, repo)
-        if url:
-            print(f"[GUARD] A fix PR is already open: {url} — skipping model call.")
+    # loop guards / chain mode
+    failed_branch = detect_failed_branch()
+    chain_mode = failed_branch.startswith("fix/")
+    if chain_mode:
+        print(f"[CHAIN] failure occurred on bot branch '{failed_branch}' — "
+              f"the new error will be fixed on the SAME branch so its open PR "
+              f"accumulates fixes until CI is green.")
+        if count_recent_bot_commits() >= MAX_BOT_ATTEMPTS:
+            print("[GUARD] Too many chained bot attempts on this branch — escalating.")
+            if token and repo:
+                open_issue(token, repo,
+                           f"Auto-fixer made {MAX_BOT_ATTEMPTS} chained fix attempts on "
+                           f"`{failed_branch}` and CI still fails — manual review needed.",
+                           run_url)
             sys.exit(0)
+    else:
+        if last_commit_was_bot():
+            sys.exit(0)
+        if count_recent_bot_commits() >= MAX_BOT_ATTEMPTS:
+            print("[GUARD] Too many bot attempts — escalating.")
+            if token and repo:
+                open_issue(token, repo, "Auto-fixer attempted too many fixes without success.", run_url)
+            sys.exit(0)
+        if token and repo:
+            url = pending_bot_pr(token, repo)
+            if url:
+                print(f"[GUARD] A fix PR is already open: {url} — skipping model call.")
+                sys.exit(0)
 
     # ── COLLECT INITIAL INVESTIGATION EVIDENCE ──
     print("\n━━━ COLLECT INITIAL INVESTIGATION EVIDENCE ━━━")
@@ -2096,6 +2170,11 @@ def main():
 
     focused = extract_focused_failure(log_text)
     issue_block = format_focused_issue(focused, exit_code)
+
+    # Validation scoping: the error evidence itself (never model output)
+    # decides which pre-existing problems a patch MUST fix.
+    global CURRENT_FAILURE_CONTEXT
+    CURRENT_FAILURE_CONTEXT = issue_block + "\n" + signal
 
     supporting_signal = trim_supporting_signal(signal, focused)
     print(f"[EVIDENCE] Focused issue: {(focused.get('primary_message') or '(none)')[:160]}")
@@ -2148,14 +2227,22 @@ def main():
             print(f"       fix:   {fnd['solution']}")
 
     failure_mode = investigation.get("failure_mode")
-    if failure_mode in ("infra_timeout", "no_model_response"):
-        print(f"[GATE] Investigation produced no model response ({failure_mode}) — escalating.")
+    if failure_mode in ("infra_timeout", "no_model_response", "unparseable_output"):
+        print(f"[GATE] Investigation produced no usable model output ({failure_mode}) — escalating.")
         if token and repo:
+            mode_detail = {
+                "infra_timeout":      "The investigation call(s) to Ollama timed out "
+                                      "before the model produced any output.",
+                "no_model_response":  "The model returned nothing usable.",
+                "unparseable_output": "The model responded, but its output was not "
+                                      "valid JSON even after truncation repair — "
+                                      "likely cut off mid-generation. Consider "
+                                      "raising the token cap or using a stronger model.",
+            }.get(failure_mode, "")
             open_issue(token, repo,
-                       f"Auto-fixer could not run the model in time ({failure_mode}). "
-                       f"The investigation call(s) to Ollama timed out before the model "
-                       f"produced any output.\n\n"
-                       f"**Issue Python identified (unused — model never ran):**\n"
+                       f"Auto-fixer could not get a usable diagnosis "
+                       f"({failure_mode}). {mode_detail}\n\n"
+                       f"**Issue Python identified (unused — no usable diagnosis):**\n"
                        f"```\n{issue_block[:1200]}\n```",
                        run_url)
         sys.exit(0)
@@ -2189,6 +2276,14 @@ def main():
     retry_issue_block = ""
     rejection_history = []  # accumulated across rounds so the model never
                             # regresses on an already-reported problem
+    rejected_fingerprints = set()  # byte-level identity of rejected issue-sets
+    last_patch_duration = 0.0
+
+    def _issues_fingerprint(iss):
+        return repr(sorted(
+            ((it.get("file") or ""), (it.get("evidence") or ""),
+             (it.get("corrected") or ""))
+            for it in iss if isinstance(it, dict)))
 
     for repair_round in range(1, MAX_REPAIR_ROUNDS + 1):
         if _budget_exceeded():
@@ -2200,25 +2295,55 @@ def main():
             sys.exit(5)
 
         print(f"\n━━━ AI PATCH GENERATION AGENT (round {repair_round}/{MAX_REPAIR_ROUNDS}) ━━━")
+        remaining = TOTAL_TIME_BUDGET - _elapsed()
+        if repair_round > 1 and remaining < max(60, last_patch_duration * 1.2 + 20):
+            print(f"[BUDGET] {remaining:.0f}s left but the last patch round took "
+                  f"{last_patch_duration:.0f}s — another round can't fit.")
+            if token and repo:
+                open_issue(token, repo,
+                           f"Auto-fixer ran out of budget mid-repair "
+                           f"({remaining:.0f}s left, rounds take ~{last_patch_duration:.0f}s). "
+                           f"Root cause: {root_cause}\n\nRejections so far:\n"
+                           + "\n".join(f"- {r}" for r in rejection_history), run_url)
+            sys.exit(5)
         active_issue_block = retry_issue_block or issue_block
+        _patch_t0 = time.time()
         try:
             issues = ai_generate_patch(patch_root_cause, solution, evidence,
                                        retry_note, active_issue_block)
         except Exception as exc:
+            last_patch_duration = time.time() - _patch_t0
             print(f"[ERROR] patch generation failed: {exc}", file=sys.stderr)
             if repair_round == MAX_REPAIR_ROUNDS:
                 if token and repo:
                     open_issue(token, repo, f"AI patch generation failed: {exc}", run_url)
                 sys.exit(2)
             continue
+        last_patch_duration = time.time() - _patch_t0
 
         print(f"  issues reported: {len(issues)}")
         for n, it in enumerate(issues, 1):
             print(f"    {n}. {it.get('file','?')}: {it.get('problem','')[:80]}")
 
+        fp = _issues_fingerprint(issues)
+        if fp in rejected_fingerprints:
+            print("[REPAIR] model repeated a previously rejected patch "
+                  "verbatim — no progress possible, escalating.",
+                  file=sys.stderr)
+            if token and repo:
+                open_issue(token, repo,
+                           f"Auto-fixer stalled: the model kept producing the "
+                           f"same rejected patch. Root cause: {root_cause}\n\n"
+                           f"Rejections:\n"
+                           + "\n".join(f"- {r}" for r in rejection_history),
+                           run_url)
+            sys.exit(3)
+        rejected_fingerprints.add(fp)
+
         fixes, pair_rejects = issues_to_fixes(issues, evidence)
         for rej in pair_rejects:
             print(f"  ✗ {rej}", file=sys.stderr)
+
         if not fixes:
             detail = "; ".join(pair_rejects) or "model reported no locatable issues"
             print(f"[ERROR] no usable fixes this round. {detail}", file=sys.stderr)
@@ -2278,6 +2403,7 @@ def main():
         retry_issue_block = format_focused_issue(retry_focused, "n/a (post-fix test/build run)")
         new_signal = extract_error_signal(combined_output) or combined_output[-1500:]
         new_signal = trim_supporting_signal(new_signal, retry_focused)
+        CURRENT_FAILURE_CONTEXT += "\n" + retry_issue_block + "\n" + new_signal
         revert_files(originals)
         written = []
 
@@ -2307,14 +2433,30 @@ def main():
         sys.exit(5)
 
     print("\n━━━ COMMIT + PR ━━━")
-    branch = commit_to_branch(commit_msg, written)
-    if not branch:
-        sys.exit(4)
-    if token and repo:
-        open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
-                investigation_log, list(evidence.keys()), solution, findings)
+    if chain_mode:
+        branch = commit_to_existing_branch(commit_msg, written, failed_branch)
+        if not branch:
+            sys.exit(4)
+        if token and repo:
+            findings_md = "".join(
+                f"\n{i+1}. **{f['issue']}** — {f.get('root_cause','')}"
+                for i, f in enumerate(findings))
+            comment_on_bot_pr(
+                token, repo, branch,
+                f"## 🤖 Follow-up auto-fix\n\n"
+                f"CI on this branch failed with a new error; fixed it in the "
+                f"latest commit.\n\n**Root cause:** {root_cause}\n"
+                f"**Files changed:** {', '.join(f'`{f}`' for f in written)}\n"
+                f"{('**Issues:**' + findings_md) if findings_md else ''}")
     else:
-        print(f"[PR] No token — merge {branch} manually.")
+        branch = commit_to_branch(commit_msg, written)
+        if not branch:
+            sys.exit(4)
+        if token and repo:
+            open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
+                    investigation_log, list(evidence.keys()), solution, findings)
+        else:
+            print(f"[PR] No token — merge {branch} manually.")
 
     print("\n━━━ ✅ DONE ━━━")
     print(f"  root cause : {root_cause}")
