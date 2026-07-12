@@ -664,6 +664,51 @@ def warm_up_model() -> bool:
         return False
 
 
+def _close_truncated_json(text: str):
+    """Generic repair for JSON cut off mid-generation (num_predict cap):
+    close any open string, strip a trailing incomplete token, and close all
+    open brackets. Falls back to backtracking to the last complete value."""
+    def _close(t: str) -> str:
+        stack, in_str, esc = [], False, False
+        for ch in t:
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch in "{[":
+                    stack.append(ch)
+                elif ch in "}]":
+                    if stack:
+                        stack.pop()
+        out = t
+        if in_str:
+            out += '"'
+        out = re.sub(r",\s*$", "", out)
+        while stack:
+            out += "}" if stack.pop() == "{" else "]"
+        return out
+
+    for candidate in (text, ):
+        try:
+            return json.loads(_close(candidate))
+        except json.JSONDecodeError:
+            pass
+    # Backtrack: drop the trailing incomplete key/value and try again.
+    for cut in range(len(text) - 1, max(0, len(text) - 2000), -1):
+        if text[cut] == ",":
+            try:
+                return json.loads(_close(text[:cut]))
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
 def _json_from(raw: str):
     cleaned = re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
     try:
@@ -690,6 +735,13 @@ def _json_from(raw: str):
                 return json.loads(best + "}" * (best.count("{") - best.count("}")))
             except json.JSONDecodeError:
                 pass
+    # Last resort: the output was probably truncated mid-generation.
+    start = cleaned.find("{")
+    if start != -1:
+        repaired = _close_truncated_json(cleaned[start:])
+        if repaired is not None:
+            print("[JSON] recovered a truncated JSON object from model output.")
+            return repaired
     return None
 
 
@@ -975,6 +1027,8 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
     stall_count = 0
     got_any_model_response = False
     timed_out_cold = False
+    parse_failures = 0
+    turn_num_predict = 800
 
     for turn in range(1, MAX_INVESTIGATION_TURNS + 1):
         if _budget_exceeded():
@@ -988,7 +1042,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                                              pending_notes, issue_block=issue_block)
         pending_notes = []
         try:
-            raw = _stream_ollama(prompt, INVESTIGATE_SCHEMA, num_predict=800,
+            raw = _stream_ollama(prompt, INVESTIGATE_SCHEMA, num_predict=turn_num_predict,
                                  temperature=0.05, tag=f"INVESTIGATE-T{turn}",
                                  timeout=turn_timeout, retries=INVESTIGATION_RETRIES)
         except Exception as exc:
@@ -1014,8 +1068,23 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                 break
 
         data = _json_from(raw) or {}
-        if data:
+        if raw:
             got_any_model_response = True
+        if not data:
+            parse_failures += 1
+            print(f"[INVESTIGATE] turn {turn}: model produced {len(raw)} chars "
+                  f"but NOT valid JSON (likely truncated at the token cap).")
+            log.append({"turn": turn, "status": "unparseable",
+                        "analysis": raw[:200]})
+            if last_turn or parse_failures >= 2:
+                break
+            pending_notes.append(
+                "Your previous response was NOT valid JSON — it appears to have "
+                "been cut off before completion. Respond again with ONLY the "
+                "JSON object. Keep 'analysis' to at most 2 short sentences and "
+                "each finding brief so the output fits.")
+            turn_num_predict = 1500  # give the retry more room to finish
+            continue
         status = data.get("status", "")
         analysis = data.get("analysis", "")
         print(f"[INVESTIGATE] turn {turn}: status={status} | "
@@ -1093,6 +1162,11 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
         if not got_any_model_response:
             failure_mode = "infra_timeout" if timed_out_cold else "no_model_response"
             root_cause = ("model did not return any usable response (infra/latency problem)")
+        elif parse_failures:
+            failure_mode = "unparseable_output"
+            root_cause = ("model responded but its output was not valid JSON "
+                          "even after truncation repair (likely cut off "
+                          "mid-generation)")
         else:
             failure_mode = "not_converged"
             root_cause = "unknown — investigation did not converge"
@@ -1993,14 +2067,22 @@ def main():
             print(f"       fix:   {fnd['solution']}")
 
     failure_mode = investigation.get("failure_mode")
-    if failure_mode in ("infra_timeout", "no_model_response"):
-        print(f"[GATE] Investigation produced no model response ({failure_mode}) — escalating.")
+    if failure_mode in ("infra_timeout", "no_model_response", "unparseable_output"):
+        print(f"[GATE] Investigation produced no usable model output ({failure_mode}) — escalating.")
         if token and repo:
+            mode_detail = {
+                "infra_timeout":      "The investigation call(s) to Ollama timed out "
+                                      "before the model produced any output.",
+                "no_model_response":  "The model returned nothing usable.",
+                "unparseable_output": "The model responded, but its output was not "
+                                      "valid JSON even after truncation repair — "
+                                      "likely cut off mid-generation. Consider "
+                                      "raising the token cap or using a stronger model.",
+            }.get(failure_mode, "")
             open_issue(token, repo,
-                       f"Auto-fixer could not run the model in time ({failure_mode}). "
-                       f"The investigation call(s) to Ollama timed out before the model "
-                       f"produced any output.\n\n"
-                       f"**Issue Python identified (unused — model never ran):**\n"
+                       f"Auto-fixer could not get a usable diagnosis "
+                       f"({failure_mode}). {mode_detail}\n\n"
+                       f"**Issue Python identified (unused — no usable diagnosis):**\n"
                        f"```\n{issue_block[:1200]}\n```",
                        run_url)
         sys.exit(0)
