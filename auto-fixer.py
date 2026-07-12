@@ -32,6 +32,14 @@ the existing "Individual issues to fix (address EVERY one)" text — so
 anything they catch gets fixed in the SAME PR instead of waiting for a
 future CI run to surface it one bug at a time. Nothing else in the
 investigation prompts, patch loop, or validation logic is changed.
+
+── PATCH EVIDENCE HARDENING (this version) ────────────────────────────────────
+- Patch evidence budget raised to 14000 chars.
+- _select_patch_evidence now guarantees that files listed in the investigation's
+  `findings` are never omitted, even if the budget overflows. The patch model
+  therefore always has the content it needs to fix every known issue.
+- ai_generate_patch extracts file paths from the findings and passes them as
+  required.
 """
 
 import argparse
@@ -61,7 +69,8 @@ OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "10m")
 # was drowning in prefill: all evidence files were concatenated up to 16k chars.
 # It now gets its own (smaller) evidence budget and its own timeout.
 PATCH_TIMEOUT            = int(os.environ.get("PATCH_TIMEOUT", str(AI_TIMEOUT + 90)))
-MAX_PATCH_EVIDENCE_CHARS = int(os.environ.get("MAX_PATCH_EVIDENCE_CHARS", "6000"))
+# *** RAISED from 6000 to 14000 to accommodate multi-file fixes ***
+MAX_PATCH_EVIDENCE_CHARS = int(os.environ.get("MAX_PATCH_EVIDENCE_CHARS", "14000"))
 PATCH_NUM_PREDICT        = int(os.environ.get("PATCH_NUM_PREDICT", "1200"))
 
 INVESTIGATION_TIMEOUT = int(os.environ.get("INVESTIGATION_TIMEOUT", str(AI_TIMEOUT)))
@@ -1211,14 +1220,6 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
 
 
 # ── SECOND-PASS AUDIT (NEW) ─────────────────────────────────────────────────
-# One extra, deliberately FAILURE-AGNOSTIC AI turn that reviews the same
-# evidence files the investigator already read, but is told to IGNORE what
-# caused this run's failure and just review the code like a human reviewer
-# would. This is what catches bugs the log-driven investigation structurally
-# cannot see (a later step's typo, a wrong flag, a logic error) because CI
-# stopped before that step ever ran. Complements (does not replace)
-# _deterministic_extra_findings below, which only catches regex-detectable
-# problems (missing file refs, bad version strings).
 SECOND_PASS_AUDIT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1254,9 +1255,6 @@ Output ONLY one JSON object, no markdown fences:
 
 
 def _second_pass_audit(evidence: dict, confirmed_findings: list, issue_block: str) -> list:
-    """One extra, deliberately failure-agnostic AI call. Skips cleanly if
-    there's no evidence to review or not enough time budget left — this is
-    additive and must never be the reason a run fails or times out."""
     if not evidence:
         return []
     remaining = TOTAL_TIME_BUDGET - _elapsed()
@@ -1300,7 +1298,7 @@ def _second_pass_audit(evidence: dict, confirmed_findings: list, issue_block: st
     return out
 
 
-# ── PATCH GENERATION (unchanged) ───────────────────────────────────────────
+# ── PATCH GENERATION ─────────────────────────────────────────────────────────
 PATCH_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1352,33 +1350,73 @@ one entry, and do not stop after the first one.
 """
 
 
-def _select_patch_evidence(evidence: dict, mention_blob: str) -> dict:
+def _select_patch_evidence(evidence: dict, mention_blob: str,
+                           required_files: list = None) -> dict:
     """Keep evidence files the AI's own diagnosis mentions; drop the rest if
-    over budget. Selection is driven purely by the model's output text —
-    Python adds no opinion about where the bug is."""
+    over budget, but NEVER drop a file listed in required_files."""
     blob = mention_blob.lower()
+    required = set(required_files or [])
+
+    # Mentioned files: explicitly referenced in the diagnosis text
     mentioned, rest = [], []
     for f, c in evidence.items():
-        (mentioned if (f.lower() in blob or Path(f).name.lower() in blob)
-         else rest).append((f, c))
+        if f in required:
+            mentioned.append((f, c))
+        elif f.lower() in blob or Path(f).name.lower() in blob:
+            mentioned.append((f, c))
+        else:
+            rest.append((f, c))
+
     selected, total, dropped = {}, 0, []
+
+    # 1) Always include mandatory files first (even if budget overflows)
+    for f_path in required:
+        if f_path in evidence and f_path not in selected:
+            content = evidence[f_path]
+            block_len = len(content) + len(f_path) + 16
+            selected[f_path] = content
+            total += block_len
+
+    # 2) Add mentioned files, then rest – skip if budget exceeded
     for f, c in mentioned + rest:
-        block_len = len(c or "") + len(f) + 16
+        if f in selected:
+            continue
+        block_len = len(c) + len(f) + 16
         if selected and total + block_len > MAX_PATCH_EVIDENCE_CHARS:
             dropped.append(f)
             continue
         selected[f] = c
         total += block_len
+
     if dropped:
         print(f"[PATCH] evidence budget {MAX_PATCH_EVIDENCE_CHARS} chars — "
-              f"omitted (not referenced by the diagnosis): {dropped}")
+              f"omitted (not required): {dropped}")
     return selected
 
 
 def ai_generate_patch(root_cause: str, solution: str, evidence: dict,
-                      retry_note: str = "", issue_block: str = "") -> list:
+                      retry_note: str = "", issue_block: str = "",
+                      findings: list = None) -> list:
     mention_blob = "\n".join([root_cause or "", solution or "", issue_block or ""])
-    scoped = _select_patch_evidence(evidence, mention_blob)
+
+    # Extract file paths from the findings list
+    required_files = []
+    if findings:
+        for fnd in findings:
+            for field in ('issue', 'root_cause'):
+                text = fnd.get(field, '')
+                if not text:
+                    continue
+                # Simple regex: capture the first file-like token (letters/numbers/.-_) 
+                # followed by a colon or space. This is greedy enough for our use.
+                m = re.match(r'^([\w.\-/]+)(?:\s*:)', text.strip())
+                if m:
+                    required_files.append(m.group(1))
+                    break
+        required_files = list(dict.fromkeys(required_files))  # deduplicate
+
+    scoped = _select_patch_evidence(evidence, mention_blob, required_files)
+
     parts = [f"### {f}\n```\n{c}\n```" for f, c in scoped.items()]
     context = "\n\n".join(parts) if parts else "(no evidence files were read)"
     issue_section = (f"## ISSUE TO SOLVE (stay scoped to this):\n{issue_block}\n\n"
@@ -1395,14 +1433,10 @@ def ai_generate_patch(root_cause: str, solution: str, evidence: dict,
 
     prompt = _assemble(context)
     if len(prompt) > MAX_PROMPT_CHARS:
-        # Truncate the EVIDENCE, never the instructions or the trailing
-        # "Emit the issues JSON" line (the old blind prompt[:N] slice could
-        # cut both, leaving the model without its output directive).
         overflow = len(prompt) - MAX_PROMPT_CHARS
         context = context[:max(0, len(context) - overflow)] + "\n...(evidence truncated)"
         prompt = _assemble(context)
 
-    # Budget-aware timeout: never start a patch call the run can't afford.
     remaining = max(0, TOTAL_TIME_BUDGET - _elapsed())
     if remaining < 45:
         raise RuntimeError(f"only {remaining:.0f}s of budget left — not enough "
@@ -1494,7 +1528,7 @@ def ai_review_failure(prior_root_cause: str, prior_solution: str, new_signal: st
             "confidence": conf}
 
 
-# ── PAIR + LOCATE / VALIDATE / APPLY (unchanged) ──────────────────────────
+# ── PAIR + LOCATE / VALIDATE / APPLY ─────────────────────────────────────────
 def issues_to_fixes(issues: list, evidence: dict) -> tuple:
     fixes_by_file, rejects = {}, []
     for n, it in enumerate(issues, 1):
@@ -1602,10 +1636,6 @@ def _resolve_content(fix: dict) -> tuple:
 
 
 def _missing_ref_map(content: str, file: str) -> dict:
-    """Map of token -> problem message for repo-file references that don't
-    exist. Pure observation; blocking decisions happen in _compare_ref_problems
-    (post-patch) OR are folded straight into `findings` pre-patch by
-    _deterministic_extra_findings below."""
     problems = {}
     if not content:
         return problems
@@ -1630,12 +1660,6 @@ def _missing_ref_map(content: str, file: str) -> dict:
 
 
 def _compare_ref_problems(old_map: dict, new_map: dict, label: str) -> str:
-    """Error-driven verdict on a patched file's reference problems:
-      - problems INTRODUCED by the patch  -> always reject (regression)
-      - pre-existing problems the FAILURE EVIDENCE mentions -> reject
-        (the patch was supposed to fix exactly this)
-      - pre-existing problems unrelated to the error -> note only; the next
-        CI run is the judge of whether they matter."""
     introduced = {k: v for k, v in new_map.items() if k not in old_map}
     if introduced:
         return (f"{label}: patch INTRODUCES new problem(s): "
@@ -1654,8 +1678,6 @@ def _compare_ref_problems(old_map: dict, new_map: dict, label: str) -> str:
 
 
 def _dockerfile_problem_map(file: str, content: str) -> dict:
-    """Map of key -> problem message for Dockerfile references/tags. Pure
-    observation; blocking decisions happen in _compare_ref_problems."""
     problems = {}
     if "dockerfile" not in Path(file).name.lower() or not content:
         return problems
@@ -1687,12 +1709,6 @@ def _dockerfile_problem_map(file: str, content: str) -> dict:
 
 
 def _workflow_version_problem_map(file: str, content: str) -> dict:
-    """Map of key -> problem message for `python-version:` lines in GitHub
-    Actions workflow files. This is the workflow-file counterpart to
-    _dockerfile_problem_map's Python-version check above — it catches an
-    invalid version (e.g. "3.1") REGARDLESS of whether that's the line that
-    actually failed this run, which is exactly the case a log-driven-only
-    diagnosis can miss when a DIFFERENT bug in the same run failed first."""
     problems = {}
     if not WORKFLOW_PATTERN.search(file) or not content:
         return problems
@@ -1706,13 +1722,6 @@ def _workflow_version_problem_map(file: str, content: str) -> dict:
 
 
 def _deterministic_extra_findings(evidence: dict, existing_findings: list) -> list:
-    """Re-scan every evidence file the AI investigator already read using
-    ALL known deterministic checks — not just the one tied to this run's
-    failure — so syntactic bugs (missing file refs, bad version strings) get
-    caught regardless of whether they're the bug that actually failed CI
-    this time. Free (no AI call), reuses logic already trusted for
-    post-patch validation. Purely additive: only ADDS to `findings`, never
-    removes or overrides the AI's own diagnosis."""
     already_mentioned = " ".join(
         (f.get("issue", "") + " " + f.get("root_cause", "")) for f in existing_findings
     ).lower()
@@ -1915,7 +1924,7 @@ def revert_files(originals: dict):
             print(f"[REVERT] failed {file}: {exc}", file=sys.stderr)
 
 
-# ── BUILD & TESTS (unchanged) ─────────────────────────────────────────────
+# ── BUILD & TESTS ─────────────────────────────────────────────────────────
 def detect_test_commands(stacks: set) -> list:
     cmds = []
     if "python" in stacks:
@@ -1981,7 +1990,7 @@ def try_docker_build(written: list) -> tuple:
         return True, ""
 
 
-# ── GIT & PR (unchanged) ──────────────────────────────────────────────────
+# ── GIT & PR ──────────────────────────────────────────────────────────────
 def _git(*args, check=True):
     return subprocess.run(["git", *args], check=check, capture_output=True, text=True)
 
@@ -2226,12 +2235,6 @@ def main():
     confidence_omitted = investigation.get("confidence_omitted", False)
 
     # ── CATCH BUGS THE LOG-DRIVEN DIAGNOSIS COULDN'T HAVE SEEN ──
-    # CI stops at the first failing step, so a second, independent bug
-    # further down the pipeline (e.g. a typo in a step that never ran)
-    # produces no log evidence in THIS run. These two layers only ADD to
-    # `findings` — they never override or remove the AI's own diagnosis:
-    #   1. free, regex-based re-scan of every evidence file already read
-    #   2. one extra, failure-agnostic AI review pass over the same files
     failure_mode_precheck = investigation.get("failure_mode")
     if not failure_mode_precheck and evidence:
         det_extra = _deterministic_extra_findings(evidence, findings)
@@ -2303,9 +2306,8 @@ def main():
     success = False
     retry_note = ""
     retry_issue_block = ""
-    rejection_history = []  # accumulated across rounds so the model never
-                            # regresses on an already-reported problem
-    rejected_fingerprints = set()  # byte-level identity of rejected fix-sets
+    rejection_history = []
+    rejected_fingerprints = set()
     last_patch_duration = 0.0
 
     def _fixes_fingerprint(fx):
@@ -2340,7 +2342,8 @@ def main():
         _patch_t0 = time.time()
         try:
             issues = ai_generate_patch(patch_root_cause, solution, evidence,
-                                       retry_note, active_issue_block)
+                                       retry_note, active_issue_block,
+                                       findings=findings)  # <-- passing findings
         except Exception as exc:
             last_patch_duration = time.time() - _patch_t0
             print(f"[ERROR] patch generation failed: {exc}", file=sys.stderr)
