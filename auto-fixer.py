@@ -92,16 +92,25 @@ RETRY_BACKOFF  = [20, 20]
 # fine and swapping, which is far worse for latency than the model itself
 # being smaller. If you move to a bigger/dedicated box, raise this via env.
 OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
+# Keep the model resident between calls. Without this, an idle gap between
+# stages lets Ollama evict the 3B, and the NEXT call silently pays the
+# "reload 3B into 8GB RAM" cost inside its own read-timeout window — which
+# is exactly how an investigation call blows 150s having generated nothing.
+OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "10m")
 
-# Investigation turns get their OWN, tighter timeout/retry budget. The turn
-# loop already has its own recovery logic (fuzzy-match, stall detection,
-# forced final turn) — a stuck low-level HTTP call doesn't need its own
-# multi-attempt retry loop stacked on top of that, it just needs to fail
-# fast so the turn loop can move on. This is what actually keeps a run from
-# needing to be manually cancelled: worst case per turn is bounded tightly,
-# not AI_TIMEOUT × MAX_RETRIES.
-INVESTIGATION_TIMEOUT = int(os.environ.get("INVESTIGATION_TIMEOUT", "150"))
+# Investigation turns are the calls that MUST succeed — if investigation
+# never returns, there's nothing to patch and the run escalates. So they get
+# the SAME budget we've proven 3B needs on this box (AI_TIMEOUT, ~210s), not
+# less. An earlier version capped these at 150s "to fail fast", but on a cold
+# or contended box 150s isn't enough for prefill+generation, so the must-win
+# call was the one most likely to time out. Fail-fast is the wrong instinct
+# for the one call the whole run depends on.
+INVESTIGATION_TIMEOUT = int(os.environ.get("INVESTIGATION_TIMEOUT", str(AI_TIMEOUT)))
 INVESTIGATION_RETRIES = int(os.environ.get("INVESTIGATION_RETRIES", "1"))
+# The FIRST timed investigation call also absorbs any residual model-load /
+# page-in cost that warm-up didn't fully cover, so give turn 1 extra headroom
+# on top of the per-turn timeout. Later turns are warm and don't need it.
+INVESTIGATION_FIRST_TURN_EXTRA = int(os.environ.get("INVESTIGATION_FIRST_TURN_EXTRA", "60"))
 
 # Hard ceiling on the whole run's AI-calling wall-clock time. Checked at
 # every major stage boundary (each investigation turn, each repair round);
@@ -552,7 +561,8 @@ def _stream_ollama(prompt, schema=None, num_predict=2000, temperature=0.05,
     else:
         payload = {"model": OLLAMA_MODEL, "prompt": prompt,
                    "options": {"temperature": temperature, "num_predict": num_predict,
-                               "num_ctx": num_ctx}, "stream": True}
+                               "num_ctx": num_ctx},
+                   "keep_alive": OLLAMA_KEEP_ALIVE, "stream": True}
         if schema:
             payload["format"] = schema
     print(f"[{tag}] {endpoint} ({fmt}) | prompt {len(prompt)} chars | model {OLLAMA_MODEL}")
@@ -581,15 +591,60 @@ def _stream_ollama(prompt, schema=None, num_predict=2000, temperature=0.05,
             return raw
         except requests.exceptions.Timeout as exc:
             last = exc
-            wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF)-1)]
-            print(f"[{tag}] timeout; waiting {wait}s...")
             if attempt < retries - 1:
+                wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF)-1)]
+                print(f"[{tag}] timeout after {timeout}s; retrying in {wait}s "
+                      f"(attempt {attempt+1}/{retries})...")
                 time.sleep(wait)
+            else:
+                print(f"[{tag}] timeout after {timeout}s (no retries left).")
         except requests.exceptions.ConnectionError as exc:
             raise RuntimeError(f"Cannot connect to Ollama at {endpoint}: {exc}")
         except requests.exceptions.RequestException as exc:
             raise RuntimeError(f"Ollama request failed: {exc}")
     raise RuntimeError(f"Ollama did not respond after {retries} attempts: {last}")
+
+
+def warm_up_model() -> bool:
+    """Force the model resident BEFORE the first timed investigation call, so
+    the cost of loading 3B into RAM is paid here — outside any call whose
+    read-timeout the whole run depends on — instead of silently eating the
+    investigation call's budget on a cold/contended box.
+
+    This is the single most effective fix for 'investigation timed out having
+    produced nothing': that failure is almost always the first real call
+    paying load cost it didn't budget for. We give warm-up its own generous
+    timeout, no schema (grammar-constrained decode is slower and we don't
+    need structure here), and a 1-token generation. Failure is non-fatal —
+    if warm-up itself times out the box is genuinely overloaded and the real
+    call will surface that honestly; we just log and continue."""
+    endpoint, fmt = _detect_endpoint()
+    warm_timeout = int(os.environ.get("OLLAMA_WARMUP_TIMEOUT", "240"))
+    print(f"[WARMUP] pinging {OLLAMA_MODEL} to load it into memory "
+          f"(timeout {warm_timeout}s) — keeps the first real call from paying "
+          f"cold-load cost inside its own budget...")
+    t0 = time.time()
+    try:
+        if fmt == "openai":
+            payload = {"model": OLLAMA_MODEL, "prompt": "ok", "max_tokens": 1,
+                       "stream": False}
+        else:
+            payload = {"model": OLLAMA_MODEL, "prompt": "ok",
+                       "options": {"num_predict": 1, "num_ctx": OLLAMA_NUM_CTX},
+                       "keep_alive": OLLAMA_KEEP_ALIVE, "stream": False}
+        resp = requests.post(endpoint, json=payload, timeout=(10, warm_timeout))
+        resp.raise_for_status()
+        print(f"[WARMUP] model resident in {time.time()-t0:.1f}s — "
+              f"held for {OLLAMA_KEEP_ALIVE}.")
+        return True
+    except requests.exceptions.Timeout:
+        print(f"[WARMUP] warm-up itself timed out after {warm_timeout}s — the "
+              f"box may be overloaded right now; continuing anyway.", file=sys.stderr)
+        return False
+    except Exception as exc:
+        print(f"[WARMUP] warm-up call failed ({exc}) — continuing anyway.",
+              file=sys.stderr)
+        return False
 
 
 def _json_from(raw: str):
@@ -922,6 +977,8 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
     dead_ends = set()       # requests with no usable match — no point re-suggesting
     pending_notes = []      # fed into the next prompt
     stall_count = 0
+    got_any_model_response = False   # did the model EVER return parseable output?
+    timed_out_cold = False           # did we fail specifically on a read timeout?
 
     effective_turns = MAX_TURNS_WITH_HINT if hint_text else MAX_INVESTIGATION_TURNS
     if hint_text:
@@ -935,19 +992,55 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                   f"before turn {turn} — stopping instead of starting another slow call.")
             break
         last_turn = (turn == effective_turns)
+        # Turn 1 absorbs any residual load/page-in that warm-up didn't cover,
+        # so give it extra headroom; later turns are warm.
+        turn_timeout = (INVESTIGATION_TIMEOUT + INVESTIGATION_FIRST_TURN_EXTRA
+                        if turn == 1 else INVESTIGATION_TIMEOUT)
         prompt = _build_investigation_prompt(signal, exit_code, repo_tree,
                                              git_diff, evidence, last_turn,
                                              pending_notes, hint_text, issue_block)
         pending_notes = []
         try:
-            raw = _stream_ollama(prompt, INVESTIGATE_SCHEMA, num_predict=900,
+            raw = _stream_ollama(prompt, INVESTIGATE_SCHEMA, num_predict=800,
                                  temperature=0.05, tag=f"INVESTIGATE-T{turn}",
-                                 timeout=INVESTIGATION_TIMEOUT, retries=INVESTIGATION_RETRIES)
+                                 timeout=turn_timeout, retries=INVESTIGATION_RETRIES)
         except Exception as exc:
+            is_timeout = "timed out" in str(exc).lower() or "timeout" in str(exc).lower()
             print(f"[INVESTIGATE] turn {turn} failed: {exc}", file=sys.stderr)
-            break
+            # A first-turn timeout is an INFRA problem, not a diagnosis: the
+            # model never answered. Rather than break straight to a
+            # "confidence too low" escalation (which reads like the AI looked
+            # and guessed), retry ONCE with a leaner prompt — drop the git
+            # diff and supporting log lines, keep only the issue block, hint,
+            # and pre-loaded evidence — so there's far less to prefill. The
+            # model is warm now (it loaded during the timed-out attempt), so
+            # this second try usually lands.
+            if is_timeout and turn == 1 and not got_any_model_response:
+                timed_out_cold = True
+                if _budget_exceeded():
+                    break
+                print("[INVESTIGATE] first turn timed out with no response — "
+                      "retrying once with a leaner prompt (dropping diff + "
+                      "supporting log lines to shrink prefill).")
+                lean_prompt = _build_investigation_prompt(
+                    "(omitted to reduce load — see the issue block and evidence)",
+                    exit_code, repo_tree, "(omitted to reduce load)", evidence,
+                    last_turn, None, hint_text, issue_block)
+                try:
+                    raw = _stream_ollama(
+                        lean_prompt, INVESTIGATE_SCHEMA, num_predict=800,
+                        temperature=0.05, tag="INVESTIGATE-T1-LEAN",
+                        timeout=INVESTIGATION_TIMEOUT + INVESTIGATION_FIRST_TURN_EXTRA,
+                        retries=INVESTIGATION_RETRIES)
+                except Exception as exc2:
+                    print(f"[INVESTIGATE] lean retry also failed: {exc2}", file=sys.stderr)
+                    break
+            else:
+                break
 
         data = _json_from(raw) or {}
+        if data:
+            got_any_model_response = True
         status = data.get("status", "")
         print(f"[INVESTIGATE] turn {turn}: status={status} | "
               f"{(data.get('analysis') or '')[:160]}")
@@ -1006,7 +1099,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                     pending_notes, hint_text, issue_block)
                 try:
                     raw2 = _stream_ollama(final_prompt, INVESTIGATE_SCHEMA,
-                                          num_predict=900, temperature=0.05,
+                                          num_predict=800, temperature=0.05,
                                           tag="INVESTIGATE-FINAL",
                                           timeout=INVESTIGATION_TIMEOUT,
                                           retries=INVESTIGATION_RETRIES)
@@ -1024,9 +1117,23 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
         break
 
     if result is None:
-        result = {"root_cause": "unknown — investigation did not converge",
-                   "solution": "", "confidence": 0.0,
-                   "commit_message": "fix: auto-fixer change", "findings": []}
+        # Separate "the model answered and wasn't sure" from "the model never
+        # answered" — main() escalates these with different messages, and only
+        # the latter is worth an automatic re-run.
+        if not got_any_model_response:
+            failure_mode = "infra_timeout" if timed_out_cold else "no_model_response"
+            root_cause = ("the model did not return any usable response (the CI "
+                          "runner was too slow or the model call timed out) — "
+                          "this is an infrastructure/latency problem, not a "
+                          "diagnosis")
+        else:
+            failure_mode = "not_converged"
+            root_cause = "unknown — investigation did not converge on a confident diagnosis"
+        result = {"root_cause": root_cause, "solution": "", "confidence": 0.0,
+                  "commit_message": "fix: auto-fixer change", "findings": [],
+                  "failure_mode": failure_mode}
+    else:
+        result["failure_mode"] = None
     result["evidence"] = evidence
     result["investigation_log"] = log
     return result
@@ -1865,6 +1972,10 @@ def main():
 
     # ── AI INVESTIGATION AGENT — always runs, always decides ──
     print("\n━━━ AI INVESTIGATION AGENT ━━━")
+    # Load the model into RAM up front so the first investigation call doesn't
+    # pay cold-load cost inside its own read-timeout — the exact failure that
+    # was making runs escalate with a 0% "diagnosis" they never actually made.
+    warm_up_model()
     investigation = ai_investigate(supporting_signal, exit_code, repo_tree, git_diff,
                                    allowed_files, seed_evidence, hint_text, issue_block)
     root_cause = investigation["root_cause"]
@@ -1894,6 +2005,38 @@ def main():
                             for fnd in findings)]
         print(f"  hint outcome  : AI's findings reference {len(confirmed)}/{len(prescan)} "
               f"pre-scan hint(s) — the diagnosis above is the AI's own.")
+
+    failure_mode = investigation.get("failure_mode")
+    if failure_mode in ("infra_timeout", "no_model_response"):
+        # The model never answered — do NOT dress this up as a low-confidence
+        # diagnosis. It's an infra/latency problem, and the honest signal to a
+        # human (and to future-you tuning the box) is "the model didn't run",
+        # not "the AI looked and wasn't sure".
+        print(f"[GATE] Investigation produced no model response "
+              f"({failure_mode}) — this is an infrastructure/latency issue, not "
+              f"a failed diagnosis. Escalating with that framing so it's tunable.")
+        if token and repo:
+            open_issue(
+                token, repo,
+                (f"Auto-fixer could not run the model in time ({failure_mode}). "
+                 f"The investigation call(s) to Ollama timed out before the model "
+                 f"produced any output — so there is no AI diagnosis, and nothing "
+                 f"was guessed.\n\n"
+                 f"**This is a runner-capacity / latency problem, not a code bug "
+                 f"the AI failed to find.** Things to check on the self-hosted "
+                 f"runner:\n"
+                 f"- Was the box swapping or busy (docker build / pip / pytest "
+                 f"competing for the 8GB)? \n"
+                 f"- Is `{OLLAMA_MODEL}` staying resident? (keep_alive is set to "
+                 f"`{OLLAMA_KEEP_ALIVE}`; warm-up runs before the first call.)\n"
+                 f"- Consider raising `INVESTIGATION_TIMEOUT` (currently "
+                 f"{INVESTIGATION_TIMEOUT}s) / `OLLAMA_WARMUP_TIMEOUT`, or lowering "
+                 f"`OLLAMA_NUM_CTX` ({OLLAMA_NUM_CTX}) / `MAX_TOTAL_CONTEXT` to "
+                 f"shrink prefill.\n\n"
+                 f"**Issue Python identified (unused — model never ran):**\n"
+                 f"```\n{issue_block[:1200]}\n```"),
+                run_url)
+        sys.exit(0)
 
     if confidence < 0.5:
         print(f"[GATE] Confidence {confidence:.0%} too low — escalating instead of guessing.")
