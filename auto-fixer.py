@@ -32,7 +32,9 @@ INVESTIGATION_TIMEOUT = int(os.environ.get("INVESTIGATION_TIMEOUT", str(AI_TIMEO
 INVESTIGATION_RETRIES = int(os.environ.get("INVESTIGATION_RETRIES", "1"))
 INVESTIGATION_FIRST_TURN_EXTRA = int(os.environ.get("INVESTIGATION_FIRST_TURN_EXTRA", "60"))
 
-TOTAL_TIME_BUDGET = int(os.environ.get("TOTAL_TIME_BUDGET", "600"))
+# Raised from 600 → 900: a single investigation turn on the 8GB runner has been
+# observed taking ~300s, so 600s left no room for a patch round + tests.
+TOTAL_TIME_BUDGET = int(os.environ.get("TOTAL_TIME_BUDGET", "900"))
 _run_start_time = None
 
 
@@ -679,6 +681,12 @@ def _json_from(raw: str):
 
 
 # ── 🔥 HARDENED AI INVESTIGATION PROMPT ──────────────────────────────────────
+# NOTE: "analysis" and "confidence" are now REQUIRED. Ollama's structured-output
+# grammar enforces this list, so the model can no longer omit its confidence and
+# silently inherit the Python default (0.4) — which is exactly what caused a
+# correct diagnosis to be escalated by the <0.5 gate. The confidence value is
+# still entirely the model's own judgment; Python never invents one when the
+# schema is enforced.
 INVESTIGATE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -699,7 +707,7 @@ INVESTIGATE_SCHEMA = {
             },
             "required": ["issue", "root_cause"]}},
     },
-    "required": ["status"],
+    "required": ["status", "analysis", "confidence"],
 }
 
 INVESTIGATE_SYSTEM = """\
@@ -783,12 +791,17 @@ EVERY distinct cause of the CI failure described below.
    - Do NOT skip a bug because you think the fix is "obvious" or "minor".
      If it causes a failure, it belongs in the list.
 
-10. **CONFIDENCE:**
+10. **CONFIDENCE (MANDATORY FIELD — NEVER OMIT IT):**
+    - You MUST include a numeric `confidence` between 0.0 and 1.0 in EVERY
+      response, and a non-empty `analysis`.
     - Confidence 0.9+ means you have read every relevant file in full and
       found no more issues.
     - Confidence 0.7-0.89 means you are quite sure but there might be
       additional problems in parts of the file you couldn't see.
     - Confidence ≤0.4 means you are guessing without solid evidence.
+    - If your findings are directly confirmed by the error log AND you located
+      the exact offending text in the evidence files, do not under-report your
+      confidence — a verified diagnosis deserves 0.8+.
 
 Output ONLY one JSON object. No markdown fences.
 
@@ -797,11 +810,11 @@ PROBLEM, even if multiple are in the same file):
 {"analysis":"step-by-step reasoning about what was checked and why you are confident (or not)","status":"root_cause_confirmed","root_cause":"one-sentence summary covering ALL issues found","solution":"high-level plan to fix all issues","confidence":0.9,"all_issues_found":true,"commit_message":"fix: <brief description>","findings":[{"issue":"short name","root_cause":"why this breaks the build","solution":"what to change, with exact text if possible"}]}
 
 Schema when you need another file:
-{"analysis":"what you want to confirm and why the current evidence is insufficient","status":"need_more_info","requested_files":["exact/path/from/tree"]}
+{"analysis":"what you want to confirm and why the current evidence is insufficient","status":"need_more_info","requested_files":["exact/path/from/tree"],"confidence":0.2}
 """
 
 
-# ── Investigation loop (unchanged apart from prompt constant) ───────────────
+# ── Investigation loop ───────────────────────────────────────────────────────
 def _closest_allowed_file(requested: str, allowed_files: set) -> str:
     req_base = Path(requested).name.lower()
     by_base = {}
@@ -863,10 +876,23 @@ def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
 
 
 def _finalize_investigation(data: dict, forced: bool, evidence: dict) -> dict:
+    raw_conf = data.get("confidence")
+    confidence_omitted = raw_conf is None
+    if confidence_omitted:
+        # With the enforced schema this should never happen; if it does, make it
+        # loud so a defaulted value is never mistaken for the model's judgment.
+        print("[FINALIZE] ⚠ model omitted 'confidence' — defaulting to 0.4 "
+              "(this WILL fail the 0.5 gate). Schema enforcement may be off "
+              "(non-native endpoint?).", file=sys.stderr)
     try:
-        confidence = float(data.get("confidence", 0.4))
+        confidence = float(raw_conf if raw_conf is not None else 0.4)
     except (TypeError, ValueError):
+        print(f"[FINALIZE] ⚠ model returned non-numeric confidence "
+              f"({raw_conf!r}) — defaulting to 0.4.", file=sys.stderr)
         confidence = 0.4
+        confidence_omitted = True
+    confidence = max(0.0, min(confidence, 1.0))
+
     if forced and data.get("status") != "root_cause_confirmed":
         confidence = min(confidence, 0.4)
 
@@ -898,6 +924,7 @@ def _finalize_investigation(data: dict, forced: bool, evidence: dict) -> dict:
         "root_cause":     data.get("root_cause") or "unknown",
         "solution":       data.get("solution") or "",
         "confidence":     confidence,
+        "confidence_omitted": confidence_omitted,
         "commit_message": data.get("commit_message") or "fix: auto-fixer change",
         "findings":       findings,
         "all_issues_found": bool(all_issues_found) if all_issues_found is not None else None,
@@ -969,6 +996,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
         status = data.get("status", "")
         analysis = data.get("analysis", "")
         print(f"[INVESTIGATE] turn {turn}: status={status} | "
+              f"confidence={data.get('confidence', '(omitted!)')} | "
               f"{analysis[:160] if analysis else '(no analysis)'}")
 
         if not status and turn > 1:
@@ -1046,6 +1074,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
             failure_mode = "not_converged"
             root_cause = "unknown — investigation did not converge"
         result = {"root_cause": root_cause, "solution": "", "confidence": 0.0,
+                  "confidence_omitted": True,
                   "commit_message": "fix: auto-fixer change", "findings": [],
                   "failure_mode": failure_mode}
     else:
@@ -1151,7 +1180,7 @@ def _normalize_issue_keys(issues):
     return out
 
 
-# ── REVIEW AGENT (unchanged) ───────────────────────────────────────────────
+# ── REVIEW AGENT ─────────────────────────────────────────────────────────────
 REVIEW_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1160,7 +1189,7 @@ REVIEW_SCHEMA = {
         "solution":   {"type": "string"},
         "confidence": {"type": "number"},
     },
-    "required": ["decision"],
+    "required": ["decision", "confidence"],
 }
 
 REVIEW_SYSTEM = """\
@@ -1170,6 +1199,7 @@ decide:
   - "retry": provide updated root_cause and solution.
   - "stop": a human should look at it.
 Focus on the "## NEW ISSUE" section if present.
+"confidence" is MANDATORY in every response.
 Output ONLY one JSON object:
 {"decision":"retry","root_cause":"...","solution":"...","confidence":0.0-1.0}
 or
@@ -1837,10 +1867,12 @@ def main():
     evidence   = investigation["evidence"]
     findings   = investigation.get("findings", [])
     investigation_log = investigation.get("investigation_log")
+    confidence_omitted = investigation.get("confidence_omitted", False)
 
     print("\n  ── investigation result ──")
     print(f"  OVERALL CAUSE : {root_cause}")
-    print(f"  confidence    : {confidence:.0%}")
+    print(f"  confidence    : {confidence:.0%}"
+          + ("  (⚠ DEFAULTED — model did not report one)" if confidence_omitted else ""))
     print(f"  files read    : {', '.join(evidence.keys()) or '(none)'}")
     print(f"  issues found  : {len(findings)}")
     for i, fnd in enumerate(findings, 1):
@@ -1864,10 +1896,14 @@ def main():
         sys.exit(0)
 
     if confidence < 0.5:
-        print(f"[GATE] Confidence {confidence:.0%} too low — escalating.")
+        gate_note = (" NOTE: the model never reported a confidence value — this is a "
+                     "reporting failure, not necessarily a bad diagnosis."
+                     if confidence_omitted else "")
+        print(f"[GATE] Confidence {confidence:.0%} too low — escalating.{gate_note}")
         if token and repo:
             escalation_detail = (
-                f"AI confidence too low ({confidence:.0%}). Root cause: {root_cause}\n\n"
+                f"AI confidence too low ({confidence:.0%}).{gate_note} "
+                f"Root cause: {root_cause}\n\n"
                 f"**Issue Python identified:**\n```\n{issue_block[:1500]}\n```\n\n"
                 f"**Files read during investigation:** "
                 f"{', '.join(evidence.keys()) or '(none)'}\n"
