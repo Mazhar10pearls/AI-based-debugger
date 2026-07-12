@@ -747,6 +747,7 @@ INVESTIGATE_SCHEMA = {
         "solution":        {"type": "string"},
         "confidence":      {"type": "number"},
         "commit_message":  {"type": "string"},
+        "all_issues_found": {"type": "boolean"},
         "findings": {"type": "array", "items": {
             "type": "object",
             "properties": {
@@ -790,11 +791,27 @@ You are a DevOps investigation agent. Your job is to find the root cause of a CI
 5. Set "confidence" to reflect how directly the evidence you have READ
    supports your conclusion. If you are confirming without having examined
    any file content, your confidence must be low (0.4 or below).
+6. IMPORTANT — do not stop at the first bug you notice. A single failure
+   can be caused by MULTIPLE independent problems in the same file (for
+   example: a bad base-image tag AND a misspelled filename in a COPY line
+   AND a different misspelling of the same file in a RUN command — these
+   are three separate bugs even though they contributed to one failure).
+   Before confirming, re-read every file in "## Evidence gathered so far"
+   line by line and check EVERY reference, path, argument, and version
+   string against what actually exists elsewhere in the evidence and the
+   "## Repository tree" — not just the first thing that looks wrong.
+   Report every distinct problem you find as its own entry in "findings".
+7. Set "all_issues_found" to true only if you have checked the full
+   evidence for additional problems and are confident there are no more.
+   Set it to false if you are unsure whether more issues remain (e.g. you
+   ran out of turns, or evidence was truncated) — lower confidence
+   accordingly in that case.
 
 Output ONLY one JSON object. No markdown fences.
 
-Schema when confirming (use for findings):
-{"analysis":"…","status":"root_cause_confirmed","root_cause":"one-sentence summary","solution":"…","confidence":0.9,"commit_message":"fix: <describe the actual change>","findings":[{"issue":"short name","root_cause":"why this breaks the build","solution":"what to change"}]}
+Schema when confirming (use for findings — include ONE ENTRY PER DISTINCT
+PROBLEM, even multiple problems in the same file):
+{"analysis":"…","status":"root_cause_confirmed","root_cause":"one-sentence summary covering ALL issues found","solution":"…","confidence":0.9,"all_issues_found":true,"commit_message":"fix: <describe the actual change>","findings":[{"issue":"short name","root_cause":"why this breaks the build","solution":"what to change"}]}
 
 Schema when you need another file:
 {"analysis":"…","status":"need_more_info","requested_files":["exact/path/from/tree"]}
@@ -892,12 +909,19 @@ def _finalize_investigation(data: dict, forced: bool, evidence: dict) -> dict:
                      "root_cause": data.get("root_cause") or "unknown",
                      "solution": data.get("solution") or ""}]
 
+    all_issues_found = data.get("all_issues_found")
+    if all_issues_found is False:
+        print("[INVESTIGATE] model flagged it may NOT have found all issues — "
+              "capping confidence.")
+        confidence = min(confidence, 0.45)
+
     return {
         "root_cause":     data.get("root_cause") or "unknown",
         "solution":       data.get("solution") or "",
         "confidence":     confidence,
         "commit_message": data.get("commit_message") or "fix: auto-fixer change",
         "findings":       findings,
+        "all_issues_found": bool(all_issues_found) if all_issues_found is not None else None,
     }
 
 
@@ -1074,10 +1098,21 @@ PATCH_SCHEMA = {
 
 PATCH_SYSTEM = """\
 You are a patch-generation agent. Another engineer already investigated this \
-CI/CD failure and confirmed the root cause below. Your ONLY job is to emit the \
-concrete text-level fix — do not re-diagnose.
+CI/CD failure and confirmed the root cause(s) below. Your job is to emit the \
+concrete text-level fix for EVERY issue listed — do not re-diagnose, but do
+not silently skip any of them either.
 
 Stay scoped to the "## ISSUE TO SOLVE" section if one is present.
+
+IMPORTANT: if multiple issues are listed under "## Confirmed root cause",
+you MUST emit one "issues" entry per problem — a single file can have
+several independent bugs (e.g. a bad version string AND one or more
+mismatched filenames used in different commands). Before finishing, re-scan
+the file contents you were given for any other reference of the same kind
+as the ones already listed (other paths, other version strings, etc.) that
+point to something which doesn't match what actually exists elsewhere in
+the evidence — and fix those too, using the same file/evidence/corrected
+format.
 
 Output ONLY one JSON object. No markdown fences.
 
@@ -1090,7 +1125,9 @@ Output ONLY one JSON object. No markdown fences.
 Schema:
 {"issues":[{"file":"...","problem":"...","evidence":"...","corrected":"..."}]}
 
-**REMEMBER**: "evidence" and "corrected" must be DIFFERENT strings.
+**REMEMBER**: "evidence" and "corrected" must be DIFFERENT strings. Emit
+a separate entry for each distinct bug — do not merge multiple bugs into
+one entry, and do not stop after the first one.
 """
 
 
@@ -1922,6 +1959,12 @@ def main():
                     open_issue(token, repo,
                                f"AI produced no usable fixes. Root cause: {root_cause}\n\n{detail}", run_url)
                 sys.exit(3)
+            # Feed the rejection reason(s) into the next attempt so it doesn't
+            # just resubmit the same unusable issue list again.
+            retry_note = (f"Your previous patch attempt was rejected before it "
+                          f"could even be applied, for these reasons:\n{detail}\n"
+                          f"Make sure 'evidence' is copied EXACTLY from the file "
+                          f"contents shown, and 'corrected' is different from it.")
             continue
 
         print("\n━━━ PYTHON VALIDATION ENGINE ━━━")
@@ -1940,6 +1983,13 @@ def main():
                     open_issue(token, repo,
                                f"AI fix failed validation. Root cause: {root_cause}\n\n{detail}", run_url)
                 sys.exit(3)
+            # Carry the exact validation failure into the next round's patch
+            # prompt. Without this, a rejected patch (e.g. one that still
+            # leaves a dangling reference) gets resubmitted unchanged, since
+            # the patch agent otherwise has no idea it was rejected or why.
+            retry_note = (f"Your previous patch was rejected by validation for "
+                          f"these reasons — fix ALL of them, not just the ones "
+                          f"you already addressed:\n{detail}")
             continue
 
         print("\n━━━ EXECUTE BUILD & TESTS ━━━")
