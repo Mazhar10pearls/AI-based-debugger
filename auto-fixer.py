@@ -6,9 +6,15 @@ Pipeline:
 
     GitHub Actions Pipeline Failed
         → Python: collect initial evidence (logs, exit code, repo tree, git diff)
-        → AI Investigation Agent (multi-turn loop):
-              reads evidence → forms hypothesis → requests more files if needed
-              → Python fetches requested files (read-only) → loop → confirms root cause
+        → Python: distill a FOCUSED issue statement (primary error, failing
+              step, trimmed traceback) — this, not the raw log, is what the
+              AI is anchored to in every prompt
+        → Python: deterministic reference scan — if every candidate typo is
+              high-confidence, fix it directly and skip the AI entirely
+        → AI Investigation Agent (multi-turn loop, only when needed):
+              reads the focused issue + evidence → forms hypothesis →
+              requests more files if needed → Python fetches requested files
+              (read-only) → loop → confirms root cause
         → AI Patch Generation Agent: emits the concrete fix (flat evidence→corrected issues)
         → Python Validation Engine: format/path/syntax/YAML/JSON checks,
               secret scanning, dangerous-command detection, safe patch verification
@@ -24,6 +30,19 @@ Design notes:
     caps how much it can ask for at once, and the model may ONLY request files
     that literally appear in the repository tree Python already listed for it
     — it can never name a file into existence.
+  * The same small model also does noticeably better when it isn't handed a
+    wall of raw log text and asked to find the needle itself. Python now does
+    that needle-finding up front (extract_focused_failure / format_focused_issue)
+    and puts a short "## ISSUE TO SOLVE" block at the TOP of every prompt —
+    investigation, patch generation, and failure review all get this same
+    anchor, so the model spends its limited context reasoning about the fix
+    instead of re-deriving what broke.
+  * Some failures don't need a model at all. deterministic_reference_scan()
+    already catches typo'd file references with a similarity score; if every
+    candidate in a run clears AUTO_RESOLVE_SIMILARITY, Python builds and
+    applies the fix directly (prescan_candidates_to_fixes) without ever
+    calling Ollama — no round trip, no timeout risk, no wasted escalation
+    for a problem that was already fully solved deterministically.
   * The AI never writes to disk directly. It only ever emits JSON (a file
     request, or an evidence→corrected quote). Python is the only thing that
     reads or writes files, and it re-validates every AI-authored change
@@ -111,10 +130,23 @@ MAX_REPAIR_ROUNDS       = int(os.environ.get("MAX_REPAIR_ROUNDS", "2"))
 # RAM held resident while competing with the rest of the CI job. Only raise
 # these if you also move to a bigger model on a less contended box.
 MAX_ERROR_LINES   = 14
+# Once the focused issue block already carries the primary error + trimmed
+# traceback, the "supporting" log lines only need to add what's NOT already
+# shown there — this is the ceiling on that supplementary context.
+MAX_SUPPORTING_LINES = 10
 MAX_FILE_CHARS    = int(os.environ.get("MAX_FILE_CHARS", "4000"))
 MAX_TOTAL_CONTEXT = int(os.environ.get("MAX_TOTAL_CONTEXT", "10000"))
 MAX_FILES_FIXED   = 4
 MAX_PROMPT_CHARS  = int(os.environ.get("MAX_PROMPT_CHARS", "11000"))
+MAX_TRACEBACK_LINES = 12
+
+# ── Deterministic auto-resolve ────────────────────────────────────────────────
+# If every prescan candidate (see deterministic_reference_scan) clears this
+# similarity bar, Python builds and applies the fix directly and skips the
+# AI investigation/patch stages entirely for this run. A 0.9+ match against
+# a real repo file basically IS the fix — there's no diagnostic value an AI
+# call adds, only latency and timeout risk.
+AUTO_RESOLVE_SIMILARITY = float(os.environ.get("AUTO_RESOLVE_SIMILARITY", "0.90"))
 
 # ── Git flow ──────────────────────────────────────────────────────────────────
 GIT_BASE_BRANCH   = os.environ.get("GIT_BASE_BRANCH",   "develop")
@@ -280,6 +312,19 @@ TECH_STACK_SIGNALS = {
     "go":     ["go build", "go test", "go mod", ".go", "go.mod"],
 }
 
+# GitHub Actions' own "this is what failed" markers — the highest-confidence
+# signal available when present, since GitHub (not our keyword heuristics)
+# decided these lines were the error.
+GH_ERROR_ANNOTATION = re.compile(r'^##\[error\](.*)$', re.M)
+GH_GROUP_START       = re.compile(r'^##\[group\](.*)$', re.M)
+TRACEBACK_START      = re.compile(r'^Traceback \(most recent call last\):', re.M)
+EXCEPTION_LINE       = re.compile(r'^[A-Za-z_][A-Za-z0-9_.]*(Error|Exception|Warning)\b')
+# GitHub's own "the step exited non-zero" annotation is real but content-free
+# — it names no file, no cause. Never let it outrank a specific error (a
+# traceback's exception line, or a more specific ##[error] annotation) when
+# picking the ONE primary message the AI anchors on.
+GENERIC_GH_ERROR_ANNOTATION = re.compile(r'^Process completed with exit code', re.I)
+
 
 def extract_error_signal(log_text: str) -> str:
     lines = log_text.splitlines()
@@ -293,6 +338,121 @@ def extract_error_signal(log_text: str) -> str:
     signal = "\n".join(list(dict.fromkeys(relevant + tail)))
     print(f"[EVIDENCE] Error signal: {len(signal)} chars")
     return signal
+
+
+def extract_focused_failure(log_text: str) -> dict:
+    """Distill the raw log down to the handful of facts an engineer would
+    actually reach for first: the exact error message, the step/command
+    that was running when it broke, and the traceback (trimmed to its
+    first + last frames rather than dumped whole). This is what gets put
+    at the TOP of every AI prompt — investigation, patch generation, and
+    failure review — so a resource-constrained small model spends its
+    limited context on the fix instead of re-deriving what broke from a
+    wall of raw log text."""
+    # 1. GitHub's own error annotations, if this is a GitHub Actions log.
+    gh_errors = [m.group(1).strip() for m in GH_ERROR_ANNOTATION.finditer(log_text)
+                 if m.group(1).strip()]
+
+    # 2. Which step/group was running when things broke — the nearest
+    #    preceding ##[group] header before the first error annotation.
+    failing_step = ""
+    groups = list(GH_GROUP_START.finditer(log_text))
+    if groups:
+        anchor_match = GH_ERROR_ANNOTATION.search(log_text)
+        anchor = anchor_match.start() if anchor_match else len(log_text)
+        for g in groups:
+            if g.start() < anchor:
+                failing_step = g.group(1).strip()
+            else:
+                break
+
+    # 3. Python traceback — first line, exception line, and if long, only
+    #    the first and last couple of frames rather than the whole middle.
+    traceback_text = ""
+    tb_match = TRACEBACK_START.search(log_text)
+    if tb_match:
+        tb_lines = log_text[tb_match.start():].splitlines()
+        end = len(tb_lines)
+        for i in range(1, len(tb_lines)):
+            l = tb_lines[i]
+            if l.strip() == "":
+                end = i
+                break
+            if EXCEPTION_LINE.match(l.strip()):
+                end = i + 1
+                break
+        tb_lines = tb_lines[:end]
+        if len(tb_lines) > MAX_TRACEBACK_LINES:
+            tb_lines = tb_lines[:1] + ["    ...(truncated)..."] + tb_lines[-(MAX_TRACEBACK_LINES - 1):]
+        traceback_text = "\n".join(tb_lines)
+
+    # 4. The single clearest error message. Prefer a SPECIFIC GitHub error
+    #    annotation, then the traceback's exception line, and only fall back
+    #    to a generic annotation ("Process completed with exit code N") if
+    #    nothing more specific exists — that generic line names no file and
+    #    no cause, so it's the least useful thing to anchor an AI prompt on.
+    specific_gh_errors = [e for e in gh_errors if not GENERIC_GH_ERROR_ANNOTATION.match(e)]
+    exc_lines = []
+    if traceback_text:
+        exc_lines = [l.strip() for l in traceback_text.splitlines()
+                     if EXCEPTION_LINE.match(l.strip())]
+
+    if specific_gh_errors:
+        primary_message = specific_gh_errors[-1]
+    elif exc_lines:
+        primary_message = exc_lines[-1]
+    elif gh_errors:
+        primary_message = gh_errors[-1]
+    else:
+        primary_message = ""
+
+    # 5. file:line references anywhere in the log — useful even without a
+    #    Python traceback (linters, Dockerfile builders, etc).
+    file_refs = []
+    for h in FILE_REF_HINTS:
+        for m in h.finditer(log_text):
+            ref = m.group(0)
+            if ref not in file_refs:
+                file_refs.append(ref)
+    file_refs = file_refs[:8]
+
+    return {
+        "primary_message": primary_message,
+        "failing_step": failing_step,
+        "traceback": traceback_text,
+        "file_refs": file_refs,
+        "gh_errors": gh_errors[:5],
+    }
+
+
+def format_focused_issue(focused: dict, exit_code: str) -> str:
+    """Render extract_focused_failure()'s output as the short block that
+    heads every AI prompt. Deliberately compact — this is meant to be read
+    in full, not skimmed."""
+    parts = [f"Exit code: {exit_code}"]
+    if focused.get("failing_step"):
+        parts.append(f"Failing step: {focused['failing_step']}")
+    if focused.get("primary_message"):
+        parts.append(f"Primary error: {focused['primary_message']}")
+    if focused.get("traceback"):
+        parts.append(f"Traceback:\n{focused['traceback']}")
+    if focused.get("file_refs"):
+        parts.append(f"File references seen in the log: {', '.join(focused['file_refs'])}")
+    others = [e for e in focused.get("gh_errors", []) if e != focused.get("primary_message")]
+    if others:
+        parts.append("Other error annotations in the log:\n" +
+                     "\n".join(f"- {o}" for o in others[:4]))
+    return "\n".join(parts) if parts else "(no focused signal extracted — see supporting log lines below)"
+
+
+def trim_supporting_signal(signal: str, focused: dict, max_lines: int = MAX_SUPPORTING_LINES) -> str:
+    """Once the focused issue block already carries the primary error and
+    traceback, the supporting log lines only need to add what ISN'T already
+    shown there — keeps the prompt from paying twice for the same content."""
+    tb_lines = set(focused.get("traceback", "").splitlines())
+    lines = [l for l in signal.splitlines() if l not in tb_lines]
+    lines = list(dict.fromkeys(lines))[-max_lines:]
+    return "\n".join(lines) if lines else "(fully covered by the issue summary above)"
 
 
 def fingerprint_stack(log_text: str) -> set:
@@ -496,6 +656,13 @@ the root cause yet — think like a senior engineer: read the evidence, form a \
 hypothesis, and if you're not sure, ask for the specific file(s) that would \
 confirm or rule it out.
 
+Focus ONLY on the "## ISSUE TO SOLVE" section below — that is Python's own \
+distillation of what actually broke this run (the real error message, which \
+step was running, and the traceback if there was one). The supporting log \
+lines, diff, and repo tree underneath are context to help you confirm and fix \
+that issue, NOT a second, separate problem. Do not diagnose or propose \
+changes unrelated to what's in ISSUE TO SOLVE.
+
 Output ONLY one JSON object. No markdown fences. Start with { end with }.
 
 Each turn, choose exactly one status:
@@ -513,10 +680,9 @@ Schema when asking for more evidence:
 Schema when confirming:
 {"analysis":"...","status":"root_cause_confirmed","root_cause":"one-sentence overall summary","solution":"...","confidence":0.0-1.0,"commit_message":"fix: short","findings":[{"issue":"short name of this specific bug","root_cause":"why THIS bug happened","solution":"what fixes THIS bug"}]}
 
-CRITICAL — "findings" must list EVERY distinct bug you found, one entry per \
-bug, even if several live in the same file or look similar. A CI failure \
-routinely has more than one independent bug (e.g. a bad version string AND \
-separate typo'd file paths) — finding one and stopping is a FAILURE. \
+CRITICAL — "findings" must list EVERY distinct bug implied by ISSUE TO SOLVE, \
+one entry per bug, even if several live in the same file or look similar. \
+Finding one and stopping when there are clearly more is a FAILURE. \
 "root_cause"/"solution" above are just a one-sentence roll-up for a commit \
 message; "findings" is the itemized breakdown a human will actually read.
 
@@ -532,8 +698,8 @@ Only do this for issues you can directly verify from what's shown to you \
 guess at bugs you can't confirm.
 
 Rules:
-- If the logs and diff already make the cause obvious, confirm immediately — \
-don't pad with unnecessary file requests.
+- If the ISSUE TO SOLVE and diff already make the cause obvious, confirm \
+immediately — don't pad with unnecessary file requests.
 - A file being merely related to the tech stack is not enough reason to \
 request it — request only what actually tests your hypothesis.
 """
@@ -574,8 +740,9 @@ def deterministic_reference_scan(allowed_files: set) -> list:
     file references — no model call, no waiting. Runs in well under a
     second versus minutes of a small local model repeatedly failing to
     produce useful output for the same class of bug. Returns a list of
-    {file, wrong_token, suggested, line} candidates; empty list if nothing
-    found, in which case the caller falls back to the full AI investigation."""
+    {file, wrong_token, suggested, line, similarity} candidates; empty list
+    if nothing found, in which case the caller falls back to the full AI
+    investigation."""
     candidates = []
     for f in sorted(allowed_files):
         if not PRESCAN_FILE_PATTERN.search(f):
@@ -601,15 +768,34 @@ def deterministic_reference_scan(allowed_files: set) -> list:
             line_end = content.find("\n", m.end())
             line = content[line_start:(line_end if line_end != -1 else len(content))].strip()
             candidates.append({"file": f, "wrong_token": token,
-                               "suggested": match, "line": line})
+                               "suggested": match, "line": line,
+                               "similarity": similarity})
             print(f"[PRESCAN] {f}: '{token}' looks like a typo of '{match}' "
                   f"(similarity {similarity:.2f})")
     return candidates
 
 
+def prescan_candidates_to_fixes(prescan: list) -> list:
+    """Turn high-confidence prescan hits directly into the same
+    {file, reason, edits} shape write_fixes()/validate_fix() expect — no AI
+    round-trip needed. Groups multiple typos in the same file into a single
+    fix entry so they're applied and validated together."""
+    fixes_by_file = {}
+    for c in prescan:
+        entry = fixes_by_file.setdefault(
+            c["file"], {"file": c["file"], "reason": "", "edits": []})
+        edit = {"find": c["wrong_token"], "replace": c["suggested"]}
+        if edit not in entry["edits"]:
+            entry["edits"].append(edit)
+        note = f"'{c['wrong_token']}' -> '{c['suggested']}'"
+        entry["reason"] = (entry["reason"] + "; " + note).lstrip("; ")[:300]
+    return list(fixes_by_file.values())
+
+
 def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
                                 evidence: dict, last_turn: bool,
-                                notes: list = None, hint_text: str = "") -> str:
+                                notes: list = None, hint_text: str = "",
+                                issue_block: str = "") -> str:
     ev_parts, total = [], 0
     for f, c in evidence.items():
         block = f"### {f}\n```\n{c}\n```"
@@ -642,9 +828,10 @@ def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
             "you have. Only ask for more if the hint does NOT explain the "
             "failure or you need to see something else to be sure.\n"
         )
+    issue_section = f"\n## ISSUE TO SOLVE\n{issue_block}\n" if issue_block else ""
     return (
-        f"{INVESTIGATE_SYSTEM}{turn_note}{notes_section}{hint_section}\n"
-        f"## CI failure (key lines):\n```\n{signal}\n```\n"
+        f"{INVESTIGATE_SYSTEM}{turn_note}{issue_section}{notes_section}{hint_section}\n"
+        f"## Supporting log lines (context only — the actual issue is above):\n```\n{signal}\n```\n"
         f"## Exit code: {exit_code}\n"
         f"## Git diff (most recent commit):\n```\n{git_diff}\n```\n"
         f"## Repository tree (folders & filenames only — request only from this list):\n{repo_tree}\n"
@@ -686,10 +873,15 @@ def _finalize_investigation(data: dict, forced: bool) -> dict:
 
 
 def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
-                   seed_evidence: dict = None, hint_text: str = "") -> dict:
+                   seed_evidence: dict = None, hint_text: str = "",
+                   issue_block: str = "") -> dict:
     """The core investigation loop from the diagram: AI reads evidence, thinks,
     requests more if needed, loops, confirms root cause. Bounded by
     MAX_INVESTIGATION_TURNS so a small model can't spin forever.
+
+    issue_block is Python's distilled "ISSUE TO SOLVE" statement (see
+    format_focused_issue) — it heads every prompt so the model stays scoped
+    to the actual failure instead of re-deriving it from raw logs.
 
     seed_evidence/hint_text let a fast Python pre-scan hand the AI a head
     start — relevant files pre-loaded, a pointer to what looks suspicious —
@@ -724,7 +916,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
         last_turn = (turn == effective_turns)
         prompt = _build_investigation_prompt(signal, exit_code, repo_tree,
                                              git_diff, evidence, last_turn,
-                                             pending_notes, hint_text)
+                                             pending_notes, hint_text, issue_block)
         pending_notes = []
         try:
             raw = _stream_ollama(prompt, INVESTIGATE_SCHEMA, num_predict=900,
@@ -790,7 +982,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                     break
                 final_prompt = _build_investigation_prompt(
                     signal, exit_code, repo_tree, git_diff, evidence, True,
-                    pending_notes, hint_text)
+                    pending_notes, hint_text, issue_block)
                 try:
                     raw2 = _stream_ollama(final_prompt, INVESTIGATE_SCHEMA,
                                           num_predict=900, temperature=0.05,
@@ -844,6 +1036,11 @@ You are a patch-generation agent. Another engineer already investigated this \
 CI/CD failure and confirmed the root cause below. Your ONLY job is to emit the \
 concrete text-level fix — do not re-diagnose.
 
+Stay scoped to the "## ISSUE TO SOLVE" section if one is present below — that \
+is Python's own summary of what actually broke this run. The confirmed root \
+cause is the diagnosis; ISSUE TO SOLVE is the original evidence it was based \
+on. Do not introduce fixes for anything outside that scope.
+
 Output ONLY one JSON object. No markdown fences. Start with { end with }.
 
 "issues" = ONE ENTRY PER BUG implied by the confirmed root cause. Each entry:
@@ -870,13 +1067,15 @@ for something not shown to you.
 
 
 def ai_generate_patch(root_cause: str, solution: str, evidence: dict,
-                      retry_note: str = "") -> list:
+                      retry_note: str = "", issue_block: str = "") -> list:
     parts = [f"### {f}\n```\n{c}\n```" for f, c in evidence.items()]
     context = "\n\n".join(parts) if parts else "(no evidence files were read)"
+    issue_section = (f"## ISSUE TO SOLVE (stay scoped to this):\n{issue_block}\n\n"
+                     if issue_block else "")
     retry_section = (f"## Note: a previous attempt at this fix failed:\n"
                      f"{retry_note}\nDo not repeat the same change — adjust "
                      f"based on this new information.\n\n" if retry_note else "")
-    prompt = (f"{PATCH_SYSTEM}\n\n{retry_section}"
+    prompt = (f"{PATCH_SYSTEM}\n\n{issue_section}{retry_section}"
               f"## Confirmed root cause: {root_cause}\n"
               f"## Solution direction: {solution}\n\n"
               f"## File contents (you may ONLY edit these):\n{context}\n\n"
@@ -935,15 +1134,19 @@ decide:
 and solution for another patch attempt.
   - "stop": this doesn't point to a clear, safely-automatable fix — a human \
 should look at it.
-Output ONLY one JSON object:
+Focus on the "## NEW ISSUE" section if present — that is Python's own \
+summary of what broke this time, distilled the same way the original issue \
+was. Output ONLY one JSON object:
 {"decision":"retry","root_cause":"...","solution":"...","confidence":0.0-1.0}
 or
 {"decision":"stop","root_cause":"why this can't be safely auto-fixed","solution":"","confidence":0.0}
 """
 
 
-def ai_review_failure(prior_root_cause: str, prior_solution: str, new_signal: str) -> dict:
-    prompt = (f"{REVIEW_SYSTEM}\n\n## Original root cause: {prior_root_cause}\n"
+def ai_review_failure(prior_root_cause: str, prior_solution: str, new_signal: str,
+                      issue_block: str = "") -> dict:
+    issue_section = f"## NEW ISSUE\n{issue_block}\n\n" if issue_block else ""
+    prompt = (f"{REVIEW_SYSTEM}\n\n{issue_section}## Original root cause: {prior_root_cause}\n"
               f"## Fix attempted: {prior_solution}\n"
               f"## New failure after applying the fix:\n```\n{new_signal}\n```\n\n"
               f"Return the JSON.")
@@ -1593,13 +1796,24 @@ def main():
         print(f"[SECURITY] redacting {len(redacted)} potential secret pattern(s) from log: "
               f"{', '.join(redacted)}")
     log_text = redact_secrets(log_text)
+
+    exit_code = get_exit_code(log_text, args.exit_code)
     signal = extract_error_signal(log_text)
     stacks = fingerprint_stack(log_text)
     if not signal.strip():
         print("[EVIDENCE] No error signal — nothing to fix.")
         sys.exit(0)
 
-    exit_code = get_exit_code(log_text, args.exit_code)
+    # Distill the log into a compact, scoped issue statement — this heads
+    # every AI prompt from here on so the model works from "here is the
+    # exact problem" instead of "here are 2000 lines, find the problem".
+    focused = extract_focused_failure(log_text)
+    issue_block = format_focused_issue(focused, exit_code)
+    supporting_signal = trim_supporting_signal(signal, focused)
+    print(f"[EVIDENCE] Focused issue: {(focused.get('primary_message') or '(none)')[:160]}")
+    if focused.get("failing_step"):
+        print(f"[EVIDENCE] Failing step: {focused['failing_step']}")
+
     git_diff  = get_git_diff()
     repo_tree, allowed_files = repo_tree_text()
     print(f"[EVIDENCE] exit_code={exit_code} | {len(allowed_files)} readable file(s) in tree")
@@ -1608,28 +1822,50 @@ def main():
     print("\n━━━ DETERMINISTIC REFERENCE SCAN ━━━")
     prescan = deterministic_reference_scan(allowed_files)
     seed_evidence, hint_text = {}, ""
+    deterministic_fixes = None
     if prescan:
         seed_evidence = {c["file"]: _read_evidence_file(c["file"]) for c in prescan}
         hint_lines = "\n".join(
             f"- {c['file']}: '{c['wrong_token']}' does not appear in the repository "
             f"tree; the closest real file is '{c['suggested']}'" for c in prescan)
         hint_text = hint_lines
-        print(f"[PRESCAN] {len(prescan)} candidate(s) found — pre-loading "
-              f"{len(seed_evidence)} file(s) and passing this as a hint to the "
-              f"investigation agent (it still decides).")
+        if all(c["similarity"] >= AUTO_RESOLVE_SIMILARITY for c in prescan):
+            deterministic_fixes = prescan_candidates_to_fixes(prescan)
+            print(f"[PRESCAN] all {len(prescan)} candidate(s) ≥ {AUTO_RESOLVE_SIMILARITY:.0%} "
+                  f"similarity — resolving deterministically, skipping the AI investigation "
+                  f"and patch-generation calls entirely for this run.")
+        else:
+            print(f"[PRESCAN] {len(prescan)} candidate(s) found — pre-loading "
+                  f"{len(seed_evidence)} file(s) and passing this as a hint to the "
+                  f"investigation agent (it still decides).")
     else:
         print("[PRESCAN] nothing found — investigation agent starts with no hint.")
 
-    # ── AI INVESTIGATION AGENT ──
-    print("\n━━━ AI INVESTIGATION AGENT ━━━")
-    investigation = ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files,
-                                   seed_evidence, hint_text)
-    root_cause = investigation["root_cause"]
-    solution   = investigation["solution"]
-    commit_msg = investigation["commit_message"]
-    confidence = investigation["confidence"]
-    evidence   = investigation["evidence"]
-    findings   = investigation.get("findings", [])
+    # ── ROOT CAUSE: deterministic resolution, or AI INVESTIGATION AGENT ──
+    if deterministic_fixes is not None:
+        findings = [{
+            "issue": f"Typo'd reference in {c['file']}",
+            "root_cause": f"'{c['wrong_token']}' does not exist in the repo; it's a "
+                          f"typo of '{c['suggested']}' (similarity {c['similarity']:.0%})",
+            "solution": f"Replace '{c['wrong_token']}' with '{c['suggested']}' in {c['file']}",
+        } for c in prescan]
+        root_cause = "; ".join(f["root_cause"] for f in findings)
+        solution   = "; ".join(f["solution"] for f in findings)
+        commit_msg = "fix: correct typo'd file reference(s)"
+        confidence = 1.0
+        evidence   = seed_evidence
+        investigation_log = []
+    else:
+        print("\n━━━ AI INVESTIGATION AGENT ━━━")
+        investigation = ai_investigate(supporting_signal, exit_code, repo_tree, git_diff,
+                                       allowed_files, seed_evidence, hint_text, issue_block)
+        root_cause = investigation["root_cause"]
+        solution   = investigation["solution"]
+        commit_msg = investigation["commit_message"]
+        confidence = investigation["confidence"]
+        evidence   = investigation["evidence"]
+        findings   = investigation.get("findings", [])
+        investigation_log = investigation.get("investigation_log")
 
     print("\n  ── investigation result ──")
     print(f"  OVERALL CAUSE : {root_cause}")
@@ -1648,7 +1884,7 @@ def main():
         if token and repo:
             escalation_detail = (
                 f"AI confidence too low ({confidence:.0%}). Root cause: {root_cause}\n\n"
-                f"**Error signal Python extracted from the log:**\n```\n{signal[:1500]}\n```\n\n"
+                f"**Issue Python identified:**\n```\n{issue_block[:1500]}\n```\n\n"
                 f"**Files read during investigation:** "
                 f"{', '.join(evidence.keys()) or '(none)'}\n\n"
                 f"The investigation agent could not converge on a confident diagnosis "
@@ -1669,6 +1905,7 @@ def main():
     written, originals, fixes = [], {}, []
     success = False
     retry_note = ""
+    retry_issue_block = ""
 
     for repair_round in range(1, MAX_REPAIR_ROUNDS + 1):
         if _budget_exceeded():
@@ -1683,33 +1920,41 @@ def main():
                            f"TOTAL_TIME_BUDGET / OLLAMA_NUM_CTX / MAX_TOTAL_CONTEXT if this "
                            f"keeps happening.", run_url)
             sys.exit(5)
-        print(f"\n━━━ AI PATCH GENERATION AGENT (round {repair_round}/{MAX_REPAIR_ROUNDS}) ━━━")
-        try:
-            issues = ai_generate_patch(patch_root_cause, solution, evidence, retry_note)
-        except Exception as exc:
-            print(f"[ERROR] patch generation failed: {exc}", file=sys.stderr)
-            if repair_round == MAX_REPAIR_ROUNDS:
-                if token and repo:
-                    open_issue(token, repo, f"AI patch generation failed: {exc}", run_url)
-                sys.exit(2)
-            continue
 
-        print(f"  issues reported: {len(issues)}")
-        for n, it in enumerate(issues, 1):
-            print(f"    {n}. {it.get('file','?')}: {it.get('problem','')[:80]}")
+        if repair_round == 1 and deterministic_fixes is not None:
+            print(f"\n━━━ DETERMINISTIC PATCH (round {repair_round}/{MAX_REPAIR_ROUNDS}) ━━━")
+            fixes = deterministic_fixes
+            print(f"  fixes: {len(fixes)} file(s) — no AI call needed")
+        else:
+            print(f"\n━━━ AI PATCH GENERATION AGENT (round {repair_round}/{MAX_REPAIR_ROUNDS}) ━━━")
+            active_issue_block = retry_issue_block or issue_block
+            try:
+                issues = ai_generate_patch(patch_root_cause, solution, evidence,
+                                           retry_note, active_issue_block)
+            except Exception as exc:
+                print(f"[ERROR] patch generation failed: {exc}", file=sys.stderr)
+                if repair_round == MAX_REPAIR_ROUNDS:
+                    if token and repo:
+                        open_issue(token, repo, f"AI patch generation failed: {exc}", run_url)
+                    sys.exit(2)
+                continue
 
-        fixes, pair_rejects = issues_to_fixes(issues, evidence)
-        for rej in pair_rejects:
-            print(f"  ✗ {rej}", file=sys.stderr)
-        if not fixes:
-            detail = "; ".join(pair_rejects) or "model reported no locatable issues"
-            print(f"[ERROR] no usable fixes this round. {detail}", file=sys.stderr)
-            if repair_round == MAX_REPAIR_ROUNDS:
-                if token and repo:
-                    open_issue(token, repo,
-                               f"AI produced no usable fixes. Root cause: {root_cause}\n\n{detail}", run_url)
-                sys.exit(3)
-            continue
+            print(f"  issues reported: {len(issues)}")
+            for n, it in enumerate(issues, 1):
+                print(f"    {n}. {it.get('file','?')}: {it.get('problem','')[:80]}")
+
+            fixes, pair_rejects = issues_to_fixes(issues, evidence)
+            for rej in pair_rejects:
+                print(f"  ✗ {rej}", file=sys.stderr)
+            if not fixes:
+                detail = "; ".join(pair_rejects) or "model reported no locatable issues"
+                print(f"[ERROR] no usable fixes this round. {detail}", file=sys.stderr)
+                if repair_round == MAX_REPAIR_ROUNDS:
+                    if token and repo:
+                        open_issue(token, repo,
+                                   f"AI produced no usable fixes. Root cause: {root_cause}\n\n{detail}", run_url)
+                    sys.exit(3)
+                continue
 
         print("\n━━━ PYTHON VALIDATION ENGINE ━━━")
         if args.dry_run:
@@ -1745,7 +1990,10 @@ def main():
         # ── FAILURE: collect new evidence, revert, AI reviews it ──
         print(f"[REPAIR] round {repair_round} failed tests/build — reverting.")
         combined_output = (test_output + "\n" + docker_output).strip()
+        retry_focused = extract_focused_failure(combined_output)
+        retry_issue_block = format_focused_issue(retry_focused, "n/a (post-fix test/build run)")
         new_signal = extract_error_signal(combined_output) or combined_output[-1500:]
+        new_signal = trim_supporting_signal(new_signal, retry_focused)
         revert_files(originals)
         written = []
 
@@ -1753,11 +2001,13 @@ def main():
             if token and repo:
                 open_issue(token, repo,
                            f"Fix applied but tests/build failed after {repair_round} "
-                           f"attempt(s) — reverted. Root cause: {root_cause}", run_url)
+                           f"attempt(s) — reverted. Root cause: {root_cause}\n\n"
+                           f"**New issue after the fix:**\n```\n{retry_issue_block[:1500]}\n```",
+                           run_url)
             sys.exit(5)
 
         print("\n━━━ AI REVIEWS NEW EVIDENCE ━━━")
-        review = ai_review_failure(root_cause, solution, new_signal)
+        review = ai_review_failure(root_cause, solution, new_signal, retry_issue_block)
         print(f"[REVIEW] decision={review['decision']} confidence={review['confidence']:.0%}")
         if review["decision"] != "retry":
             if token and repo:
@@ -1768,6 +2018,7 @@ def main():
 
         root_cause, solution = review["root_cause"], review["solution"]
         retry_note = new_signal[:1200]
+        deterministic_fixes = None  # a review cycle always goes back to the AI patch agent
 
     if not success:
         sys.exit(5)
@@ -1779,7 +2030,7 @@ def main():
         sys.exit(4)
     if token and repo:
         open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
-                investigation.get("investigation_log"), list(evidence.keys()), solution,
+                investigation_log, list(evidence.keys()), solution,
                 findings)
     else:
         print(f"[PR] No token — merge {branch} manually.")
