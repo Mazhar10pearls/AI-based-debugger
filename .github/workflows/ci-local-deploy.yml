@@ -35,20 +35,20 @@ jobs:
     steps:
       # ── Checkout ─────────────────────────────────────────────────────────
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
         with:
           fetch-depth: 0
 
       # ── Python ───────────────────────────────────────────────────────────
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: "3.12"  # Updated to a valid minor release
+          python-version: "3.1"  # Updated to a valid minor release
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r sample_app/requirements.txt
+          pip install -r sample_app/requiremesnts.txt
 
       # ── Test (always) ────────────────────────────────────────────────────
       - name: Run unit tests
