@@ -3,6 +3,35 @@
 Self-Healing CI/CD Auto-Fixer — agentic investigation flow.
 
 (Full description unchanged – see original.)
+
+── ADDED IN THIS VERSION ─────────────────────────────────────────────────────
+CI runs stop at the first failing step, so a SECOND, independent bug further
+down the same pipeline produces no log evidence in the run that's currently
+failing (e.g. a typo'd filename in a step that never executes because an
+earlier step already failed). The AI investigator is log-driven, so it will
+happily confirm root_cause after fixing only the bug that actually failed —
+and self-report all_issues_found=true even though it never looked past that
+point.
+
+Two new, additive layers close this gap after investigation but before patch
+generation. Neither replaces the AI diagnosis; both only ADD findings to it:
+
+  1. _deterministic_extra_findings() — free, regex-based. Re-runs the same
+     reference/version checks already trusted for POST-patch validation
+     (_missing_ref_map, _dockerfile_problem_map) as a PRE-patch discovery
+     pass over every file the investigator already read, plus a new
+     _workflow_version_problem_map() for python-version outside a Dockerfile.
+
+  2. _second_pass_audit() — one extra, deliberately failure-agnostic AI call
+     that reviews the same evidence files ignoring what caused THIS run's
+     failure, to catch non-regex-detectable bugs (wrong arg, wrong flag,
+     logic error) a careful reviewer would flag.
+
+Both feed into `findings`, which already flows into `patch_root_cause` via
+the existing "Individual issues to fix (address EVERY one)" text — so
+anything they catch gets fixed in the SAME PR instead of waiting for a
+future CI run to surface it one bug at a time. Nothing else in the
+investigation prompts, patch loop, or validation logic is changed.
 """
 
 import argparse
@@ -1181,6 +1210,96 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
     return result
 
 
+# ── SECOND-PASS AUDIT (NEW) ─────────────────────────────────────────────────
+# One extra, deliberately FAILURE-AGNOSTIC AI turn that reviews the same
+# evidence files the investigator already read, but is told to IGNORE what
+# caused this run's failure and just review the code like a human reviewer
+# would. This is what catches bugs the log-driven investigation structurally
+# cannot see (a later step's typo, a wrong flag, a logic error) because CI
+# stopped before that step ever ran. Complements (does not replace)
+# _deterministic_extra_findings below, which only catches regex-detectable
+# problems (missing file refs, bad version strings).
+SECOND_PASS_AUDIT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "analysis": {"type": "string"},
+        "additional_findings": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "issue":      {"type": "string"},
+                "root_cause": {"type": "string"},
+                "solution":   {"type": "string"},
+            },
+            "required": ["issue", "root_cause"]}},
+    },
+    "required": ["analysis", "additional_findings"],
+}
+
+SECOND_PASS_AUDIT_SYSTEM = """\
+You already diagnosed and confirmed a CI failure's root cause below. Now do
+an INDEPENDENT REVIEW of the SAME files, ignoring what caused THIS run's
+failure. CI stops at the first failing step, so a bug in a LATER step
+produces no log evidence yet — your job is to catch it now instead of
+waiting for a second run to fail on it separately.
+
+Go through every file line by line. Flag anything a careful reviewer would
+flag — wrong argument, typo'd filename, mismatched version, wrong flag,
+logic error — as long as it is NOT already covered by the confirmed root
+cause below. If you find nothing else, return an empty array. Do not repeat
+anything already listed under "Already confirmed".
+
+Output ONLY one JSON object, no markdown fences:
+{"analysis":"what you checked","additional_findings":[{"issue":"short name","root_cause":"why this breaks something","solution":"what to change"}]}
+"""
+
+
+def _second_pass_audit(evidence: dict, confirmed_findings: list, issue_block: str) -> list:
+    """One extra, deliberately failure-agnostic AI call. Skips cleanly if
+    there's no evidence to review or not enough time budget left — this is
+    additive and must never be the reason a run fails or times out."""
+    if not evidence:
+        return []
+    remaining = TOTAL_TIME_BUDGET - _elapsed()
+    if remaining < 60:
+        print("[AUDIT] not enough budget left for a second-pass audit — skipping.")
+        return []
+    ev_parts = [f"### {f}\n```\n{c}\n```" for f, c in evidence.items() if isinstance(c, str)]
+    if not ev_parts:
+        return []
+    confirmed_text = "\n".join(
+        f"- {f['issue']}: {f.get('root_cause','')}" for f in confirmed_findings) or "(none)"
+    prompt = (f"{SECOND_PASS_AUDIT_SYSTEM}\n\n"
+              f"## Already confirmed (do not repeat):\n{confirmed_text}\n\n"
+              f"## Original failure (for reference only — ignore for this audit):\n"
+              f"{issue_block[:800]}\n\n"
+              f"## Evidence:\n" + "\n\n".join(ev_parts))
+    if len(prompt) > MAX_PROMPT_CHARS:
+        prompt = prompt[:MAX_PROMPT_CHARS]
+    try:
+        raw = _stream_ollama(prompt, SECOND_PASS_AUDIT_SCHEMA, num_predict=900,
+                             temperature=0.05, tag="AUDIT",
+                             timeout=min(INVESTIGATION_TIMEOUT, int(remaining) - 20),
+                             retries=1)
+    except Exception as exc:
+        print(f"[AUDIT] second-pass audit failed (non-fatal): {exc}", file=sys.stderr)
+        return []
+    data = _json_from(raw) or {}
+    out = []
+    for f in (data.get("additional_findings") or []):
+        if isinstance(f, dict) and (f.get("issue") or f.get("root_cause")):
+            out.append({
+                "issue":      (f.get("issue") or f.get("root_cause") or "").strip(),
+                "root_cause": (f.get("root_cause") or "").strip(),
+                "solution":   (f.get("solution") or "").strip(),
+            })
+    if out:
+        print(f"[AUDIT] second-pass audit found {len(out)} additional issue(s): "
+              f"{[o['issue'] for o in out]}")
+    else:
+        print("[AUDIT] second-pass audit found nothing new.")
+    return out
+
+
 # ── PATCH GENERATION (unchanged) ───────────────────────────────────────────
 PATCH_SCHEMA = {
     "type": "object",
@@ -1484,7 +1603,9 @@ def _resolve_content(fix: dict) -> tuple:
 
 def _missing_ref_map(content: str, file: str) -> dict:
     """Map of token -> problem message for repo-file references that don't
-    exist. Pure observation; blocking decisions happen in _compare_ref_problems."""
+    exist. Pure observation; blocking decisions happen in _compare_ref_problems
+    (post-patch) OR are folded straight into `findings` pre-patch by
+    _deterministic_extra_findings below."""
     problems = {}
     if not content:
         return problems
@@ -1563,6 +1684,57 @@ def _dockerfile_problem_map(file: str, content: str) -> dict:
             problems[f"python:{version}"] = (
                 f"base image 'python:{version}' — not a real CPython release")
     return problems
+
+
+def _workflow_version_problem_map(file: str, content: str) -> dict:
+    """Map of key -> problem message for `python-version:` lines in GitHub
+    Actions workflow files. This is the workflow-file counterpart to
+    _dockerfile_problem_map's Python-version check above — it catches an
+    invalid version (e.g. "3.1") REGARDLESS of whether that's the line that
+    actually failed this run, which is exactly the case a log-driven-only
+    diagnosis can miss when a DIFFERENT bug in the same run failed first."""
+    problems = {}
+    if not WORKFLOW_PATTERN.search(file) or not content:
+        return problems
+    for m in WORKFLOW_PYVERSION_LINE.finditer(content):
+        major, minor = int(m.group(3)), int(m.group(4))
+        if not (major == 3 and minor in VALID_PYTHON_MINORS):
+            key = f"python-version:{major}.{minor}"
+            problems[key] = (f"python-version '{major}.{minor}' is not a "
+                             f"supported CPython release")
+    return problems
+
+
+def _deterministic_extra_findings(evidence: dict, existing_findings: list) -> list:
+    """Re-scan every evidence file the AI investigator already read using
+    ALL known deterministic checks — not just the one tied to this run's
+    failure — so syntactic bugs (missing file refs, bad version strings) get
+    caught regardless of whether they're the bug that actually failed CI
+    this time. Free (no AI call), reuses logic already trusted for
+    post-patch validation. Purely additive: only ADDS to `findings`, never
+    removes or overrides the AI's own diagnosis."""
+    already_mentioned = " ".join(
+        (f.get("issue", "") + " " + f.get("root_cause", "")) for f in existing_findings
+    ).lower()
+    extra, seen = [], set()
+    for file, content in evidence.items():
+        if not isinstance(content, str):
+            continue
+        problems = {}
+        problems.update(_missing_ref_map(content, file))
+        problems.update(_dockerfile_problem_map(file, content))
+        problems.update(_workflow_version_problem_map(file, content))
+        for token, msg in problems.items():
+            key = f"{file}:{token}"
+            if token.lower() in already_mentioned or key in seen:
+                continue
+            seen.add(key)
+            extra.append({
+                "issue": f"{file}: {msg}",
+                "root_cause": f"{file} — {msg}",
+                "solution": f"correct '{token}' in {file}",
+            })
+    return extra
 
 
 def _yaml_structure_signature(node):
@@ -2052,6 +2224,23 @@ def main():
     findings   = investigation.get("findings", [])
     investigation_log = investigation.get("investigation_log")
     confidence_omitted = investigation.get("confidence_omitted", False)
+
+    # ── CATCH BUGS THE LOG-DRIVEN DIAGNOSIS COULDN'T HAVE SEEN ──
+    # CI stops at the first failing step, so a second, independent bug
+    # further down the pipeline (e.g. a typo in a step that never ran)
+    # produces no log evidence in THIS run. These two layers only ADD to
+    # `findings` — they never override or remove the AI's own diagnosis:
+    #   1. free, regex-based re-scan of every evidence file already read
+    #   2. one extra, failure-agnostic AI review pass over the same files
+    failure_mode_precheck = investigation.get("failure_mode")
+    if not failure_mode_precheck and evidence:
+        det_extra = _deterministic_extra_findings(evidence, findings)
+        audit_extra = _second_pass_audit(evidence, findings + det_extra, issue_block)
+        new_findings = det_extra + audit_extra
+        if new_findings:
+            print(f"[GUARD] found {len(new_findings)} additional issue(s) the "
+                  f"primary diagnosis missed: {[f['issue'] for f in new_findings]}")
+            findings = findings + new_findings
 
     print("\n  ── investigation result ──")
     print(f"  OVERALL CAUSE : {root_cause}")
