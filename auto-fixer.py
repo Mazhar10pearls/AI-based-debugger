@@ -14,7 +14,8 @@ Pipeline:
               (read-only) → loop → confirms root cause
         → AI Patch Generation Agent: emits the concrete fix (flat evidence→corrected issues)
         → Python Validation Engine: format/path/syntax/YAML/JSON checks,
-              secret scanning, dangerous-command detection, safe patch verification
+              secret scanning, dangerous-command detection, AND a final check
+              that the patched file no longer references any missing files.
         → Apply changes → Execute build & tests
         → on failure: collect new failure evidence → AI reviews it → retry or stop
         → on success: commit, push, open PR
@@ -22,8 +23,10 @@ Pipeline:
 Design notes:
   * Model defaults to gemma3:4b. Override with OLLAMA_MODEL.
   * No deterministic pre‑scan ever. AI drives every investigation step.
-  * The investigation prompt now explicitly instructs the model to confirm
-    immediately when a workflow YAML shows a misspelled filename.
+  * The investigation prompt now explicitly tells the AI to search for typos in
+    the CI configuration files, not in the missing files themselves.
+  * A post‑patch validator scans the edited file for any remaining file‑reference
+    typos and rejects incomplete fixes, forcing a retry.
 """
 
 import argparse
@@ -142,6 +145,11 @@ DEFAULT_PYTHON_VERSION = os.environ.get("DEFAULT_PYTHON_VERSION", "3.12")
 
 WORKFLOW_PYVERSION_LINE = re.compile(
     r'^(\s*python-version\s*:\s*)([\'"]?)(\d+)\.(\d+)([\'"]?)(.*)$', re.M)
+
+# ── Pattern for post-patch "missing reference" validation ────────────────────
+REPO_REF_EXT_PATTERN = re.compile(
+    r'(?<![\w./\-])((?:[\w.\-]+/)*[\w\-]+\.(?:py|txt|ya?ml|json|toml|cfg|ini|'
+    r'js|jsx|ts|tsx|go|java|rb|sh))(?![\w./\-])')
 
 
 def scan_text_for_secrets(text: str) -> list:
@@ -620,10 +628,17 @@ to up to 3 EXACT paths from the "## Repository tree" list.
 "confidence", "commit_message", AND "findings".
 
 **CRITICAL RULE**: If the primary error mentions a missing file (e.g., \
-`requiements.txt`) and you have already read a workflow YAML file that contains \
-that misspelled filename on a `pip install -r ...` line, you MUST answer with \
-`root_cause_confirmed` immediately. Do NOT request more files. The typo is the \
-root cause. Report every misspelled filename you see as a separate finding.
+`sample_app/test_appp.py`), the bug is almost certainly inside the CI \
+configuration (workflow YAML) or a shell script that calls that filename, NOT \
+inside the missing file itself. You must look at the workflow/script file that \
+contains the offending command line. NEVER list the missing file as the location \
+of the bug — list the file that references it.
+
+**ALSO IMPORTANT**: When you read a workflow YAML or shell script, scan EVERY \
+`run:` or command line for arguments that look like file paths. If any of those \
+paths do not exist in the repository tree, report them as SEPARATE findings — \
+even if the currently failing step only exposes one of them. Fixing all of them \
+now prevents a second CI run from failing on the next step.
 
 Schema when confirming:
 {"analysis":"...","status":"root_cause_confirmed","root_cause":"...","solution":"...","confidence":0.0-1.0,"commit_message":"fix: short","findings":[{"issue":"...","root_cause":"...","solution":"..."}]}
@@ -775,10 +790,9 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
         print(f"[INVESTIGATE] turn {turn}: status={status} | "
               f"{analysis[:160] if analysis else '(no analysis)'}")
 
-        # If the model returned an empty or malformed response, force final decision
         if not status and turn > 1:
             print("[INVESTIGATE] empty status from model — treating as stall.")
-            stall_count += 2  # force final decision below
+            stall_count += 2
 
         log.append({"turn": turn, "status": status, "analysis": analysis[:200]})
 
@@ -860,7 +874,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
     return result
 
 
-# ── PATCH GENERATION (improved prompt) ──────────────────────────────────────
+# ── PATCH GENERATION ──────────────────────────────────────────────────────
 PATCH_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1102,6 +1116,32 @@ def _resolve_content(fix: dict) -> tuple:
     return None, "no 'edits' or 'fixed_content'"
 
 
+def _any_reference_missing(content: str, file: str) -> str:
+    """Check if any file-like references in the patched content don't exist in the repo.
+    Returns a reason string, or '' if all referenced files exist.
+    """
+    if not content:
+        return ""
+    all_repo = [_relstrip(str(p)) for p in Path(".").rglob("*")
+                if p.is_file() and not any(d in SKIP_DIRS for d in p.parts)]
+    all_repo_set = set(all_repo)
+    parent_dir = Path(file).parent
+
+    seen_tokens = set()
+    for m in REPO_REF_EXT_PATTERN.finditer(content):
+        token = m.group(1)
+        if token in seen_tokens:
+            continue
+        seen_tokens.add(token)
+        if "${{" in token or token.startswith("."):
+            continue
+        candidates = {token, _relstrip(str(parent_dir / token))}
+        if any(c in all_repo_set or Path(c).is_file() for c in candidates):
+            continue
+        return f"patched file still references missing '{token}'"
+    return ""
+
+
 def _dockerfile_still_broken(file: str, content: str) -> str:
     if "dockerfile" not in Path(file).name.lower():
         return ""
@@ -1264,6 +1304,11 @@ def validate_fix(fix: dict) -> tuple:
     docker_reason = _dockerfile_still_broken(file, content)
     if docker_reason:
         return False, f"safe patch verification failed: {docker_reason}"
+
+    # Post-patch missing-reference check (catches leftover typos)
+    ref_reason = _any_reference_missing(content, file)
+    if ref_reason:
+        return False, ref_reason
 
     return True, "ok"
 
