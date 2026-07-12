@@ -3,19 +3,18 @@
 Self-Healing CI/CD Auto-Fixer — agentic investigation flow.
 
 Pipeline:
-
     GitHub Actions Pipeline Failed
         → Python: collect initial evidence (logs, exit code, repo tree, git diff)
-        → Python: distill a FOCUSED issue statement (primary error, failing
-              step, AND the command that triggered it)
+        → Python: distill a FOCUSED issue statement (primary error, failing step,
+              AND the command that triggered it)
         → AI Investigation Agent (multi-turn loop, ALWAYS runs):
               reads the focused issue + evidence → forms hypothesis →
               requests more files if needed → Python fetches requested files
               (read-only) → loop → confirms root cause
-        → AI Patch Generation Agent: emits the concrete fix (flat evidence→corrected issues)
+        → AI Patch Generation Agent: emits the concrete fix
         → Python Validation Engine: format/path/syntax/YAML/JSON checks,
-              secret scanning, dangerous-command detection, AND a final check
-              that the patched file no longer references any missing files.
+              secret scanning, dangerous-command detection, AND a check that
+              the patched file no longer references any missing files.
         → Apply changes → Execute build & tests
         → on failure: collect new failure evidence → AI reviews it → retry or stop
         → on success: commit, push, open PR
@@ -23,10 +22,10 @@ Pipeline:
 Design notes:
   * Model defaults to gemma3:4b. Override with OLLAMA_MODEL.
   * No deterministic pre‑scan ever. AI drives every investigation step.
-  * The investigation prompt now explicitly tells the AI to search for typos in
-    the CI configuration files, not in the missing files themselves.
-  * A post‑patch validator scans the edited file for any remaining file‑reference
-    typos and rejects incomplete fixes, forcing a retry.
+  * Investigation is limited to 2 turns (enough for "read workflow → confirm").
+  * The prompt explicitly instructs the model to look for ALL misspelled file references
+    in the CI configuration and confirm immediately after reading it.
+  * A post‑patch validator rejects fixes that still contain missing file references.
 """
 
 import argparse
@@ -68,15 +67,15 @@ def _budget_exceeded() -> bool:
     return _run_start_time is not None and _elapsed() >= TOTAL_TIME_BUDGET
 
 
-# ── Agentic-loop bounds ──────────────────────────────────────────────────────
-MAX_INVESTIGATION_TURNS = int(os.environ.get("MAX_INVESTIGATION_TURNS", "4"))
-MAX_FILES_PER_REQUEST   = int(os.environ.get("MAX_FILES_PER_REQUEST", "3"))
+# ── Agentic-loop bounds (tighter for focused investigation) ──────────────────
+MAX_INVESTIGATION_TURNS = int(os.environ.get("MAX_INVESTIGATION_TURNS", "2"))   # 2 turns max
+MAX_FILES_PER_REQUEST   = int(os.environ.get("MAX_FILES_PER_REQUEST", "1"))     # force focus
 MAX_REPAIR_ROUNDS       = int(os.environ.get("MAX_REPAIR_ROUNDS", "2"))
 
 # ── Prompt / context budget ───────────────────────────────────────────────────
 MAX_ERROR_LINES   = 14
 MAX_SUPPORTING_LINES = 10
-MAX_FILE_CHARS    = int(os.environ.get("MAX_FILE_CHARS", "2500"))
+MAX_FILE_CHARS    = int(os.environ.get("MAX_FILE_CHARS", "2000"))  # smaller for faster prefill
 MAX_TOTAL_CONTEXT = int(os.environ.get("MAX_TOTAL_CONTEXT", "5000"))
 MAX_FILES_FIXED   = 4
 MAX_PROMPT_CHARS  = int(os.environ.get("MAX_PROMPT_CHARS", "8000"))
@@ -146,7 +145,7 @@ DEFAULT_PYTHON_VERSION = os.environ.get("DEFAULT_PYTHON_VERSION", "3.12")
 WORKFLOW_PYVERSION_LINE = re.compile(
     r'^(\s*python-version\s*:\s*)([\'"]?)(\d+)\.(\d+)([\'"]?)(.*)$', re.M)
 
-# ── Pattern for post-patch "missing reference" validation ────────────────────
+# ── Pattern for post‑patch "missing reference" validation ────────────────────
 REPO_REF_EXT_PATTERN = re.compile(
     r'(?<![\w./\-])((?:[\w.\-]+/)*[\w\-]+\.(?:py|txt|ya?ml|json|toml|cfg|ini|'
     r'js|jsx|ts|tsx|go|java|rb|sh))(?![\w./\-])')
@@ -336,12 +335,10 @@ def extract_focused_failure(log_text: str) -> dict:
                 msg_line_idx = i
                 break
         if msg_line_idx is not None:
-            # grab the line right before the error
             if msg_line_idx > 0:
                 prev = log_lines[msg_line_idx - 1].strip()
                 if prev and not any(n in prev.lower() for n in NOISE_KEYWORDS):
                     command_context_lines.append(prev)
-            # also try to find a line that contains the same filename
             error_filename = None
             for ref in file_refs:
                 if ref in primary_message:
@@ -586,7 +583,7 @@ def _json_from(raw: str):
     return None
 
 
-# ── AI INVESTIGATION AGENT (improved prompt) ─────────────────────────────────
+# ── AI INVESTIGATION AGENT (strict, focused prompt) ──────────────────────────
 INVESTIGATE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -610,38 +607,30 @@ INVESTIGATE_SCHEMA = {
 }
 
 INVESTIGATE_SYSTEM = """\
-You are a DevOps investigation agent diagnosing a CI/CD failure. You do NOT know \
-the root cause yet — think like a senior engineer: read the evidence, form a \
-hypothesis, and if you're not sure, ask for the specific file(s) that would \
-confirm or rule it out.
+You are a DevOps investigation agent. Your job is to find the root cause of a CI failure quickly.
 
-Focus ONLY on the "## ISSUE TO SOLVE" section below — that is Python's own \
-distillation of what actually broke this run. The supporting log lines, diff, \
-and repo tree underneath are context.
+**RULES (follow strictly):**
+
+1. The "## ISSUE TO SOLVE" section tells you exactly what broke.
+2. If the error says "No such file or directory: 'X'", the problem is **not** inside X.
+   X does not exist. The problem is in the CI configuration file (workflow YAML) or script
+   that **calls** X with a misspelled name.
+3. If you have not yet read the CI workflow YAML, request it NOW. The workflow YAML is
+   almost always named like `.github/workflows/ci*.yml` – pick the one from the repository tree.
+4. After reading the workflow YAML:
+   a) Scan **every** `run:` line and **every** command argument that looks like a file path.
+   b) For each such path, check if it exists in the "## Repository tree". If it does NOT exist
+      (but a similar file does), you have found a typo.
+   c) **Immediately respond with status `root_cause_confirmed`** – DO NOT request more files.
+      List each misspelled file as a separate finding.
+5. Do NOT request the missing file itself – it doesn't exist. Request the file that
+   **references** it (the workflow YAML, Dockerfile, shell script, etc.).
+6. Confidence must be 0.9 or higher if you see the typo directly in the evidence.
 
 Output ONLY one JSON object. No markdown fences.
 
-Each turn, choose exactly one status:
-  - "need_more_info": you cannot confirm a root cause yet. Set "requested_files" \
-to up to 3 EXACT paths from the "## Repository tree" list.
-  - "root_cause_confirmed": you are confident. Fill in "root_cause", "solution", \
-"confidence", "commit_message", AND "findings".
-
-**CRITICAL RULE**: If the primary error mentions a missing file (e.g., \
-`sample_app/test_appp.py`), the bug is almost certainly inside the CI \
-configuration (workflow YAML) or a shell script that calls that filename, NOT \
-inside the missing file itself. You must look at the workflow/script file that \
-contains the offending command line. NEVER list the missing file as the location \
-of the bug — list the file that references it.
-
-**ALSO IMPORTANT**: When you read a workflow YAML or shell script, scan EVERY \
-`run:` or command line for arguments that look like file paths. If any of those \
-paths do not exist in the repository tree, report them as SEPARATE findings — \
-even if the currently failing step only exposes one of them. Fixing all of them \
-now prevents a second CI run from failing on the next step.
-
-Schema when confirming:
-{"analysis":"...","status":"root_cause_confirmed","root_cause":"...","solution":"...","confidence":0.0-1.0,"commit_message":"fix: short","findings":[{"issue":"...","root_cause":"...","solution":"..."}]}
+Schema when confirming (use for findings):
+{"analysis":"…","status":"root_cause_confirmed","root_cause":"one-sentence summary","solution":"…","confidence":0.9,"commit_message":"fix: correct typos in workflow file","findings":[{"issue":"short name","root_cause":"why this typo breaks the build","solution":"what to change"}]}
 """
 
 
@@ -1611,6 +1600,11 @@ def main():
 
     focused = extract_focused_failure(log_text)
     issue_block = format_focused_issue(focused, exit_code)
+
+    # Dynamic hint: if the error is "No such file", nudge the AI toward the workflow file
+    if "No such file" in focused.get("primary_message", ""):
+        issue_block += "\n(Hint: the command that caused this error almost certainly lives in a .github/workflows/*.yml file. Start there.)"
+
     supporting_signal = trim_supporting_signal(signal, focused)
     print(f"[EVIDENCE] Focused issue: {(focused.get('primary_message') or '(none)')[:160]}")
     if focused.get("failing_step"):
