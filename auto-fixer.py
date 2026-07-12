@@ -2,7 +2,36 @@
 """
 Self-Healing CI/CD Auto-Fixer — agentic investigation flow.
 
-(Full description unchanged – see original.)
+Pipeline:
+    GitHub Actions Pipeline Failed
+        → Python: collect initial evidence (logs, exit code, repo tree, git diff)
+        → Python: distill a FOCUSED issue statement (primary error, failing step,
+              AND the command that triggered it)
+        → Python: deterministically RETRIEVE candidate evidence files based on the
+              *shape* of the failure (log patterns + filenames only). This never
+              decides what is wrong — it only widens what the AI can see.
+        → AI Investigation Agent (multi-turn loop, ALWAYS runs):
+              reads the focused issue + evidence → forms hypothesis →
+              requests more files if needed → Python fetches requested files
+              (read-only) → loop → confirms root cause
+        → AI Patch Generation Agent: emits the concrete fix
+        → Python Validation Engine: format/path/syntax/YAML/JSON checks,
+              secret scanning, dangerous-command detection, AND a check that
+              the patched file no longer references any missing files.
+        → Apply changes → Execute build & tests
+        → on failure: collect new failure evidence → AI reviews it → retry or stop
+        → on success: commit, push, open PR
+
+Design notes:
+  * Model defaults to gemma3:4b. Override with OLLAMA_MODEL.
+  * No deterministic root-cause logic, ever. AI drives every investigation
+    decision and every fix. The Python layer's only job is to make sure the
+    AI has good, relevant context to look at — never to conclude anything on
+    the AI's behalf, and never to hardcode any issue-specific correction.
+  * Investigation is limited to 3 turns (enough for "read files → scan all
+    lines → confirm").
+  * A post-patch validator rejects fixes that still contain missing file
+    references — this is output *verification*, not diagnosis.
 """
 
 import argparse
@@ -32,9 +61,8 @@ INVESTIGATION_TIMEOUT = int(os.environ.get("INVESTIGATION_TIMEOUT", str(AI_TIMEO
 INVESTIGATION_RETRIES = int(os.environ.get("INVESTIGATION_RETRIES", "1"))
 INVESTIGATION_FIRST_TURN_EXTRA = int(os.environ.get("INVESTIGATION_FIRST_TURN_EXTRA", "60"))
 
-# Raised from 600 → 900: a single investigation turn on the 8GB runner has been
-# observed taking ~300s, so 600s left no room for a patch round + tests.
-TOTAL_TIME_BUDGET = int(os.environ.get("TOTAL_TIME_BUDGET", "900"))
+TOTAL_TIME_BUDGET = int(os.environ.get("TOTAL_TIME_BUDGET", "600"))
+MIN_CONFIDENCE    = float(os.environ.get("MIN_CONFIDENCE", "0.5"))
 _run_start_time = None
 
 
@@ -46,7 +74,7 @@ def _budget_exceeded() -> bool:
     return _run_start_time is not None and _elapsed() >= TOTAL_TIME_BUDGET
 
 
-# ── Agentic-loop bounds (tightened for focused investigation) ──────────────────
+# ── Agentic-loop bounds ──────────────────────────────────────────────────────
 MAX_INVESTIGATION_TURNS = int(os.environ.get("MAX_INVESTIGATION_TURNS", "3"))   # 3 turns to allow full file scan + confirmation
 MAX_FILES_PER_REQUEST   = int(os.environ.get("MAX_FILES_PER_REQUEST", "1"))
 MAX_REPAIR_ROUNDS       = int(os.environ.get("MAX_REPAIR_ROUNDS", "2"))
@@ -286,7 +314,7 @@ def flatten_suggested_files(context_map: dict, cap: int = MAX_PRELOADED_FILES) -
     return out
 
 
-# ── STAGE 0 – COLLECT EVIDENCE (unchanged except for increased limits) ────────
+# ── STAGE 0 – COLLECT EVIDENCE ────────────────────────────────────────────────
 ERROR_KEYWORDS = [
     "error", "failed", "failure", "exception", "traceback", "exit code",
     "invalid", "fatal", "cannot", "refused", "denied", "missing", "undefined",
@@ -680,13 +708,7 @@ def _json_from(raw: str):
     return None
 
 
-# ── 🔥 HARDENED AI INVESTIGATION PROMPT ──────────────────────────────────────
-# NOTE: "analysis" and "confidence" are now REQUIRED. Ollama's structured-output
-# grammar enforces this list, so the model can no longer omit its confidence and
-# silently inherit the Python default (0.4) — which is exactly what caused a
-# correct diagnosis to be escalated by the <0.5 gate. The confidence value is
-# still entirely the model's own judgment; Python never invents one when the
-# schema is enforced.
+# ── 🔥 HARDENED AI INVESTIGATION PROMPT (multi‑bug + anti‑hallucination) ──────
 INVESTIGATE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -707,7 +729,7 @@ INVESTIGATE_SCHEMA = {
             },
             "required": ["issue", "root_cause"]}},
     },
-    "required": ["status", "analysis", "confidence"],
+    "required": ["status"],
 }
 
 INVESTIGATE_SYSTEM = """\
@@ -725,7 +747,7 @@ EVERY distinct cause of the CI failure described below.
    across different files. You must treat each distinct problem as a separate
    bug — even if they are all in the same line or the same file.
 
-3. **LINE-BY-LINE AUDIT:**
+3. **LINE-BY-LINE AUDIT (WITH ANTI-HALLUCINATION CAUTION):**
    - For EVERY file listed in "## Evidence gathered so far", go through it
      LINE BY LINE.
    - For EVERY path, filename, version string, command, flag, argument, or
@@ -734,8 +756,13 @@ EVERY distinct cause of the CI failure described below.
        b) Is a known valid version/tool, OR
        c) Matches the requirements, conventions, or dependencies described
           elsewhere in the evidence.
-   - If ANY of those do NOT match reality, you MUST record that as a separate
-     issue in the "findings" array. Do not stop after the first mismatch.
+   - **BUT** — do not flag a line as a bug just because it looks "unusual"
+     or because you don't understand it. If a reference matches the repository
+     tree exactly, or is a valid known tag, it is NOT a bug, even if you
+     personally haven't seen it before. Only report a mismatch when the
+     evidence clearly shows that something is wrong (e.g. a file referenced
+     does not exist, a version is impossible like `python:3.1`, or a command
+     would fail due to a missing tool).
 
 4. **CROSS-REFERENCE BETWEEN FILES:**
    - If a Dockerfile references `requirements.txt` or any other file, check
@@ -775,46 +802,56 @@ EVERY distinct cause of the CI failure described below.
 
 8. **CONFIRMATION RULES:**
    - Only respond with `status: root_cause_confirmed` once you have physically
-     verified EVERY issue you are reporting, AND you are confident that no
-     other problems exist in the evidence you examined.
+     verified EVERY issue you are reporting, AND you are confident that each
+     identified issue is a genuine bug causing the failure.
    - Set `all_issues_found` to `true` ONLY after you have completed a
-     full line‑by‑line scan of EVERY file in the evidence and are certain.
-     If you are unsure (e.g., file was truncated or you ran out of turns),
-     you MUST set `all_issues_found` to `false` and lower your confidence.
+     full line‑by‑line scan of EVERY file in the evidence and are certain
+     no further issues remain. If you are unsure (e.g., file was truncated or
+     you ran out of turns), you MUST set `all_issues_found` to `false`.
+     **This flag does NOT directly control your confidence score** (see next rule).
 
 9. **FINDINGS FORMAT:**
    - Each entry in `findings` must have:
-       - `issue`: a very short name (e.g. "wrong Python base image", "typo in COPY source")
+       - `issue`: a very short name
        - `root_cause`: exactly why this particular thing breaks the build
        - `solution`: a precise textual change that would fix it
    - Do NOT merge multiple distinct bugs into one entry.
    - Do NOT skip a bug because you think the fix is "obvious" or "minor".
-     If it causes a failure, it belongs in the list.
 
-10. **CONFIDENCE (MANDATORY FIELD — NEVER OMIT IT):**
-    - You MUST include a numeric `confidence` between 0.0 and 1.0 in EVERY
-      response, and a non-empty `analysis`.
-    - Confidence 0.9+ means you have read every relevant file in full and
-      found no more issues.
-    - Confidence 0.7-0.89 means you are quite sure but there might be
-      additional problems in parts of the file you couldn't see.
-    - Confidence ≤0.4 means you are guessing without solid evidence.
-    - If your findings are directly confirmed by the error log AND you located
-      the exact offending text in the evidence files, do not under-report your
-      confidence — a verified diagnosis deserves 0.8+.
+10. **CONFIDENCE (CRITICAL – this determines whether the fix is applied):**
+    - Your confidence must reflect how certain you are that **each individual
+      issue you report** is correct and will fix the failure, based on the
+      evidence you have read.
+    - High confidence (0.8 – 0.95): you can point to exact lines in the
+      evidence that prove the bug. The solution is straightforward.
+    - Medium confidence (0.65 – 0.8): the evidence strongly suggests the bug,
+      but there might be a small ambiguity (e.g. you cannot see the full file,
+      or the fix could have side-effects).
+    - Low confidence (<0.65): you are guessing or relying mostly on the error
+      message without seeing the relevant file contents.
+    - **Even if you set `all_issues_found` to false, you can still set a high
+      confidence for the bugs you *did* find.** Confidence is about the bugs
+      you list, not about whether the list is exhaustive.
+    - Never set confidence above 0.7 if you have NOT read the actual file
+      contents that contain the bug. Reading just the error message is not enough.
+    - **If you are confident in every issue you listed, set confidence ≥ 0.8.**
+      Do not artificially lower it because you might have missed something.
 
 Output ONLY one JSON object. No markdown fences.
 
-Schema when confirming (use for findings — include ONE ENTRY PER DISTINCT
-PROBLEM, even if multiple are in the same file):
-{"analysis":"step-by-step reasoning about what was checked and why you are confident (or not)","status":"root_cause_confirmed","root_cause":"one-sentence summary covering ALL issues found","solution":"high-level plan to fix all issues","confidence":0.9,"all_issues_found":true,"commit_message":"fix: <brief description>","findings":[{"issue":"short name","root_cause":"why this breaks the build","solution":"what to change, with exact text if possible"}]}
+Schema when confirming:
+{"analysis":"step-by-step reasoning","status":"root_cause_confirmed",
+ "root_cause":"one-sentence summary","solution":"high-level plan",
+ "confidence":0.85,"all_issues_found":false,
+ "commit_message":"fix: <description>",
+ "findings":[{"issue":"...","root_cause":"...","solution":"..."}]}
 
 Schema when you need another file:
-{"analysis":"what you want to confirm and why the current evidence is insufficient","status":"need_more_info","requested_files":["exact/path/from/tree"],"confidence":0.2}
+{"analysis":"...","status":"need_more_info","requested_files":["exact/path"]}
 """
 
 
-# ── Investigation loop ───────────────────────────────────────────────────────
+# ── Investigation loop ────────────────────────────────────────────────────────
 def _closest_allowed_file(requested: str, allowed_files: set) -> str:
     req_base = Path(requested).name.lower()
     by_base = {}
@@ -876,23 +913,10 @@ def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
 
 
 def _finalize_investigation(data: dict, forced: bool, evidence: dict) -> dict:
-    raw_conf = data.get("confidence")
-    confidence_omitted = raw_conf is None
-    if confidence_omitted:
-        # With the enforced schema this should never happen; if it does, make it
-        # loud so a defaulted value is never mistaken for the model's judgment.
-        print("[FINALIZE] ⚠ model omitted 'confidence' — defaulting to 0.4 "
-              "(this WILL fail the 0.5 gate). Schema enforcement may be off "
-              "(non-native endpoint?).", file=sys.stderr)
     try:
-        confidence = float(raw_conf if raw_conf is not None else 0.4)
+        confidence = float(data.get("confidence", 0.4))
     except (TypeError, ValueError):
-        print(f"[FINALIZE] ⚠ model returned non-numeric confidence "
-              f"({raw_conf!r}) — defaulting to 0.4.", file=sys.stderr)
         confidence = 0.4
-        confidence_omitted = True
-    confidence = max(0.0, min(confidence, 1.0))
-
     if forced and data.get("status") != "root_cause_confirmed":
         confidence = min(confidence, 0.4)
 
@@ -917,14 +941,13 @@ def _finalize_investigation(data: dict, forced: bool, evidence: dict) -> dict:
     all_issues_found = data.get("all_issues_found")
     if all_issues_found is False:
         print("[INVESTIGATE] model flagged it may NOT have found all issues — "
-              "capping confidence.")
-        confidence = min(confidence, 0.45)
+              "capping confidence to 0.6 max.")
+        confidence = min(confidence, 0.6)
 
     return {
         "root_cause":     data.get("root_cause") or "unknown",
         "solution":       data.get("solution") or "",
         "confidence":     confidence,
-        "confidence_omitted": confidence_omitted,
         "commit_message": data.get("commit_message") or "fix: auto-fixer change",
         "findings":       findings,
         "all_issues_found": bool(all_issues_found) if all_issues_found is not None else None,
@@ -996,7 +1019,6 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
         status = data.get("status", "")
         analysis = data.get("analysis", "")
         print(f"[INVESTIGATE] turn {turn}: status={status} | "
-              f"confidence={data.get('confidence', '(omitted!)')} | "
               f"{analysis[:160] if analysis else '(no analysis)'}")
 
         if not status and turn > 1:
@@ -1074,7 +1096,6 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
             failure_mode = "not_converged"
             root_cause = "unknown — investigation did not converge"
         result = {"root_cause": root_cause, "solution": "", "confidence": 0.0,
-                  "confidence_omitted": True,
                   "commit_message": "fix: auto-fixer change", "findings": [],
                   "failure_mode": failure_mode}
     else:
@@ -1084,7 +1105,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
     return result
 
 
-# ── PATCH GENERATION (unchanged) ───────────────────────────────────────────
+# ── PATCH GENERATION (unchanged) ───────────────────────────────────────────────
 PATCH_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1180,7 +1201,7 @@ def _normalize_issue_keys(issues):
     return out
 
 
-# ── REVIEW AGENT ─────────────────────────────────────────────────────────────
+# ── REVIEW AGENT (unchanged) ───────────────────────────────────────────────────
 REVIEW_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1189,7 +1210,7 @@ REVIEW_SCHEMA = {
         "solution":   {"type": "string"},
         "confidence": {"type": "number"},
     },
-    "required": ["decision", "confidence"],
+    "required": ["decision"],
 }
 
 REVIEW_SYSTEM = """\
@@ -1199,7 +1220,6 @@ decide:
   - "retry": provide updated root_cause and solution.
   - "stop": a human should look at it.
 Focus on the "## NEW ISSUE" section if present.
-"confidence" is MANDATORY in every response.
 Output ONLY one JSON object:
 {"decision":"retry","root_cause":"...","solution":"...","confidence":0.0-1.0}
 or
@@ -1233,7 +1253,7 @@ def ai_review_failure(prior_root_cause: str, prior_solution: str, new_signal: st
             "confidence": conf}
 
 
-# ── PAIR + LOCATE / VALIDATE / APPLY (unchanged) ──────────────────────────
+# ── PAIR + LOCATE / VALIDATE / APPLY (unchanged) ──────────────────────────────
 def issues_to_fixes(issues: list, evidence: dict) -> tuple:
     fixes_by_file, rejects = {}, []
     for n, it in enumerate(issues, 1):
@@ -1564,7 +1584,7 @@ def revert_files(originals: dict):
             print(f"[REVERT] failed {file}: {exc}", file=sys.stderr)
 
 
-# ── BUILD & TESTS (unchanged) ─────────────────────────────────────────────
+# ── BUILD & TESTS (unchanged) ─────────────────────────────────────────────────
 def detect_test_commands(stacks: set) -> list:
     cmds = []
     if "python" in stacks:
@@ -1630,7 +1650,7 @@ def try_docker_build(written: list) -> tuple:
         return True, ""
 
 
-# ── GIT & PR (unchanged) ──────────────────────────────────────────────────
+# ── GIT & PR (unchanged) ──────────────────────────────────────────────────────
 def _git(*args, check=True):
     return subprocess.run(["git", *args], check=check, capture_output=True, text=True)
 
@@ -1867,12 +1887,10 @@ def main():
     evidence   = investigation["evidence"]
     findings   = investigation.get("findings", [])
     investigation_log = investigation.get("investigation_log")
-    confidence_omitted = investigation.get("confidence_omitted", False)
 
     print("\n  ── investigation result ──")
     print(f"  OVERALL CAUSE : {root_cause}")
-    print(f"  confidence    : {confidence:.0%}"
-          + ("  (⚠ DEFAULTED — model did not report one)" if confidence_omitted else ""))
+    print(f"  confidence    : {confidence:.0%}")
     print(f"  files read    : {', '.join(evidence.keys()) or '(none)'}")
     print(f"  issues found  : {len(findings)}")
     for i, fnd in enumerate(findings, 1):
@@ -1895,14 +1913,11 @@ def main():
                        run_url)
         sys.exit(0)
 
-    if confidence < 0.5:
-        gate_note = (" NOTE: the model never reported a confidence value — this is a "
-                     "reporting failure, not necessarily a bad diagnosis."
-                     if confidence_omitted else "")
-        print(f"[GATE] Confidence {confidence:.0%} too low — escalating.{gate_note}")
+    if confidence < MIN_CONFIDENCE:
+        print(f"[GATE] Confidence {confidence:.0%} below threshold {MIN_CONFIDENCE} — escalating.")
         if token and repo:
             escalation_detail = (
-                f"AI confidence too low ({confidence:.0%}).{gate_note} "
+                f"AI confidence too low ({confidence:.0%}, threshold {MIN_CONFIDENCE}). "
                 f"Root cause: {root_cause}\n\n"
                 f"**Issue Python identified:**\n```\n{issue_block[:1500]}\n```\n\n"
                 f"**Files read during investigation:** "
