@@ -140,6 +140,12 @@ REPO_REF_EXT_PATTERN = re.compile(
     r'(?<![\w./\-])((?:[\w.\-]+/)*[\w\-]+\.(?:py|txt|ya?ml|json|toml|cfg|ini|'
     r'js|jsx|ts|tsx|go|java|rb|sh))(?![\w./\-])')
 
+# Set in main() to the actual failure evidence (issue block + log signal).
+# Validators use it ONLY to decide whether a pre-existing broken reference is
+# part of the error being fixed (blocking) or unrelated noise (non-blocking).
+# This keeps validation error-driven, not file-driven.
+CURRENT_FAILURE_CONTEXT = ""
+
 
 def scan_text_for_secrets(text: str) -> list:
     return [name for name, pat in SECRET_PATTERNS if pat.search(text)]
@@ -1402,15 +1408,17 @@ def _resolve_content(fix: dict) -> tuple:
     return None, "no 'edits' or 'fixed_content'"
 
 
-def _any_reference_missing(content: str, file: str) -> str:
+def _missing_ref_map(content: str, file: str) -> dict:
+    """Map of token -> problem message for repo-file references that don't
+    exist. Pure observation; blocking decisions happen in _compare_ref_problems."""
+    problems = {}
     if not content:
-        return ""
+        return problems
     all_repo = [_relstrip(str(p)) for p in Path(".").rglob("*")
                 if p.is_file() and not any(d in SKIP_DIRS for d in p.parts)]
     all_repo_set = set(all_repo)
     parent_dir = Path(file).parent
 
-    problems = []
     seen_tokens = set()
     for m in REPO_REF_EXT_PATTERN.finditer(content):
         token = m.group(1)
@@ -1422,20 +1430,44 @@ def _any_reference_missing(content: str, file: str) -> str:
         candidates = {token, _relstrip(str(parent_dir / token))}
         if any(c in all_repo_set or Path(c).is_file() for c in candidates):
             continue
-        problems.append(f"patched file still references missing '{token}'")
-    # Report EVERY missing reference so a retry can fix them all at once
-    # instead of discovering them one rejection at a time.
-    return "; ".join(problems)
+        problems[token] = f"references missing '{token}'"
+    return problems
 
 
-def _dockerfile_still_broken(file: str, content: str) -> str:
-    if "dockerfile" not in Path(file).name.lower():
-        return ""
+def _compare_ref_problems(old_map: dict, new_map: dict, label: str) -> str:
+    """Error-driven verdict on a patched file's reference problems:
+      - problems INTRODUCED by the patch  -> always reject (regression)
+      - pre-existing problems the FAILURE EVIDENCE mentions -> reject
+        (the patch was supposed to fix exactly this)
+      - pre-existing problems unrelated to the error -> note only; the next
+        CI run is the judge of whether they matter."""
+    introduced = {k: v for k, v in new_map.items() if k not in old_map}
+    if introduced:
+        return (f"{label}: patch INTRODUCES new problem(s): "
+                + "; ".join(introduced.values()))
+    ctx = CURRENT_FAILURE_CONTEXT.lower()
+    persisting = {k: v for k, v in new_map.items() if k in old_map}
+    blocking = {k: v for k, v in persisting.items() if k.lower() in ctx}
+    if blocking:
+        return (f"{label}: the failure evidence mentions these and the patch "
+                f"leaves them broken: " + "; ".join(blocking.values()))
+    if persisting:
+        print(f"[VALIDATE] note ({label}): pre-existing issues NOT mentioned "
+              f"in the failure evidence — left for a future run to judge: "
+              + "; ".join(persisting.values()))
+    return ""
+
+
+def _dockerfile_problem_map(file: str, content: str) -> dict:
+    """Map of key -> problem message for Dockerfile references/tags. Pure
+    observation; blocking decisions happen in _compare_ref_problems."""
+    problems = {}
+    if "dockerfile" not in Path(file).name.lower() or not content:
+        return problems
     all_repo = [_relstrip(str(p)) for p in Path(".").rglob("*")
                 if p.is_file() and not any(d in SKIP_DIRS for d in p.parts)]
     all_repo_set = set(all_repo)
     docker_dir = Path(file).parent
-    problems = []
     for pat, label in DOCKERFILE_REF_PATTERNS:
         for m in pat.finditer(content):
             ref = m.group(1).strip().strip("'\"")
@@ -1445,7 +1477,7 @@ def _dockerfile_still_broken(file: str, content: str) -> str:
             candidates = {ref_clean, _relstrip(str(docker_dir / ref_clean))}
             if any(Path(c).is_file() or c in all_repo_set for c in candidates):
                 continue
-            problems.append(f"{label} still references missing '{ref}' after the patch")
+            problems[ref_clean] = f"{label} references missing '{ref}'"
     for m in DOCKERFILE_FROM_PYTHON.finditer(content):
         version = m.group(2)
         base = version.split("-", 1)[0]
@@ -1454,10 +1486,9 @@ def _dockerfile_still_broken(file: str, content: str) -> str:
             continue
         major, minor = int(vm.group(1)), int(vm.group(2))
         if not (major == 3 and minor in VALID_PYTHON_MINORS):
-            problems.append(f"base image still 'python:{version}' — not a real CPython release")
-    # Report EVERY remaining problem in one rejection so the retry prompt
-    # contains the complete picture, not just the first hit.
-    return "; ".join(dict.fromkeys(problems))
+            problems[f"python:{version}"] = (
+                f"base image 'python:{version}' — not a real CPython release")
+    return problems
 
 
 def _yaml_structure_signature(node):
@@ -1590,11 +1621,17 @@ def validate_fix(fix: dict) -> tuple:
         except json.JSONDecodeError as e:
             return False, f"JSON error: {e}"
 
-    docker_reason = _dockerfile_still_broken(file, content)
+    docker_reason = _compare_ref_problems(
+        _dockerfile_problem_map(file, original_text),
+        _dockerfile_problem_map(file, content),
+        "dockerfile check")
     if docker_reason:
-        return False, f"safe patch verification failed: {docker_reason}"
+        return False, docker_reason
 
-    ref_reason = _any_reference_missing(content, file)
+    ref_reason = _compare_ref_problems(
+        _missing_ref_map(original_text, file),
+        _missing_ref_map(content, file),
+        "reference check")
     if ref_reason:
         return False, ref_reason
 
@@ -1900,6 +1937,11 @@ def main():
     focused = extract_focused_failure(log_text)
     issue_block = format_focused_issue(focused, exit_code)
 
+    # Validation scoping: the error evidence itself (never model output)
+    # decides which pre-existing problems a patch MUST fix.
+    global CURRENT_FAILURE_CONTEXT
+    CURRENT_FAILURE_CONTEXT = issue_block + "\n" + signal
+
     supporting_signal = trim_supporting_signal(signal, focused)
     print(f"[EVIDENCE] Focused issue: {(focused.get('primary_message') or '(none)')[:160]}")
     if focused.get("failing_step"):
@@ -1992,6 +2034,15 @@ def main():
     retry_issue_block = ""
     rejection_history = []  # accumulated across rounds so the model never
                             # regresses on an already-reported problem
+    rejected_fingerprints = set()  # byte-level identity of rejected fix-sets
+    last_patch_duration = 0.0
+
+    def _fixes_fingerprint(fx):
+        return repr(sorted(
+            (f.get("file", ""),
+             tuple(sorted((e.get("find", ""), e.get("replace", ""))
+                          for e in f.get("edits", []))))
+            for f in fx))
 
     for repair_round in range(1, MAX_REPAIR_ROUNDS + 1):
         if _budget_exceeded():
@@ -2003,17 +2054,31 @@ def main():
             sys.exit(5)
 
         print(f"\n━━━ AI PATCH GENERATION AGENT (round {repair_round}/{MAX_REPAIR_ROUNDS}) ━━━")
+        remaining = TOTAL_TIME_BUDGET - _elapsed()
+        if repair_round > 1 and remaining < max(60, last_patch_duration * 1.2 + 20):
+            print(f"[BUDGET] {remaining:.0f}s left but the last patch round took "
+                  f"{last_patch_duration:.0f}s — another round can't fit.")
+            if token and repo:
+                open_issue(token, repo,
+                           f"Auto-fixer ran out of budget mid-repair "
+                           f"({remaining:.0f}s left, rounds take ~{last_patch_duration:.0f}s). "
+                           f"Root cause: {root_cause}\n\nRejections so far:\n"
+                           + "\n".join(f"- {r}" for r in rejection_history), run_url)
+            sys.exit(5)
         active_issue_block = retry_issue_block or issue_block
+        _patch_t0 = time.time()
         try:
             issues = ai_generate_patch(patch_root_cause, solution, evidence,
                                        retry_note, active_issue_block)
         except Exception as exc:
+            last_patch_duration = time.time() - _patch_t0
             print(f"[ERROR] patch generation failed: {exc}", file=sys.stderr)
             if repair_round == MAX_REPAIR_ROUNDS:
                 if token and repo:
                     open_issue(token, repo, f"AI patch generation failed: {exc}", run_url)
                 sys.exit(2)
             continue
+        last_patch_duration = time.time() - _patch_t0
 
         print(f"  issues reported: {len(issues)}")
         for n, it in enumerate(issues, 1):
@@ -2022,6 +2087,23 @@ def main():
         fixes, pair_rejects = issues_to_fixes(issues, evidence)
         for rej in pair_rejects:
             print(f"  ✗ {rej}", file=sys.stderr)
+
+        if fixes:
+            fp = _fixes_fingerprint(fixes)
+            if fp in rejected_fingerprints:
+                print("[REPAIR] model repeated a previously rejected fix "
+                      "verbatim — no progress possible, escalating.",
+                      file=sys.stderr)
+                if token and repo:
+                    open_issue(token, repo,
+                               f"Auto-fixer stalled: the model kept producing the "
+                               f"same rejected patch. Root cause: {root_cause}\n\n"
+                               f"Rejections:\n"
+                               + "\n".join(f"- {r}" for r in rejection_history),
+                               run_url)
+                sys.exit(3)
+            rejected_fingerprints.add(fp)
+
         if not fixes:
             detail = "; ".join(pair_rejects) or "model reported no locatable issues"
             print(f"[ERROR] no usable fixes this round. {detail}", file=sys.stderr)
@@ -2081,6 +2163,7 @@ def main():
         retry_issue_block = format_focused_issue(retry_focused, "n/a (post-fix test/build run)")
         new_signal = extract_error_signal(combined_output) or combined_output[-1500:]
         new_signal = trim_supporting_signal(new_signal, retry_focused)
+        CURRENT_FAILURE_CONTEXT += "\n" + retry_issue_block + "\n" + new_signal
         revert_files(originals)
         written = []
 
