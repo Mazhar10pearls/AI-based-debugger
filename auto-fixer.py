@@ -9,10 +9,12 @@ Pipeline:
         → Python: distill a FOCUSED issue statement (primary error, failing
               step, trimmed traceback) — this, not the raw log, is what the
               AI is anchored to in every prompt
-        → Python: deterministic reference scan — if every candidate typo is
-              high-confidence, fix it directly and skip the AI entirely
-        → AI Investigation Agent (multi-turn loop, only when needed):
-              reads the focused issue + evidence → forms hypothesis →
+        → Python: deterministic reference scan — a HINT GENERATOR only. It
+              never fixes anything and never skips the AI: its findings are
+              logged, the relevant files are pre-loaded as evidence, and a
+              clearly-labelled hint block is injected into the AI prompt
+        → AI Investigation Agent (multi-turn loop, ALWAYS runs):
+              reads the focused issue + evidence + hints → forms hypothesis →
               requests more files if needed → Python fetches requested files
               (read-only) → loop → confirms root cause
         → AI Patch Generation Agent: emits the concrete fix (flat evidence→corrected issues)
@@ -37,12 +39,15 @@ Design notes:
     investigation, patch generation, and failure review all get this same
     anchor, so the model spends its limited context reasoning about the fix
     instead of re-deriving what broke.
-  * Some failures don't need a model at all. deterministic_reference_scan()
-    already catches typo'd file references with a similarity score; if every
-    candidate in a run clears AUTO_RESOLVE_SIMILARITY, Python builds and
-    applies the fix directly (prescan_candidates_to_fixes) without ever
-    calling Ollama — no round trip, no timeout risk, no wasted escalation
-    for a problem that was already fully solved deterministically.
+  * The deterministic pre-scan is strictly an ASSISTANT to the AI, never a
+    solver. This is an AI-based debugger by design: the AI always makes the
+    diagnosis, always sets confidence, and always authors the patch. The
+    pre-scan's whole job is to make the AI's prompt better — it runs in
+    milliseconds, spots likely typo'd file references, pre-loads the
+    relevant files as evidence (saving investigation turns), and hands the
+    model a labelled, unverified hint including the exact offending line.
+    Python narrows the search space and improves the prompt; it does not
+    pre-solve.
   * The AI never writes to disk directly. It only ever emits JSON (a file
     request, or an evidence→corrected quote). Python is the only thing that
     reads or writes files, and it re-validates every AI-authored change
@@ -139,14 +144,6 @@ MAX_TOTAL_CONTEXT = int(os.environ.get("MAX_TOTAL_CONTEXT", "10000"))
 MAX_FILES_FIXED   = 4
 MAX_PROMPT_CHARS  = int(os.environ.get("MAX_PROMPT_CHARS", "11000"))
 MAX_TRACEBACK_LINES = 12
-
-# ── Deterministic auto-resolve ────────────────────────────────────────────────
-# If every prescan candidate (see deterministic_reference_scan) clears this
-# similarity bar, Python builds and applies the fix directly and skips the
-# AI investigation/patch stages entirely for this run. A 0.9+ match against
-# a real repo file basically IS the fix — there's no diagnostic value an AI
-# call adds, only latency and timeout risk.
-AUTO_RESOLVE_SIMILARITY = float(os.environ.get("AUTO_RESOLVE_SIMILARITY", "0.90"))
 
 # ── Git flow ──────────────────────────────────────────────────────────────────
 GIT_BASE_BRANCH   = os.environ.get("GIT_BASE_BRANCH",   "develop")
@@ -737,12 +734,14 @@ PRESCAN_MIN_SIMILARITY = 0.72
 
 def deterministic_reference_scan(allowed_files: set) -> list:
     """Fast, Python-only pass over Dockerfiles and workflow YAML for broken
-    file references — no model call, no waiting. Runs in well under a
-    second versus minutes of a small local model repeatedly failing to
-    produce useful output for the same class of bug. Returns a list of
-    {file, wrong_token, suggested, line, similarity} candidates; empty list
-    if nothing found, in which case the caller falls back to the full AI
-    investigation."""
+    file references. This is a HINT GENERATOR, nothing more: it never fixes
+    anything, never sets confidence, and never bypasses the AI. Its findings
+    are (a) logged so a human reading the run sees exactly what static
+    analysis noticed and where, and (b) rendered into the investigation
+    prompt via format_prescan_hint() so the AI starts with a sharper prompt
+    instead of a cold one. The AI always makes the diagnosis and always
+    authors the patch. Returns a list of {file, wrong_token, suggested,
+    line, similarity} candidates; empty list if nothing suspicious found."""
     candidates = []
     for f in sorted(allowed_files):
         if not PRESCAN_FILE_PATTERN.search(f):
@@ -767,29 +766,49 @@ def deterministic_reference_scan(allowed_files: set) -> list:
             line_start = content.rfind("\n", 0, m.start()) + 1
             line_end = content.find("\n", m.end())
             line = content[line_start:(line_end if line_end != -1 else len(content))].strip()
+            line_no = content.count("\n", 0, m.start()) + 1
             candidates.append({"file": f, "wrong_token": token,
                                "suggested": match, "line": line,
-                               "similarity": similarity})
-            print(f"[PRESCAN] {f}: '{token}' looks like a typo of '{match}' "
-                  f"(similarity {similarity:.2f})")
+                               "line_no": line_no, "similarity": similarity})
     return candidates
 
 
-def prescan_candidates_to_fixes(prescan: list) -> list:
-    """Turn high-confidence prescan hits directly into the same
-    {file, reason, edits} shape write_fixes()/validate_fix() expect — no AI
-    round-trip needed. Groups multiple typos in the same file into a single
-    fix entry so they're applied and validated together."""
-    fixes_by_file = {}
+def format_prescan_hint(prescan: list) -> str:
+    """Render prescan candidates as the hint block the investigation prompt
+    carries. Deliberately rich — the whole point of the pre-scan now is a
+    better prompt: the AI gets the suspicious token, the closest real file,
+    the similarity score, AND the exact offending line with its line number,
+    so it can verify the hypothesis against the pre-loaded evidence in one
+    look instead of hunting for the line itself."""
+    lines = []
     for c in prescan:
-        entry = fixes_by_file.setdefault(
-            c["file"], {"file": c["file"], "reason": "", "edits": []})
-        edit = {"find": c["wrong_token"], "replace": c["suggested"]}
-        if edit not in entry["edits"]:
-            entry["edits"].append(edit)
-        note = f"'{c['wrong_token']}' -> '{c['suggested']}'"
-        entry["reason"] = (entry["reason"] + "; " + note).lstrip("; ")[:300]
-    return list(fixes_by_file.values())
+        lines.append(
+            f"- {c['file']} (line {c['line_no']}): the token '{c['wrong_token']}' does "
+            f"not match any file in the repository tree. Closest real file: "
+            f"'{c['suggested']}' (similarity {c['similarity']:.0%}).\n"
+            f"  Offending line: `{c['line']}`"
+        )
+    return "\n".join(lines)
+
+
+def log_prescan_hints(prescan: list):
+    """Human-readable run-log summary of what static analysis noticed and
+    what it's doing with it (passing context to the AI — nothing else)."""
+    if not prescan:
+        print("[PRESCAN] nothing suspicious found — investigation agent starts "
+              "with no hint.")
+        return
+    print(f"[PRESCAN] {len(prescan)} suspicious reference(s) found. These are "
+          f"HINTS ONLY — the AI investigation agent will verify, diagnose, and "
+          f"author any fix itself:")
+    for i, c in enumerate(prescan, 1):
+        print(f"[PRESCAN]   {i}. {c['file']}:{c['line_no']} — "
+              f"'{c['wrong_token']}' ≈ '{c['suggested']}' "
+              f"(similarity {c['similarity']:.0%})")
+        print(f"[PRESCAN]      line: {c['line'][:120]}")
+    print(f"[PRESCAN] → pre-loading the {len({c['file'] for c in prescan})} "
+          f"file(s) above as evidence and injecting the hint block into the "
+          f"AI prompt. No deterministic fix will be applied.")
 
 
 def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
@@ -816,17 +835,18 @@ def _build_investigation_prompt(signal, exit_code, repo_tree, git_diff,
     hint_section = ""
     if hint_text:
         hint_section = (
-            "\n## Static pre-scan hint (NOT a conclusion — verify it yourself "
-            "against the evidence below before relying on it; it can have false "
-            "positives):\n" + hint_text + "\n"
-            "Some relevant files have already been read for you and appear "
-            "under 'Evidence gathered so far'. You still decide the root cause, "
-            "confidence, and findings. But if you check the evidence and this "
-            "hint fully explains the CI failure, respond with status "
-            "\"root_cause_confirmed\" RIGHT NOW — do not request more files "
-            "just to double-check something already visible in the evidence "
-            "you have. Only ask for more if the hint does NOT explain the "
-            "failure or you need to see something else to be sure.\n"
+            "\n## Static pre-scan hints (NOT conclusions — verify each one "
+            "yourself against the evidence below before relying on it; the "
+            "scanner can have false positives):\n" + hint_text + "\n"
+            "The files named above have already been read for you and appear "
+            "under 'Evidence gathered so far'. YOU decide the root cause, "
+            "confidence, and findings — the scanner decides nothing. If, after "
+            "checking the evidence, these hints fully explain the CI failure, "
+            "respond with status \"root_cause_confirmed\" RIGHT NOW — do not "
+            "request more files just to double-check something already visible "
+            "in the evidence you have. If a hint does NOT explain the failure, "
+            "say so in your analysis and investigate normally. Remember to "
+            "report EVERY verified hint as its own findings[] entry.\n"
         )
     issue_section = f"\n## ISSUE TO SOLVE\n{issue_block}\n" if issue_block else ""
     return (
@@ -883,12 +903,12 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
     format_focused_issue) — it heads every prompt so the model stays scoped
     to the actual failure instead of re-deriving it from raw logs.
 
-    seed_evidence/hint_text let a fast Python pre-scan hand the AI a head
+    seed_evidence/hint_text let the fast Python pre-scan hand the AI a head
     start — relevant files pre-loaded, a pointer to what looks suspicious —
     WITHOUT deciding the root cause itself. The AI still reads everything,
     still has to confirm or refute the hint against the actual evidence, and
     still sets its own confidence and findings. Python assists; it doesn't
-    conclude.
+    conclude. This is the ONLY way the pre-scan influences the run.
 
     Two things keep a small model from stalling here:
       - a requested file that doesn't exist gets fuzzy-matched against the
@@ -906,7 +926,8 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
     effective_turns = MAX_TURNS_WITH_HINT if hint_text else MAX_INVESTIGATION_TURNS
     if hint_text:
         print(f"[INVESTIGATE] pre-scan hint present — capping this run to "
-              f"{effective_turns} turn(s) instead of the full {MAX_INVESTIGATION_TURNS}.")
+              f"{effective_turns} turn(s) instead of the full {MAX_INVESTIGATION_TURNS} "
+              f"(the hint tells the model where to look; it shouldn't need to explore).")
 
     for turn in range(1, effective_turns + 1):
         if _budget_exceeded():
@@ -1687,13 +1708,22 @@ def _gh(token):
 
 def open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
             investigation_log=None, evidence_files=None, solution="",
-            findings=None) -> str:
+            findings=None, prescan_hints=None) -> str:
     details = "".join(f"\n**`{f.get('file','?')}`** — {f.get('reason','')}\n" for f in fixes)
     trace = ""
     if investigation_log:
         steps = "".join(f"\n{i+1}. `{s['status']}` — {s['analysis']}"
                         for i, s in enumerate(investigation_log))
         trace = f"### Investigation trace{steps}\n\n"
+    hints_section = ""
+    if prescan_hints:
+        items = "".join(
+            f"\n- `{c['file']}:{c['line_no']}` — `{c['wrong_token']}` ≈ "
+            f"`{c['suggested']}` ({c['similarity']:.0%})"
+            for c in prescan_hints)
+        hints_section = (f"### Static pre-scan hints given to the AI "
+                         f"(context only — the AI verified and authored the fix)"
+                         f"{items}\n\n")
     issues_section = ""
     if findings:
         items = "".join(
@@ -1705,7 +1735,7 @@ def open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
     files_read = (f"**Files the agent read to diagnose this:** "
                  f"{', '.join(f'`{f}`' for f in evidence_files)}\n\n"
                  if evidence_files else "")
-    body = (f"## 🤖 AI Auto-Fix\n\n{trace}{issues_section}"
+    body = (f"## 🤖 AI Auto-Fix\n\n{trace}{hints_section}{issues_section}"
             f"**Overall root cause:** {root_cause}\n\n"
             f"**Solution:** {solution or 'n/a'}\n\n"
             f"{files_read}"
@@ -1818,54 +1848,32 @@ def main():
     repo_tree, allowed_files = repo_tree_text()
     print(f"[EVIDENCE] exit_code={exit_code} | {len(allowed_files)} readable file(s) in tree")
 
-    # ── DETERMINISTIC PRE-SCAN (context for the AI — never decides anything itself) ──
-    print("\n━━━ DETERMINISTIC REFERENCE SCAN ━━━")
+    # ── DETERMINISTIC REFERENCE SCAN — hint generator ONLY ──
+    # This is an AI-based debugger: the pre-scan never solves anything. Its
+    # sole outputs are (a) run-log lines a human can read, and (b) a richer
+    # prompt for the AI: pre-loaded evidence files + a labelled hint block
+    # with the suspicious token, closest real file, similarity, and the
+    # exact offending line. The AI investigation agent ALWAYS runs, always
+    # decides the root cause, and the AI patch agent always authors the fix.
+    print("\n━━━ DETERMINISTIC REFERENCE SCAN (hint generator — never solves) ━━━")
     prescan = deterministic_reference_scan(allowed_files)
+    log_prescan_hints(prescan)
     seed_evidence, hint_text = {}, ""
-    deterministic_fixes = None
     if prescan:
         seed_evidence = {c["file"]: _read_evidence_file(c["file"]) for c in prescan}
-        hint_lines = "\n".join(
-            f"- {c['file']}: '{c['wrong_token']}' does not appear in the repository "
-            f"tree; the closest real file is '{c['suggested']}'" for c in prescan)
-        hint_text = hint_lines
-        if all(c["similarity"] >= AUTO_RESOLVE_SIMILARITY for c in prescan):
-            deterministic_fixes = prescan_candidates_to_fixes(prescan)
-            print(f"[PRESCAN] all {len(prescan)} candidate(s) ≥ {AUTO_RESOLVE_SIMILARITY:.0%} "
-                  f"similarity — resolving deterministically, skipping the AI investigation "
-                  f"and patch-generation calls entirely for this run.")
-        else:
-            print(f"[PRESCAN] {len(prescan)} candidate(s) found — pre-loading "
-                  f"{len(seed_evidence)} file(s) and passing this as a hint to the "
-                  f"investigation agent (it still decides).")
-    else:
-        print("[PRESCAN] nothing found — investigation agent starts with no hint.")
+        hint_text = format_prescan_hint(prescan)
 
-    # ── ROOT CAUSE: deterministic resolution, or AI INVESTIGATION AGENT ──
-    if deterministic_fixes is not None:
-        findings = [{
-            "issue": f"Typo'd reference in {c['file']}",
-            "root_cause": f"'{c['wrong_token']}' does not exist in the repo; it's a "
-                          f"typo of '{c['suggested']}' (similarity {c['similarity']:.0%})",
-            "solution": f"Replace '{c['wrong_token']}' with '{c['suggested']}' in {c['file']}",
-        } for c in prescan]
-        root_cause = "; ".join(f["root_cause"] for f in findings)
-        solution   = "; ".join(f["solution"] for f in findings)
-        commit_msg = "fix: correct typo'd file reference(s)"
-        confidence = 1.0
-        evidence   = seed_evidence
-        investigation_log = []
-    else:
-        print("\n━━━ AI INVESTIGATION AGENT ━━━")
-        investigation = ai_investigate(supporting_signal, exit_code, repo_tree, git_diff,
-                                       allowed_files, seed_evidence, hint_text, issue_block)
-        root_cause = investigation["root_cause"]
-        solution   = investigation["solution"]
-        commit_msg = investigation["commit_message"]
-        confidence = investigation["confidence"]
-        evidence   = investigation["evidence"]
-        findings   = investigation.get("findings", [])
-        investigation_log = investigation.get("investigation_log")
+    # ── AI INVESTIGATION AGENT — always runs, always decides ──
+    print("\n━━━ AI INVESTIGATION AGENT ━━━")
+    investigation = ai_investigate(supporting_signal, exit_code, repo_tree, git_diff,
+                                   allowed_files, seed_evidence, hint_text, issue_block)
+    root_cause = investigation["root_cause"]
+    solution   = investigation["solution"]
+    commit_msg = investigation["commit_message"]
+    confidence = investigation["confidence"]
+    evidence   = investigation["evidence"]
+    findings   = investigation.get("findings", [])
+    investigation_log = investigation.get("investigation_log")
 
     print("\n  ── investigation result ──")
     print(f"  OVERALL CAUSE : {root_cause}")
@@ -1878,6 +1886,14 @@ def main():
             print(f"       cause: {fnd['root_cause']}")
         if fnd.get("solution"):
             print(f"       fix:   {fnd['solution']}")
+    if prescan:
+        confirmed = [c for c in prescan
+                     if any(c["wrong_token"] in (fnd.get("root_cause", "") +
+                                                 fnd.get("solution", "") +
+                                                 fnd.get("issue", ""))
+                            for fnd in findings)]
+        print(f"  hint outcome  : AI's findings reference {len(confirmed)}/{len(prescan)} "
+              f"pre-scan hint(s) — the diagnosis above is the AI's own.")
 
     if confidence < 0.5:
         print(f"[GATE] Confidence {confidence:.0%} too low — escalating instead of guessing.")
@@ -1921,40 +1937,35 @@ def main():
                            f"keeps happening.", run_url)
             sys.exit(5)
 
-        if repair_round == 1 and deterministic_fixes is not None:
-            print(f"\n━━━ DETERMINISTIC PATCH (round {repair_round}/{MAX_REPAIR_ROUNDS}) ━━━")
-            fixes = deterministic_fixes
-            print(f"  fixes: {len(fixes)} file(s) — no AI call needed")
-        else:
-            print(f"\n━━━ AI PATCH GENERATION AGENT (round {repair_round}/{MAX_REPAIR_ROUNDS}) ━━━")
-            active_issue_block = retry_issue_block or issue_block
-            try:
-                issues = ai_generate_patch(patch_root_cause, solution, evidence,
-                                           retry_note, active_issue_block)
-            except Exception as exc:
-                print(f"[ERROR] patch generation failed: {exc}", file=sys.stderr)
-                if repair_round == MAX_REPAIR_ROUNDS:
-                    if token and repo:
-                        open_issue(token, repo, f"AI patch generation failed: {exc}", run_url)
-                    sys.exit(2)
-                continue
+        print(f"\n━━━ AI PATCH GENERATION AGENT (round {repair_round}/{MAX_REPAIR_ROUNDS}) ━━━")
+        active_issue_block = retry_issue_block or issue_block
+        try:
+            issues = ai_generate_patch(patch_root_cause, solution, evidence,
+                                       retry_note, active_issue_block)
+        except Exception as exc:
+            print(f"[ERROR] patch generation failed: {exc}", file=sys.stderr)
+            if repair_round == MAX_REPAIR_ROUNDS:
+                if token and repo:
+                    open_issue(token, repo, f"AI patch generation failed: {exc}", run_url)
+                sys.exit(2)
+            continue
 
-            print(f"  issues reported: {len(issues)}")
-            for n, it in enumerate(issues, 1):
-                print(f"    {n}. {it.get('file','?')}: {it.get('problem','')[:80]}")
+        print(f"  issues reported: {len(issues)}")
+        for n, it in enumerate(issues, 1):
+            print(f"    {n}. {it.get('file','?')}: {it.get('problem','')[:80]}")
 
-            fixes, pair_rejects = issues_to_fixes(issues, evidence)
-            for rej in pair_rejects:
-                print(f"  ✗ {rej}", file=sys.stderr)
-            if not fixes:
-                detail = "; ".join(pair_rejects) or "model reported no locatable issues"
-                print(f"[ERROR] no usable fixes this round. {detail}", file=sys.stderr)
-                if repair_round == MAX_REPAIR_ROUNDS:
-                    if token and repo:
-                        open_issue(token, repo,
-                                   f"AI produced no usable fixes. Root cause: {root_cause}\n\n{detail}", run_url)
-                    sys.exit(3)
-                continue
+        fixes, pair_rejects = issues_to_fixes(issues, evidence)
+        for rej in pair_rejects:
+            print(f"  ✗ {rej}", file=sys.stderr)
+        if not fixes:
+            detail = "; ".join(pair_rejects) or "model reported no locatable issues"
+            print(f"[ERROR] no usable fixes this round. {detail}", file=sys.stderr)
+            if repair_round == MAX_REPAIR_ROUNDS:
+                if token and repo:
+                    open_issue(token, repo,
+                               f"AI produced no usable fixes. Root cause: {root_cause}\n\n{detail}", run_url)
+                sys.exit(3)
+            continue
 
         print("\n━━━ PYTHON VALIDATION ENGINE ━━━")
         if args.dry_run:
@@ -2018,7 +2029,6 @@ def main():
 
         root_cause, solution = review["root_cause"], review["solution"]
         retry_note = new_signal[:1200]
-        deterministic_fixes = None  # a review cycle always goes back to the AI patch agent
 
     if not success:
         sys.exit(5)
@@ -2031,7 +2041,7 @@ def main():
     if token and repo:
         open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
                 investigation_log, list(evidence.keys()), solution,
-                findings)
+                findings, prescan)
     else:
         print(f"[PR] No token — merge {branch} manually.")
 
