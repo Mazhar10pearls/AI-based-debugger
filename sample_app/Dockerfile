@@ -5,5 +5,5 @@ COPY requirementss.txt .
 RUN pip install --no-cache-dir -r requiremensts.txt
 COPY . .
 EXPOSE 5000
-CMD ["python", "apssp.py"]
+CMD ["python", "apsspp.py"]
  
