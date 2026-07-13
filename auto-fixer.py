@@ -355,6 +355,50 @@ def flatten_suggested_files(context_map: dict, cap: int = MAX_PRELOADED_FILES) -
     return out
 
 
+def retrieve_files_by_error_tokens(error_tokens: list, allowed_files: set,
+                                   cap: int = MAX_PRELOADED_FILES) -> list:
+    """OBSERVATION-ONLY retrieval that works for ANY error type, independent
+    of the failure-category signatures: the error log itself names things
+    (paths, values, identifiers) — find the repo files whose NAME matches one
+    of those tokens or whose CONTENT contains one. Fully log-driven: no
+    knowledge of what kind of error this is is used or needed. This is the
+    fallback that guarantees the audit/pinning pipeline gets evidence even
+    for failure shapes the category signatures have never seen. Files are
+    ranked by how many DISTINCT error tokens they hit."""
+    if not error_tokens:
+        return []
+    scores = {}
+    # 1) filename matches (cheap)
+    for f in allowed_files:
+        name = Path(f).name.lower()
+        for tok in error_tokens:
+            tbase = tok.rsplit("/", 1)[-1].lower()
+            if tbase and (tbase == name or (len(tbase) >= 5 and tbase in name)):
+                scores[f] = scores.get(f, 0) + 2
+    # 2) content matches (bounded scan)
+    scanned = 0
+    for f in sorted(allowed_files):
+        if scanned >= 200:
+            break
+        p = Path(f)
+        if not p.is_file() or not _is_text_file(p):
+            continue
+        scanned += 1
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        hits = sum(1 for tok in set(error_tokens) if tok and tok in text)
+        if hits:
+            scores[f] = scores.get(f, 0) + hits
+    ranked = sorted(scores.items(), key=lambda kv: -kv[1])[:cap]
+    if ranked:
+        print(f"[EVIDENCE] Token-driven retrieval (category-agnostic) matched "
+              f"{len(ranked)} file(s) the error itself points at: "
+              f"{[f for f, _ in ranked]}")
+    return [f for f, _ in ranked]
+
+
 # ── STAGE 0 – COLLECT EVIDENCE (unchanged except for increased limits) ────────
 ERROR_KEYWORDS = [
     "error", "failed", "failure", "exception", "traceback", "exit code",
@@ -1264,6 +1308,11 @@ def preflight_reference_audit(evidence_files: dict, allowed_files: set) -> tuple
         problems = {}
         problems.update(_missing_ref_map(content, fname))
         problems.update(_dockerfile_problem_map(fname, content))
+        if WORKFLOW_PATTERN.search(fname):
+            # reuse the validator's workflow-version observation as facts too
+            for v in invalid_workflow_python_versions(content):
+                problems[v] = (f"python-version '{v}' is not a real released "
+                               f"CPython version")
         for token, desc in problems.items():
             key = (fname, token)
             if key in seen:
@@ -1307,6 +1356,75 @@ def preflight_reference_audit(evidence_files: dict, allowed_files: set) -> tuple
         if f["closest"]:
             tokens.append(f["closest"])
     return "\n".join(parts), tokens, facts
+
+
+_DOCKER_WORKDIR = re.compile(r'^\s*WORKDIR\s+(\S+)', re.I | re.M)
+_CONTAINER_ABS_PATH = re.compile(r"(/[\w.\-]+(?:/[\w.\-]+)*/[\w.\-]+\.\w{1,6})")
+
+
+def map_container_paths_to_repo(focused: dict, signal: str,
+                                evidence_files: dict) -> str:
+    """OBSERVATION ONLY (not diagnosis): a runtime error from INSIDE a
+    container names paths in the CONTAINER filesystem (e.g.
+    '/app/apsspp.py'), while the file the model must edit shows the
+    repo-side spelling (e.g. CMD [\"python\", \"apsspp.py\"]). Small models
+    reliably copy the container path from the log as their 'evidence', which
+    then matches nothing. Using the WORKDIR value(s) read from the
+    Dockerfile(s) already in evidence, report the mapping between each
+    container path in the error and the repo-side reference — and the exact
+    Dockerfile line that carries it. Python maps paths; it never says what
+    the fix is."""
+    dockerfiles = {f: c for f, c in (evidence_files or {}).items()
+                   if isinstance(c, str) and "dockerfile" in Path(f).name.lower()}
+    if not dockerfiles:
+        return ""
+    blob = "\n".join(filter(None, [
+        focused.get("primary_message", ""),
+        "\n".join(focused.get("gh_errors", []) or []),
+        signal or "",
+    ]))
+    notes, seen = [], set()
+    for m in _CONTAINER_ABS_PATH.finditer(blob):
+        cpath = m.group(1)
+        low = cpath.lower()
+        if cpath in seen or low.startswith(("/home/", "/usr/", "/opt/", "/tmp/",
+                                            "/var/", "/etc/", "/proc/", "/sys/")):
+            continue
+        seen.add(cpath)
+        for dfile, dcontent in dockerfiles.items():
+            for wm in _DOCKER_WORKDIR.finditer(dcontent):
+                workdir = wm.group(1).rstrip("/")
+                if not workdir or not cpath.startswith(workdir + "/"):
+                    continue
+                rel = cpath[len(workdir) + 1:]
+                base = rel.rsplit("/", 1)[-1]
+                # exact Dockerfile line(s) that reference this file
+                carrier = ""
+                for raw in dcontent.splitlines():
+                    if (rel in raw or base in raw) and raw.strip() \
+                            and not raw.strip().upper().startswith("WORKDIR"):
+                        carrier = raw.strip()
+                        break
+                note = (f"- Container path '{cpath}' in the error is "
+                        f"'{rel}' relative to WORKDIR '{workdir}' in "
+                        f"'{dfile}' — i.e. it refers to the build-context "
+                        f"file '{rel}', NOT to a repo path starting with "
+                        f"'{workdir}/'.")
+                if carrier:
+                    note += (f"\n    The Dockerfile line that references it is "
+                             f"(copy THIS VERBATIM as 'evidence', never the "
+                             f"container path from the log): {carrier}")
+                notes.append(note)
+                break
+        if len(notes) >= 4:
+            break
+    if not notes:
+        return ""
+    print(f"[EVIDENCE] Container-path bridge: mapped {len(notes)} container "
+          f"path(s) from the error onto repo-side Dockerfile line(s).")
+    return ("Container-path → repository mapping (the error was produced "
+            "INSIDE the container; these are the repo-side facts):\n"
+            + "\n".join(notes))
 
 
 def unaddressed_audit_facts(issues: list, audit_facts: list) -> list:
@@ -1964,6 +2082,12 @@ section below. NEVER use text from the error log, the root cause, or your
 own paraphrase as "evidence" — if the exact characters are not in the file
 contents shown, the patch will be rejected.
 
+CONTAINER PATHS: runtime errors name paths as they exist INSIDE the
+container (e.g. '/app/apsspp.py'). The file contents show the repo-side
+line (e.g. `CMD ["python", "apsspp.py"]`). Your "evidence" must be the
+repo-side line from "## File contents" — never a container path like
+'/app/...' from the log.
+
 DO NOT ESCAPE CHARACTERS. Write paths and text plainly:
   - file: `.github/workflows/ci-local-deploy.yml`  ✔
   - NOT `\\.github\\_workflows\\_ci-local-deploy.yml`  → WRONG
@@ -2067,8 +2191,10 @@ def _unescape_model_string(s):
         return s
     out = s
     # Drop backslashes before characters that are never escaped in a path,
-    # YAML scalar, or plain snippet (., _, /, -, :, spaces, digits, letters).
-    out = re.sub(r'\\([._/\-: 0-9A-Za-z])', r'\1', out)
+    # YAML scalar, or plain snippet (., _, /, -, :, spaces, digits, letters,
+    # quotes, brackets, commas). Quotes/brackets matter for lines like
+    # CMD ["python", "app.py"] — a leftover \" must become ", NOT /".
+    out = re.sub(r'\\(["\'\[\],._/\-: 0-9A-Za-z])', r'\1', out)
     # A backslash used as a path separator -> forward slash.
     out = out.replace("\\", "/")
     # Collapse accidental doubled separators introduced by the above.
@@ -2198,6 +2324,50 @@ def _closest_evidence_line(ev: str, evidence: dict) -> tuple:
     return best if best[2] >= 0.4 else ("", "", 0.0)
 
 
+def _reanchor_pair(ev: str, cor: str, evidence: dict):
+    """VALIDATION-SIDE RESCUE (change stays 100% model-authored): the model
+    named a change (evidence → corrected) but its 'evidence' text does not
+    exist verbatim in any provided file — typically because it copied the
+    CONTAINER path from the error log ('/app/apsspp.py') or paraphrased the
+    line. Extract the model's OWN changed fragment (diff of its evidence vs
+    its corrected) and re-anchor that exact change onto the closest line
+    that ACTUALLY exists. Python decides nothing about WHAT changes — only
+    WHERE the model's change lands. Same principle as _salvage_fragment,
+    applied at pairing time so a fixable patch doesn't cost a full retry
+    round. Returns (file, real_line, new_line) or None."""
+    if not isinstance(ev, str) or not isinstance(cor, str) or ev == cor:
+        return None
+    hint_file, hint_line, ratio = _closest_evidence_line(ev, evidence)
+    if not hint_file or ratio < 0.55:
+        return None
+    # The model's intended change: strip the common prefix/suffix.
+    i = 0
+    while i < len(ev) and i < len(cor) and ev[i] == cor[i]:
+        i += 1
+    j = 0
+    while (j < len(ev) - i and j < len(cor) - i
+           and ev[-1 - j] == cor[-1 - j]):
+        j += 1
+    old_frag, new_frag = ev[i:len(ev) - j], cor[i:len(cor) - j]
+    if len(old_frag.strip()) < 2:
+        return None
+    # Anchor the fragment in the REAL line (must be unambiguous).
+    if hint_line.count(old_frag) != 1:
+        of, nf = old_frag.strip(), new_frag.strip()
+        if of and hint_line.count(of) == 1:
+            old_frag, new_frag = of, nf
+        else:
+            return None
+    new_line = hint_line.replace(old_frag, new_frag, 1)
+    if new_line == hint_line or not new_line.strip():
+        return None
+    # The real line must be unambiguous in its file too.
+    content = evidence.get(hint_file)
+    if not isinstance(content, str) or content.count(hint_line) != 1:
+        return None
+    return hint_file, hint_line, new_line
+
+
 def issues_to_fixes(issues: list, evidence: dict) -> tuple:
     fixes_by_file, rejects = {}, []
     for n, it in enumerate(issues, 1):
@@ -2239,17 +2409,26 @@ def issues_to_fixes(issues: list, evidence: dict) -> tuple:
             rejects.append(f"issue #{n} ({file or '?'}): evidence ambiguous")
             continue
         else:
-            hint_file, hint_line, _ = _closest_evidence_line(ev, evidence)
-            if hint_file:
-                rejects.append(
-                    f"issue #{n} ({file or '?'}): your 'evidence' text does NOT "
-                    f"exist in any provided file — you may have copied it from "
-                    f"the error log or invented it. The closest text that "
-                    f"ACTUALLY exists is in '{hint_file}': `{hint_line}`. "
-                    f"Copy the real file text exactly.")
+            re_anchored = _reanchor_pair(ev, cor, evidence)
+            if re_anchored:
+                target, real_line, new_line = re_anchored
+                print(f"[LOCATE] issue #{n}: 'evidence' didn't exist verbatim "
+                      f"(likely copied from the error log) — re-anchored the "
+                      f"model's own change onto the real line in '{target}': "
+                      f"`{real_line[:90]}` → `{new_line[:90]}`")
+                ev, cor = real_line, new_line
             else:
-                rejects.append(f"issue #{n} ({file or '?'}): evidence not found — rejected")
-            continue
+                hint_file, hint_line, _ = _closest_evidence_line(ev, evidence)
+                if hint_file:
+                    rejects.append(
+                        f"issue #{n} ({file or '?'}): your 'evidence' text does NOT "
+                        f"exist in any provided file — you may have copied it from "
+                        f"the error log or invented it. The closest text that "
+                        f"ACTUALLY exists is in '{hint_file}': `{hint_line}`. "
+                        f"Copy the real file text exactly.")
+                else:
+                    rejects.append(f"issue #{n} ({file or '?'}): evidence not found — rejected")
+                continue
 
         entry = fixes_by_file.setdefault(
             target, {"file": target, "reason": prob or "AI fix", "edits": []})
@@ -3036,7 +3215,20 @@ def main():
               f"{list(context_map.keys())}")
         print(f"[EVIDENCE] Files pre-loaded as evidence (not a diagnosis): {suggested_files}")
     else:
-        print("[EVIDENCE] No deterministic retrieval match — AI starts from log evidence only.")
+        print("[EVIDENCE] No failure-category signature matched — relying on "
+              "token-driven retrieval below.")
+
+    # ── TOKEN-DRIVEN RETRIEVAL FALLBACK (category-agnostic, log-driven) ──
+    # Whatever the error names, find the files that name it back. This keeps
+    # the audit/pinning/fast-confirm pipeline working for ANY failure shape,
+    # not just the categories the signatures know about.
+    token_files = retrieve_files_by_error_tokens(error_tokens, allowed_files)
+    for f in token_files:
+        if f not in suggested_files and len(suggested_files) < MAX_PRELOADED_FILES:
+            suggested_files.append(f)
+    if not suggested_files:
+        print("[EVIDENCE] No retrieval match at all — AI starts from log "
+              "evidence only and requests files itself.")
 
     # ── OFFENDING-LINE LOCATION (observation, not diagnosis) ──
     # Read the deterministically-retrieved files and pin the exact line(s)
@@ -3066,6 +3258,15 @@ def main():
         for t in audit_tokens:
             if t not in error_tokens:
                 error_tokens.append(t)
+
+    # ── CONTAINER-PATH → REPO-PATH BRIDGE (observation, not diagnosis) ──
+    # Runtime errors from inside a container name container paths
+    # ('/app/apsspp.py'); the editable file shows the repo-side spelling.
+    # Map the two so the model copies the real Dockerfile line as evidence.
+    bridge = map_container_paths_to_repo(focused, signal, preloaded_contents)
+    if bridge:
+        issue_block = issue_block + "\n\n" + bridge
+        CURRENT_FAILURE_CONTEXT = issue_block + "\n" + signal
 
     # ── AI INVESTIGATION AGENT ──
     print("\n━━━ AI INVESTIGATION AGENT ━━━")
