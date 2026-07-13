@@ -742,6 +742,16 @@ def extract_error_tokens(focused: dict, signal: str) -> list:
             base = tok.rsplit("/", 1)[-1]
             if len(base) >= 4:
                 tokens.add(base)
+    # bare filename-with-extension tokens (e.g. 'requiremesnts.txt') that carry
+    # no path separator and aren't quoted would otherwise slip through — these
+    # are exactly the typo'd-filename bugs, so capture them explicitly.
+    for m in re.finditer(
+            r'(?<![\w./\-])([\w\-]+\.(?:txt|py|ya?ml|json|toml|cfg|ini|lock|'
+            r'js|jsx|ts|tsx|go|java|rb|sh|md|dockerfile))(?![\w./\-])',
+            haystack, re.I):
+        tok = m.group(1)
+        if len(tok) >= 4:
+            tokens.add(tok)
     # drop trivially-common tokens that would match everything
     return [t for t in tokens if len(t) >= 3 and t.lower() not in
             ("run", "yml", "yaml", "true", "false", "with", "name", "uses")]
@@ -1121,21 +1131,59 @@ Schema when you need another file:
 
 
 # ── Investigation loop ───────────────────────────────────────────────────────
+def _token_is_dangling(tok: str, allowed_files: set) -> bool:
+    """True if a FILE/PATH-like token does NOT resolve to anything real in the
+    repo. Version numbers, image tags (python:3.1), and other non-file tokens
+    return False — deciding those aren't our call. Pure existence check."""
+    if ":" in tok:                       # image tag / url-ish, not a repo file
+        return False
+    if re.fullmatch(r'\d+(\.\d+)+', tok):  # a version number, not a path
+        return False
+    has_slash = "/" in tok
+    has_known_ext = bool(re.search(
+        r'\.(?:txt|py|ya?ml|json|toml|cfg|ini|lock|js|jsx|ts|tsx|go|java|rb|'
+        r'sh|md)$', tok, re.I))
+    if not (has_slash or has_known_ext):   # not clearly a file reference
+        return False
+    norm = _relstrip(tok)
+    base = norm.rsplit("/", 1)[-1]
+    for f in allowed_files:
+        if f == norm or Path(f).name == base or f.endswith("/" + norm):
+            return False
+    return not Path(norm).exists()
+
+
 def locate_offending_lines(focused: dict, signal: str,
-                           evidence_files: dict) -> str:
+                           evidence_files: dict, allowed_files: set = None) -> str:
     """OBSERVATION ONLY (not diagnosis, not fix-authoring): the failure log
     often names a specific offending VALUE (a quoted version like '3.1', a
-    port, a tag). A slow/small model reliably knows WHAT is wrong but often
-    fails to copy the EXACT line into its find/replace pair — it grabs the
-    lines above the bug, or produces evidence==corrected. This helper finds
-    the exact existing line(s) that contain the flagged value and hands them
-    back verbatim, so the model has the precise 'evidence' string to copy.
-    Python states the line that EXISTS; it never writes the replacement."""
+    path, a filename). A slow/small model reliably knows WHAT is wrong but
+    often fails to copy the EXACT line into its find/replace pair.
+
+    Critically, when the error names BOTH a broken value and a correct one
+    (e.g. a Dockerfile with a typo'd 'requiremesnts.txt' on one line and the
+    correct 'requirements.txt' on the next), the model tends to grab the line
+    with the CORRECT value and 'fix' it to itself (evidence == corrected). So
+    this helper splits tokens into DANGLING (name something that doesn't exist
+    in the repo) vs. RESOLVED, and pins the dangling-token lines as the broken
+    ones — it never offers a line solely because it holds an already-valid
+    value. Python states which reference doesn't resolve and where it lives; it
+    never writes the replacement."""
     if not evidence_files:
         return ""
     tokens = extract_error_tokens(focused, signal)
     if not tokens:
         return ""
+    allowed_files = allowed_files or set()
+
+    dangling = {t for t in tokens if _token_is_dangling(t, allowed_files)}
+    # If we found dangling references, ONLY those are broken — a line that holds
+    # a resolved token is (by definition) not the missing-reference bug.
+    active_tokens = dangling if dangling else set(tokens)
+
+    def _is_comment_only(line: str) -> bool:
+        s = line.lstrip()
+        return s.startswith("#") or s.startswith("//")
 
     found = []
     seen_lines = set()
@@ -1144,13 +1192,14 @@ def locate_offending_lines(focused: dict, signal: str,
             continue
         for raw_line in content.splitlines():
             line = raw_line.strip()
-            if not line or line in seen_lines:
+            # A comment can't be the cause of a CI failure — never offer one as
+            # a fix target (this is what produced no-op edits on YAML comments).
+            if not line or line in seen_lines or _is_comment_only(line):
                 continue
-            for tok in tokens:
-                # Match the token as a whole value, not a coincidental substring.
+            for tok in active_tokens:
                 try:
                     if re.search(r'(?<![\w.])' + re.escape(tok) + r'(?![\w.])', line):
-                        found.append((fname, line, tok))
+                        found.append((fname, line, tok, tok in dangling))
                         seen_lines.add(line)
                         break
                 except re.error:
@@ -1161,16 +1210,27 @@ def locate_offending_lines(focused: dict, signal: str,
             break
     if not found:
         return ""
+    kind = "dangling reference(s)" if dangling else "flagged value(s)"
     print(f"[EVIDENCE] Offending-line locator pinned {len(found)} exact "
-          f"line(s) containing the value(s) the error flags.")
-    lines = "\n".join(
-        f"- In '{f}', this EXACT line contains the flagged value '{tok}':\n"
-        f"    {line}"
-        for f, line, tok in found)
-    return ("Exact offending line(s) located in the repository (the error names "
-            "these value(s); the lines below are copied VERBATIM from the real "
-            "files — use the relevant one as your 'evidence' string EXACTLY, and "
-            "change ONLY the flagged value in 'corrected'):\n" + lines)
+          f"line(s) containing the {kind}"
+          + (f" (dangling: {sorted(dangling)[:5]})" if dangling else "") + ".")
+    line_items = []
+    for f, line, tok, is_dangling in found:
+        tag = ("references '{}', which does NOT exist in the repository — "
+               "this is the line to fix".format(tok) if is_dangling
+               else "contains the flagged value '{}'".format(tok))
+        line_items.append(f"- In '{f}', this EXACT line {tag}:\n    {line}")
+    header = (
+        "Exact offending line(s) located in the repository. The lines below are "
+        "copied VERBATIM from the real files. Use the relevant one as your "
+        "'evidence' string EXACTLY, and in 'corrected' change ONLY the broken "
+        "token on that line. Do NOT emit an issue whose 'corrected' equals its "
+        "'evidence'. Do NOT target lines that are already correct.")
+    if dangling:
+        header += (" NOTE: the error also mentions value(s) that DO resolve "
+                   "correctly — do not touch those; fix only the dangling "
+                   "reference line(s) above.")
+    return header + "\n" + "\n".join(line_items)
 
 
 def enrich_issue_with_path_checks(focused: dict, signal: str,
@@ -2185,6 +2245,13 @@ def issues_to_fixes(issues: list, evidence: dict) -> tuple:
                 f"'<<<SKIPPED ...>>>' marker — that marker is NOT file "
                 f"content. Copy only real lines from the file.")
             continue
+        ev_first = ev.strip().splitlines()[0].lstrip() if ev.strip() else ""
+        if ev_first.startswith("#") or ev_first.startswith("//"):
+            rejects.append(
+                f"issue #{n} ({file or '?'}): 'evidence' is a COMMENT line "
+                f"(`{ev.strip()[:60]}`). A comment cannot cause a CI failure — "
+                f"target the actual broken command/value line instead.")
+            continue
         if cor.strip() == ev.strip():
             rejects.append(
                 f"issue #{n} ({file or '?'}): 'evidence' and 'corrected' are "
@@ -3043,7 +3110,8 @@ def main():
         c = _read_evidence_file(f)
         if c is not None:
             preloaded_contents[f] = c
-    offending = locate_offending_lines(focused, signal, preloaded_contents)
+    offending = locate_offending_lines(focused, signal, preloaded_contents,
+                                       allowed_files)
     if offending:
         issue_block = issue_block + "\n\n" + offending
         CURRENT_FAILURE_CONTEXT = issue_block + "\n" + signal
