@@ -1119,6 +1119,163 @@ def enrich_issue_with_path_checks(focused: dict, signal: str,
             + "\n".join(observations))
 
 
+def _read_dot_python_version() -> str:
+    """Return the major.minor from a repo-root .python-version file, or ''."""
+    p = Path(".python-version")
+    if not p.is_file():
+        return ""
+    try:
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                m = re.match(r'(\d+)\.(\d+)', line)
+                if m:
+                    return f"{m.group(1)}.{m.group(2)}"
+    except Exception:
+        pass
+    return ""
+
+
+def collect_python_version_declarations(allowed_files: set) -> dict:
+    """OBSERVATION ONLY: gather every CONCRETE python major.minor declared
+    across the repo (source of truth file, workflow, Dockerfile, packaging),
+    keyed by where it lives. Python reads and reports; it never rewrites."""
+    decls = {}
+    dot = _read_dot_python_version()
+    if dot:
+        decls[".python-version"] = dot
+    for f in sorted(allowed_files):
+        name = Path(f).name.lower()
+        try:
+            text = Path(f).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        if WORKFLOW_PATTERN.search(f):
+            # A hardcoded python-version is a concrete declaration. A
+            # `python-version-file:` reference is NOT — it defers to the file,
+            # which is exactly the coherent setup, so we don't record it.
+            for m in WORKFLOW_PYVERSION_LINE.finditer(text):
+                decls[f"{f} (python-version:)"] = f"{m.group(3)}.{m.group(4)}"
+        if name.startswith("dockerfile"):
+            for m in DOCKERFILE_FROM_PYTHON.finditer(text):
+                base = m.group(2).split("-", 1)[0]
+                vm = re.match(r'(\d+)\.(\d+)', base)
+                if vm:
+                    decls[f"{f} (FROM python:)"] = f"{vm.group(1)}.{vm.group(2)}"
+            for m in re.finditer(
+                    r'ARG\s+PYTHON_VERSION\s*=\s*["\']?(\d+)\.(\d+)', text, re.I):
+                decls[f"{f} (ARG PYTHON_VERSION)"] = f"{m.group(1)}.{m.group(2)}"
+        if name in ("pyproject.toml", "setup.py", "setup.cfg"):
+            m = re.search(r'requires[-_]python\s*=?\s*["\'][^0-9]*(\d+)\.(\d+)',
+                          text, re.I)
+            if m:
+                decls[f"{f} (requires-python)"] = f"{m.group(1)}.{m.group(2)}"
+    return decls
+
+
+def check_python_version_coherence(allowed_files: set) -> str:
+    """OBSERVATION ONLY (not diagnosis, not fix-authoring): if the repo declares
+    a Python version in more than one place and they DISAGREE, report the
+    mismatch so the model aligns them. When a .python-version file exists it is
+    named as the source of truth. Python states the facts and which value is
+    canonical; it never edits any file or decides the winner itself."""
+    decls = collect_python_version_declarations(allowed_files)
+    if len(decls) < 2:
+        return ""
+    values = set(decls.values())
+    if len(values) == 1:
+        return ""  # everything already agrees — nothing to say
+    canonical = decls.get(".python-version")
+    listing = "\n".join(f"- {loc}: {ver}" for loc, ver in decls.items())
+    if canonical:
+        guidance = (f"The '.python-version' file declares {canonical}, which is "
+                    f"the project's source of truth. Align every other "
+                    f"declaration to {canonical}.")
+    else:
+        guidance = ("There is no '.python-version' source-of-truth file; these "
+                    "declarations must be made to agree on ONE version.")
+    print(f"[EVIDENCE] Python-version coherence: {len(values)} distinct value(s) "
+          f"across {len(decls)} declaration(s) — reporting the drift.")
+    return ("Python version DISAGREEMENT across the repo (the CI runner's Python "
+            "and the image/packaging Python must match, or tests run on a "
+            "different interpreter than production ships):\n"
+            + listing + "\n" + guidance)
+
+
+# Signatures of a failure that is specifically about a Python version being
+# invalid/unavailable (setup-python, Docker base image, pyenv).
+PY_VERSION_FAILURE_SIGNATURES = [
+    re.compile(r"version\s+'?[\d.]+'?\s+.*was not found", re.I),   # setup-python
+    re.compile(r"python-version", re.I),
+    re.compile(r"failed to solve:\s*python:", re.I),               # docker FROM python:X
+    re.compile(r"docker\.io/library/python:", re.I),
+    re.compile(r"no such (?:version|python)", re.I),
+    re.compile(r"pyenv:.*version.*not installed", re.I),
+    # setup-python's python-version-file pointing at a missing file:
+    re.compile(r"python[ _-]?version[ _-]?file", re.I),
+    re.compile(r"specified python version file.*(?:does\s*n['o]?t|not)\s*exist", re.I),
+]
+
+
+def is_python_version_failure(issue_block: str, signal: str) -> bool:
+    blob = f"{issue_block}\n{signal}"
+    return any(p.search(blob) for p in PY_VERSION_FAILURE_SIGNATURES)
+
+
+def python_version_is_undefined(allowed_files: set) -> bool:
+    """True when the repo declares NO concrete Python version anywhere the tool
+    can read (.python-version, workflow python-version:, Dockerfile FROM/ARG,
+    requires-python). In that case there is nothing to anchor a fix to, so the
+    AI must NOT invent a version — Python reports the absence and the run
+    escalates for a human to define the intended version."""
+    return not collect_python_version_declarations(allowed_files)
+
+
+UNDEFINED_PYTHON_VERSION_MESSAGE = (
+    "The project doesn't define a Python version in `.python-version`, "
+    "`pyproject.toml`, the Dockerfile, or the GitHub Actions workflow. "
+    "I can't determine the intended version, and I won't guess one — picking "
+    "an arbitrary version could ship or test against the wrong interpreter. "
+    "Either add a project version file (e.g. `.python-version` with a value "
+    "like `3.12`) or infer the intended version from your package "
+    "compatibility (`requires-python`), then re-run."
+)
+
+_VERSION_FILE_REF = re.compile(
+    r"python[-_ ]?version[-_ ]?file\s*:?\s*([.\w][\w./\-]*)", re.I)
+_MISSING_FILE_ERR = re.compile(
+    r"file\s+at:?\s*([.\w][\w./\-]*)", re.I)
+
+
+def undefined_python_version_message(issue_block: str, signal: str) -> str:
+    """Return the escalation text. If the failure names a specific version file
+    the workflow expects but which is missing (e.g. `.python-version`), point
+    at THAT file explicitly — the intended fix is to create it. Otherwise fall
+    back to the generic 'no version defined anywhere' message. Python only
+    reports what the error/workflow already state; it does not choose a value."""
+    blob = f"{issue_block}\n{signal}"
+    named = None
+    # Prefer the explicit `python-version-file: X` reference (unambiguous);
+    # fall back to the "file at: X" phrasing in the error message.
+    m = _VERSION_FILE_REF.search(blob) or _MISSING_FILE_ERR.search(blob)
+    if m:
+        cand = m.group(1).strip().strip("`'\":,")
+        # Sanity: must look like a filename, not a stray word.
+        if "." in cand or "/" in cand:
+            named = cand
+    if named:
+        return (
+            f"The workflow's `setup-python` step is configured with "
+            f"`python-version-file: {named}`, but `{named}` does not exist in "
+            f"the repository, so there is no Python version to use. I won't "
+            f"invent one. To fix this, create `{named}` containing the intended "
+            f"version (e.g. `3.12`) and commit it, or replace the "
+            f"`python-version-file` reference with an explicit `python-version:` "
+            f"value — then re-run. (I can't create a brand-new file here; this "
+            f"needs a human decision on which version the project targets.)")
+    return UNDEFINED_PYTHON_VERSION_MESSAGE
+
+
 def _closest_allowed_file(requested: str, allowed_files: set) -> str:
     req_base = Path(requested).name.lower()
     by_base = {}
@@ -2453,6 +2610,32 @@ def main():
     if path_facts:
         issue_block = issue_block + "\n\n" + path_facts
         CURRENT_FAILURE_CONTEXT = issue_block + "\n" + signal
+
+    # ── PYTHON-VERSION COHERENCE (observation, not diagnosis) ──
+    # If the runner Python, the image Python, and/or .python-version disagree,
+    # surface the drift so the model aligns them to the source of truth.
+    coherence = check_python_version_coherence(allowed_files)
+    if coherence:
+        issue_block = issue_block + "\n\n" + coherence
+        CURRENT_FAILURE_CONTEXT = issue_block + "\n" + signal
+
+    # ── UNDEFINED-PYTHON-VERSION GATE (observation, not diagnosis) ──
+    # If this is a Python-version failure but the repo declares NO version
+    # anywhere, there is nothing to anchor a fix to. The AI must not invent a
+    # version — escalate with a precise message and stop before the model call.
+    if (is_python_version_failure(issue_block, signal)
+            and python_version_is_undefined(allowed_files)):
+        gate_msg = undefined_python_version_message(issue_block, signal)
+        print("[GATE] Python-version failure but the repo defines NO usable "
+              "version — refusing to guess; escalating.")
+        print(f"       {gate_msg}")
+        if token and repo:
+            open_issue(token, repo,
+                       gate_msg
+                       + f"\n\n**Failure Python identified:**\n"
+                       + f"```\n{issue_block[:1200]}\n```",
+                       run_url)
+        sys.exit(0)
 
     # ── DETERMINISTIC CONTEXT RETRIEVAL (not diagnosis) ──
     context_map = gather_deterministic_context(log_text, allowed_files)
