@@ -21,8 +21,13 @@ import yaml
 
 # ── Ollama ────────────────────────────────────────────────────────────────────
 OLLAMA_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/api/generate")
-OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL",   "gemma3:4b")
-AI_TIMEOUT     = int(os.environ.get("AI_TIMEOUT", "210"))
+# qwen2.5-coder:7b — markedly better exact-copy / JSON-schema compliance than
+# gemma3:4b for this pipeline's confirm/patch calls. Override via the
+# OLLAMA_MODEL env var (e.g. from a GitHub Actions secret/variable).
+OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL",   "qwen2.5-coder:7b")
+# 7B on an 8-core CPU prefills ~2x slower than a 4B; give each call a little
+# more wall-clock so a compliant answer isn't deadline-truncated mid-JSON.
+AI_TIMEOUT     = int(os.environ.get("AI_TIMEOUT", "240"))
 MAX_RETRIES    = int(os.environ.get("AI_MAX_RETRIES", "2"))
 RETRY_BACKOFF  = [20, 20]
 OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "16384"))   # larger context window
