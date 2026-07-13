@@ -67,7 +67,9 @@ jobs:
 
       # Read the single source of truth so the image is built on the SAME
       # Python the tests just ran on.
-      
+      - name: Resolve Python version
+        id: pyver
+        run: echo "version=$(cat .python-version)" >> "$GITHUB_OUTPUT"
 
       - name: Build Docker image
         run: |
