@@ -52,7 +52,7 @@ jobs:
 
       # ── Test (always) ────────────────────────────────────────────────────
       - name: Run unit tests
-        run: pytest sample_aprrp/test_app.py  # Corrected typo in file path
+        run: pytest sample_app/test_app.py  # Corrected typo in file path
 
       # ── Build (always — validates the Dockerfile on every branch) ─────────
       - name: Set up Docker Buildx
