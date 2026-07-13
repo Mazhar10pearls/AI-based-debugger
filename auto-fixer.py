@@ -356,7 +356,33 @@ NOISE_KEYWORDS = [
     "##[group]", "##[endgroup]", "set up job", "complete job", "post job",
     "add mask", "git config", "git version", "persist-credentials",
     "fetch-depth", "collecting ", "rootdir:", "configfile:",
+    # deprecation / runtime warnings that are never the actual failure but
+    # frequently sit right next to it in GitHub Actions logs (this is what
+    # got mis-picked as "command context" for a python-version error):
+    "deprecationwarning", "--trace-deprecation", "trace-warnings",
+    "node --trace", "(use `node", "punycode", "experimentalwarning",
+    "npm warn", "warning:", "deprecated", "notice]", "downloading",
+    "already satisfied", "reading package", "resolving", "setup-python",
+    "actions/checkout", "actions/setup", "run docker", "##[debug]",
 ]
+# A line that is plausibly the COMMAND that triggered a failure: a shell
+# invocation or a known tool call. Used to reject "the line above the error"
+# when that line is just a warning or log noise.
+COMMAND_LINE_HINTS = [
+    re.compile(r'^\s*(?:\$|>|\+)\s'),                       # shell prompt / set -x echo
+    re.compile(r'\b(?:python|pip|pytest|npm|yarn|node|go|mvn|gradle|'
+               r'docker|docker\s+buildx|curl|make|bash|sh)\b', re.I),
+    re.compile(r'\brun:\s'),                                # workflow "run:" line
+]
+
+
+def _looks_like_command(line: str) -> bool:
+    s = (line or "").strip()
+    if not s or any(n in s.lower() for n in NOISE_KEYWORDS):
+        return False
+    return any(p.search(s) for p in COMMAND_LINE_HINTS)
+
+
 FILE_REF_HINTS = [re.compile(r'File "[^"]+"'),
                   re.compile(r'[\w./\-]+\.[A-Za-z0-9]+:\d+'),
                   re.compile(r'\bDockerfile(\.\w+)?\b')]
@@ -393,6 +419,50 @@ STRONG_ERROR_LINE_PATTERNS = [
     re.compile(r'^\s*error\b[: ]', re.I),
     re.compile(r'\bfatal\b', re.I),
 ]
+
+
+_TS_PREFIX = re.compile(
+    r'^\s*\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\s+')
+
+
+def _strip_ts(line: str) -> str:
+    """Remove the leading GitHub-Actions ISO-8601 timestamp from a log line so
+    the AI sees the clean message, not '2026-07-13T01:51:41.5Z Error: ...'."""
+    return _TS_PREFIX.sub("", line)
+
+
+def _strip_log_timestamps(log_text: str) -> str:
+    return "\n".join(_strip_ts(l) for l in log_text.splitlines())
+
+
+# GitHub-Actions logs occasionally carry mojibake — null bytes, BOMs, or U+FFFD
+# replacement chars (e.g. a corrupted `--build-arg PYTHON_VERSION=` producing a
+# base image tag like '\x00\x003.12'). If that garbage reaches the AI it drives
+# a nonsense diagnosis. Strip control chars and collapse replacement-char runs.
+_CTRL_CHARS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+_REPLACEMENT_RUN = re.compile(r'[\ufffd\ufeff]+')
+
+
+def sanitize_log_text(log_text: str) -> tuple:
+    """Remove control/replacement characters from log text. Returns
+    (clean_text, corrupted_bool) — corrupted is True if any were found, so the
+    caller can lower confidence on a diagnosis built from a garbled signal."""
+    corrupted = bool(_CTRL_CHARS.search(log_text) or _REPLACEMENT_RUN.search(log_text))
+    clean = _REPLACEMENT_RUN.sub("", _CTRL_CHARS.sub("", log_text))
+    return clean, corrupted
+
+
+def looks_garbled(text: str) -> bool:
+    """True if a short string still looks corrupted after sanitizing — e.g. a
+    primary error like \"The version '3.12\" that was cut mid-token, or one with
+    a high ratio of non-ASCII noise. Used to refuse anchoring a confident
+    diagnosis on an unreadable error."""
+    if not text:
+        return False
+    if "\ufffd" in text or any(ord(c) < 32 and c not in "\t\n" for c in text):
+        return True
+    printable = sum(1 for c in text if c.isprintable() or c in "\t\n")
+    return printable / max(1, len(text)) < 0.85
 
 
 def _best_error_line(log_text: str) -> str:
@@ -488,10 +558,14 @@ def extract_focused_failure(log_text: str) -> dict:
                 msg_line_idx = i
                 break
         if msg_line_idx is not None:
-            if msg_line_idx > 0:
-                prev = log_lines[msg_line_idx - 1].strip()
-                if prev and not any(n in prev.lower() for n in NOISE_KEYWORDS):
-                    command_context_lines.append(prev)
+            # Search a small window ABOVE the error for a line that actually
+            # looks like a command (not just whatever line happened to precede
+            # it — that was grabbing Node deprecation warnings as "context").
+            for j in range(msg_line_idx - 1, max(-1, msg_line_idx - 8), -1):
+                cand = log_lines[j].strip()
+                if _looks_like_command(cand):
+                    command_context_lines.append(cand)
+                    break
             error_filename = None
             for ref in file_refs:
                 if ref in primary_message:
@@ -955,6 +1029,67 @@ Schema when you need another file:
 
 
 # ── Investigation loop ───────────────────────────────────────────────────────
+def locate_offending_lines(focused: dict, signal: str,
+                           evidence_files: dict) -> str:
+    """OBSERVATION ONLY (not diagnosis, not fix-authoring): the failure log
+    often names a specific offending VALUE (a quoted version like '3.1', a
+    port, a tag). A slow/small model reliably knows WHAT is wrong but often
+    fails to copy the EXACT line into its find/replace pair — it grabs the
+    lines above the bug, or produces evidence==corrected. This helper finds
+    the exact existing line(s) that contain the flagged value and hands them
+    back verbatim, so the model has the precise 'evidence' string to copy.
+    Python states the line that EXISTS; it never writes the replacement."""
+    if not evidence_files:
+        return ""
+    haystack = "\n".join(filter(None, [
+        focused.get("primary_message", ""),
+        "\n".join(focused.get("gh_errors", []) or []),
+        signal or "",
+    ]))
+    # Distinctive quoted or standalone tokens the error complains about, e.g.
+    # The version '3.1' ... was not found  ->  token 3.1
+    tokens = set()
+    for m in re.finditer(r"['\"]([\w.\-:/]{2,40})['\"]", haystack):
+        tokens.add(m.group(1))
+    # setup-python style bare "version 'X'"/"version X"
+    for m in re.finditer(r"version\s+['\"]?(\d+\.\d+(?:\.\d+)?)['\"]?", haystack, re.I):
+        tokens.add(m.group(1))
+    if not tokens:
+        return ""
+
+    found = []
+    seen_lines = set()
+    for fname, content in evidence_files.items():
+        if not isinstance(content, str):
+            continue
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if not line or line in seen_lines:
+                continue
+            for tok in tokens:
+                # Match the token as a whole value, not a coincidental substring.
+                if re.search(r'(?<![\w.])' + re.escape(tok) + r'(?![\w.])', line):
+                    found.append((fname, line, tok))
+                    seen_lines.add(line)
+                    break
+            if len(found) >= 6:
+                break
+        if len(found) >= 6:
+            break
+    if not found:
+        return ""
+    print(f"[EVIDENCE] Offending-line locator pinned {len(found)} exact "
+          f"line(s) containing the value(s) the error flags.")
+    lines = "\n".join(
+        f"- In '{f}', this EXACT line contains the flagged value '{tok}':\n"
+        f"    {line}"
+        for f, line, tok in found)
+    return ("Exact offending line(s) located in the repository (the error names "
+            "these value(s); the lines below are copied VERBATIM from the real "
+            "files — use the relevant one as your 'evidence' string EXACTLY, and "
+            "change ONLY the flagged value in 'corrected'):\n" + lines)
+
+
 def enrich_issue_with_path_checks(focused: dict, signal: str,
                                   allowed_files: set) -> str:
     """OBSERVATION ONLY (not diagnosis): scan the primary error + supporting
@@ -973,25 +1108,36 @@ def enrich_issue_with_path_checks(focused: dict, signal: str,
     ]))
     # path-like tokens: a/b/c.ext or bare dir/file references
     path_re = re.compile(r'(?<![\w./\-])((?:[\w.\-]+/)+[\w.\-]+)(?![\w./\-])')
+    # Prefixes/patterns that are runner or system paths, URLs, or GH expressions
+    # — never repo files, and previously the source of false "missing" flags.
+    _skip_prefixes = ("http", "${{", "/home/", "/usr/", "/opt/", "/tmp/",
+                      "/var/", "/etc/", "./_", "actions-runner", "_work/",
+                      "node_modules/", "site-packages/", "dist-packages/")
     observations = []
     seen = set()
     for m in path_re.finditer(haystack):
         token = m.group(1).strip("'\":,()[]")
-        if not token or token in seen or token.startswith(("http", "${{", "/home/", "/usr/")):
+        low = token.lower()
+        if (not token or token in seen
+                or low.startswith(_skip_prefixes)
+                or "site-packages" in low or "actions-runner" in low
+                or "/_" in token
+                # require a real file-ish extension OR a short repo-relative
+                # depth; long absolute-looking chains are runner noise.
+                or token.count("/") > 4):
             continue
         seen.add(token)
         norm = _relstrip(token)
         if norm in allowed_files or Path(norm).exists():
             continue  # path is real — nothing to note
         near = _closest_allowed_file(norm, allowed_files)
+        # Only report when there IS a close real match — an unmatched token in
+        # a noisy log is far more likely to be noise than a genuine missing
+        # repo file, and reporting it just distracts the model.
         if near and near != norm:
             observations.append(
                 f"- Path '{token}' referenced in the error does NOT exist in the "
                 f"repository. The closest real path is '{near}'.")
-        else:
-            observations.append(
-                f"- Path '{token}' referenced in the error does NOT exist in the "
-                f"repository, and no close match was found.")
         if len(observations) >= 6:
             break
     if not observations:
@@ -1001,6 +1147,190 @@ def enrich_issue_with_path_checks(focused: dict, signal: str,
     return ("Verified path facts (missing references named in the failure vs. "
             "what actually exists — you MUST reconcile every one of these):\n"
             + "\n".join(observations))
+
+
+def _read_dot_python_version() -> str:
+    """Return the major.minor from a repo-root .python-version file, or ''."""
+    p = Path(".python-version")
+    if not p.is_file():
+        return ""
+    try:
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                m = re.match(r'(\d+)\.(\d+)', line)
+                if m:
+                    return f"{m.group(1)}.{m.group(2)}"
+    except Exception:
+        pass
+    return ""
+
+
+def collect_python_version_declarations(allowed_files: set) -> dict:
+    """OBSERVATION ONLY: gather every CONCRETE python major.minor declared
+    across the repo (source of truth file, workflow, Dockerfile, packaging),
+    keyed by where it lives. Python reads and reports; it never rewrites."""
+    decls = {}
+    dot = _read_dot_python_version()
+    if dot:
+        decls[".python-version"] = dot
+    for f in sorted(allowed_files):
+        name = Path(f).name.lower()
+        try:
+            text = Path(f).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        if WORKFLOW_PATTERN.search(f):
+            # A hardcoded python-version is a concrete declaration. A
+            # `python-version-file:` reference is NOT — it defers to the file,
+            # which is exactly the coherent setup, so we don't record it.
+            for m in WORKFLOW_PYVERSION_LINE.finditer(text):
+                decls[f"{f} (python-version:)"] = f"{m.group(3)}.{m.group(4)}"
+        if name.startswith("dockerfile"):
+            for m in DOCKERFILE_FROM_PYTHON.finditer(text):
+                base = m.group(2).split("-", 1)[0]
+                vm = re.match(r'(\d+)\.(\d+)', base)
+                if vm:
+                    decls[f"{f} (FROM python:)"] = f"{vm.group(1)}.{vm.group(2)}"
+            for m in re.finditer(
+                    r'ARG\s+PYTHON_VERSION\s*=\s*["\']?(\d+)\.(\d+)', text, re.I):
+                decls[f"{f} (ARG PYTHON_VERSION)"] = f"{m.group(1)}.{m.group(2)}"
+        if name in ("pyproject.toml", "setup.py", "setup.cfg"):
+            m = re.search(r'requires[-_]python\s*=?\s*["\'][^0-9]*(\d+)\.(\d+)',
+                          text, re.I)
+            if m:
+                decls[f"{f} (requires-python)"] = f"{m.group(1)}.{m.group(2)}"
+    return decls
+
+
+def check_python_version_coherence(allowed_files: set) -> str:
+    """OBSERVATION ONLY (not diagnosis, not fix-authoring): if the repo declares
+    a Python version in more than one place and they DISAGREE, report the
+    mismatch so the model aligns them. When a .python-version file exists it is
+    named as the source of truth. Python states the facts and which value is
+    canonical; it never edits any file or decides the winner itself."""
+    decls = collect_python_version_declarations(allowed_files)
+    if len(decls) < 2:
+        return ""
+    values = set(decls.values())
+    if len(values) == 1:
+        return ""  # everything already agrees — nothing to say
+    canonical = decls.get(".python-version")
+    listing = "\n".join(f"- {loc}: {ver}" for loc, ver in decls.items())
+    if canonical:
+        guidance = (f"The '.python-version' file declares {canonical}, which is "
+                    f"the project's source of truth. Align every other "
+                    f"declaration to {canonical}.")
+    else:
+        guidance = ("There is no '.python-version' source-of-truth file; these "
+                    "declarations must be made to agree on ONE version.")
+    print(f"[EVIDENCE] Python-version coherence: {len(values)} distinct value(s) "
+          f"across {len(decls)} declaration(s) — reporting the drift.")
+    return ("Python version DISAGREEMENT across the repo (the CI runner's Python "
+            "and the image/packaging Python must match, or tests run on a "
+            "different interpreter than production ships):\n"
+            + listing + "\n" + guidance)
+
+
+# Signatures of a failure that is specifically about a Python version being
+# invalid/unavailable (setup-python, Docker base image, pyenv).
+PY_VERSION_FAILURE_SIGNATURES = [
+    re.compile(r"version\s+'?[\d.]+'?\s+.*was not found", re.I),   # setup-python
+    re.compile(r"python-version", re.I),
+    re.compile(r"failed to solve:\s*python:", re.I),               # docker FROM python:X
+    re.compile(r"docker\.io/library/python:", re.I),
+    re.compile(r"no such (?:version|python)", re.I),
+    re.compile(r"pyenv:.*version.*not installed", re.I),
+    # setup-python's python-version-file pointing at a missing file:
+    re.compile(r"python[ _-]?version[ _-]?file", re.I),
+    re.compile(r"specified python version file.*(?:does\s*n['o]?t|not)\s*exist", re.I),
+]
+
+
+def is_python_version_failure(issue_block: str, signal: str) -> bool:
+    blob = f"{issue_block}\n{signal}"
+    return any(p.search(blob) for p in PY_VERSION_FAILURE_SIGNATURES)
+
+
+def _extract_version_file_name(blob: str) -> str:
+    """Pull the referenced version-file path from either the workflow
+    `python-version-file: X` form or the error's `file at: X` form. Tries all
+    matches and returns the first that actually looks like a filename (the
+    `python-version-file` regex can otherwise capture the stray word 'at' from
+    'python version file at:')."""
+    candidates = []
+    for pat in (_VERSION_FILE_REF, _MISSING_FILE_ERR):
+        for m in pat.finditer(blob):
+            candidates.append(m.group(1).strip().strip("`'\":,"))
+    for cand in candidates:
+        if cand and ("." in cand or "/" in cand):
+            return cand
+    return ""
+
+
+def missing_version_file(issue_block: str, signal: str, allowed_files: set) -> str:
+    """Return the missing version-file path if the failure is 'the workflow
+    points at a version file that does not exist', else ''. This is distinct
+    from 'no version defined anywhere' — a version may well exist elsewhere
+    (e.g. the Dockerfile), but setup-python's python-version-file target is
+    absent. The fix is to CREATE that file (or stop referencing it), which the
+    edit-only patch engine cannot do — so this must escalate, not go to the
+    model. Observation only; Python names the missing file the error/workflow
+    already state."""
+    cand = _extract_version_file_name(f"{issue_block}\n{signal}")
+    if not cand:
+        return ""
+    norm = _relstrip(cand)
+    # Confirm it really is absent (present in neither the readable tree nor disk).
+    if norm in allowed_files or Path(norm).is_file():
+        return ""
+    return cand
+
+
+def python_version_is_undefined(allowed_files: set) -> bool:
+    """True when the repo declares NO concrete Python version anywhere the tool
+    can read (.python-version, workflow python-version:, Dockerfile FROM/ARG,
+    requires-python). In that case there is nothing to anchor a fix to, so the
+    AI must NOT invent a version — Python reports the absence and the run
+    escalates for a human to define the intended version."""
+    return not collect_python_version_declarations(allowed_files)
+
+
+UNDEFINED_PYTHON_VERSION_MESSAGE = (
+    "The project doesn't define a Python version in `.python-version`, "
+    "`pyproject.toml`, the Dockerfile, or the GitHub Actions workflow. "
+    "I can't determine the intended version, and I won't guess one — picking "
+    "an arbitrary version could ship or test against the wrong interpreter. "
+    "Either add a project version file (e.g. `.python-version` with a value "
+    "like `3.12`) or infer the intended version from your package "
+    "compatibility (`requires-python`), then re-run."
+)
+
+_VERSION_FILE_REF = re.compile(
+    r"python[-_ ]?version[-_ ]?file\s*:?\s*([.\w][\w./\-]*)", re.I)
+_MISSING_FILE_ERR = re.compile(
+    r"file\s+at:?\s*([.\w][\w./\-]*)", re.I)
+
+
+def undefined_python_version_message(issue_block: str, signal: str) -> str:
+    """Return the escalation text. If the failure names a specific version file
+    the workflow expects but which is missing (e.g. `.python-version`), point
+    at THAT file explicitly — the intended fix is to create it. Otherwise fall
+    back to the generic 'no version defined anywhere' message. Python only
+    reports what the error/workflow already state; it does not choose a value."""
+    blob = f"{issue_block}\n{signal}"
+    named = _extract_version_file_name(blob)
+    if named:
+        return (
+            f"The workflow's `setup-python` step is configured with "
+            f"`python-version-file: {named}`, but `{named}` does not exist in "
+            f"the repository, so there is no Python version to use. I won't "
+            f"invent one. To fix this, create `{named}` containing the intended "
+            f"version (e.g. `3.12`) and commit it, or replace the "
+            f"`python-version-file` reference with an explicit `python-version:` "
+            f"value — then re-run. (I can't create a brand-new file here; this "
+            f"needs a human decision on which version the project targets.)")
+    return UNDEFINED_PYTHON_VERSION_MESSAGE
 
 
 def _closest_allowed_file(requested: str, allowed_files: set) -> str:
@@ -1355,6 +1685,14 @@ section below. NEVER use text from the error log, the root cause, or your
 own paraphrase as "evidence" — if the exact characters are not in the file
 contents shown, the patch will be rejected.
 
+DO NOT ESCAPE CHARACTERS. Write paths and text plainly:
+  - file: `.github/workflows/ci-local-deploy.yml`  ✔
+  - NOT `\\.github\\_workflows\\_ci-local-deploy.yml`  �’ WRONG
+  - evidence: `python-version: "3.1"`  ✔   corrected: `python-version: "3.10"`  ✔
+No backslashes before dots, slashes, underscores, or digits. A path uses
+forward slashes only. "evidence" and "corrected" must be DIFFERENT — the
+whole point is that "corrected" changes the broken part.
+
 Schema:
 {"issues":[{"file":"...","problem":"...","evidence":"...","corrected":"..."}]}
 
@@ -1435,6 +1773,43 @@ def ai_generate_patch(root_cause: str, solution: str, evidence: dict,
     return _normalize_issue_keys(issues)
 
 
+def _unescape_model_string(s):
+    """Small coder models frequently over-escape string values — treating a
+    file path or YAML snippet like a regex/Windows path and emitting things
+    like '\\.github\\_workflows\\_ci-local-deploy.yml' or '3\\.10'. This strips
+    escapes that JSON/YAML/paths never need, so the value can actually match
+    the real file content. Pure text cleanup — no diagnosis, no fix authoring."""
+    if not isinstance(s, str):
+        return s
+    out = s
+    # Drop backslashes before characters that are never escaped in a path,
+    # YAML scalar, or plain snippet (., _, /, -, :, spaces, digits, letters).
+    out = re.sub(r'\\([._/\-: 0-9A-Za-z])', r'\1', out)
+    # A backslash used as a path separator -> forward slash.
+    out = out.replace("\\", "/")
+    # Collapse accidental doubled separators introduced by the above.
+    out = re.sub(r'/{2,}', '/', out)
+    return out
+
+
+def _normalize_file_field(file: str, evidence: dict) -> str:
+    """Map a possibly-mangled file field onto a real evidence key."""
+    if not file:
+        return file
+    cand = _unescape_model_string(file).strip().strip("`'\"")
+    cand = _relstrip(cand)
+    if cand in evidence:
+        return cand
+    # Match by basename against evidence keys (handles residual path munging).
+    base = Path(cand).name.lower()
+    for k in evidence:
+        if Path(k).name.lower() == base:
+            return k
+    # Fuzzy last resort.
+    match = difflib.get_close_matches(cand, list(evidence.keys()), n=1, cutoff=0.6)
+    return match[0] if match else cand
+
+
 def _normalize_issue_keys(issues):
     KF = ("file_path", "path", "filename", "filepath", "name")
     KE = ("find", "wrong", "offending", "original", "bad", "before")
@@ -1449,6 +1824,10 @@ def _normalize_issue_keys(issues):
                 for a in alts:
                     if a in it:
                         it[want] = it.pop(a); break
+        # Deterministically un-mangle the string values the model over-escaped.
+        for k in ("file", "evidence", "corrected"):
+            if isinstance(it.get(k), str):
+                it[k] = _unescape_model_string(it[k])
         out.append(it)
     return out
 
@@ -1538,7 +1917,7 @@ def _closest_evidence_line(ev: str, evidence: dict) -> tuple:
 def issues_to_fixes(issues: list, evidence: dict) -> tuple:
     fixes_by_file, rejects = {}, []
     for n, it in enumerate(issues, 1):
-        file = (it.get("file") or "").strip()
+        file = _normalize_file_field((it.get("file") or "").strip(), evidence)
         ev   = it.get("evidence")
         cor  = it.get("corrected")
         prob = (it.get("problem") or "").strip()
@@ -1546,8 +1925,18 @@ def issues_to_fixes(issues: list, evidence: dict) -> tuple:
         if not isinstance(ev, str) or not ev.strip():
             rejects.append(f"issue #{n} ({file or '?'}): empty evidence")
             continue
-        if not isinstance(cor, str) or cor == ev:
-            rejects.append(f"issue #{n} ({file or '?'}): corrected missing or identical")
+        if not isinstance(cor, str) or not cor.strip():
+            rejects.append(f"issue #{n} ({file or '?'}): 'corrected' is empty — "
+                           f"you must supply the fixed text.")
+            continue
+        if cor.strip() == ev.strip():
+            rejects.append(
+                f"issue #{n} ({file or '?'}): 'evidence' and 'corrected' are "
+                f"IDENTICAL (both `{ev.strip()[:80]}`). 'corrected' must be the "
+                f"SAME line with the bug fixed — e.g. if evidence is "
+                f"`python-version: \"3.1\"` then corrected is "
+                f"`python-version: \"3.10\"`. Do not escape characters with "
+                f"backslashes; copy the text plainly.")
             continue
 
         holders = [f for f, c in evidence.items() if isinstance(c, str) and ev in c]
@@ -1758,25 +2147,16 @@ MAX_WORKFLOW_VALUE_DIFFS = 3
 SENSITIVE_WORKFLOW_KEYS = {"permissions", "secrets", "env", "on", "runs-on", "uses", "if"}
 
 
-def normalize_workflow_python_versions(original_text: str, new_text: str) -> tuple:
-    old_matches = list(WORKFLOW_PYVERSION_LINE.finditer(original_text))
-    new_matches = list(WORKFLOW_PYVERSION_LINE.finditer(new_text))
-    if len(old_matches) != len(new_matches):
-        return new_text, False
-    changed = False
-    out = new_text
-    for om, nm in zip(reversed(old_matches), reversed(new_matches)):
-        o_major, o_minor = int(om.group(3)), int(om.group(4))
-        if o_major == 3 and o_minor in VALID_PYTHON_MINORS:
-            continue
-        n_prefix, n_q1, _n_major, _n_minor, n_q2, n_rest = nm.groups()
-        quote = n_q1 or n_q2 or '"'
-        new_line = f"{n_prefix}{quote}{DEFAULT_PYTHON_VERSION}{quote}{n_rest}"
-        if new_line != nm.group(0):
-            changed = True
-            print(f"[NORMALIZE] python-version forced to {DEFAULT_PYTHON_VERSION}")
-        out = out[:nm.start()] + new_line + out[nm.end():]
-    return out, changed
+def invalid_workflow_python_versions(text: str) -> list:
+    """VALIDATION ONLY: return the list of python-version values in a workflow
+    that are NOT real CPython releases. Python observes and reports; it never
+    rewrites the value — the model must author a valid version itself."""
+    bad = []
+    for m in WORKFLOW_PYVERSION_LINE.finditer(text):
+        major, minor = int(m.group(3)), int(m.group(4))
+        if not (major == 3 and minor in VALID_PYTHON_MINORS):
+            bad.append(f"{major}.{minor}")
+    return bad
 
 
 def validate_workflow_edit(original_text: str, new_text: str) -> tuple:
@@ -1849,11 +2229,18 @@ def validate_fix(fix: dict) -> tuple:
         except yaml.YAMLError as e:
             return False, f"YAML error: {e}"
         if WORKFLOW_PATTERN.search(file):
-            content, snapped = normalize_workflow_python_versions(original_text, content)
-            if snapped:
-                fix["fixed_content"] = content
-                fix["reason"] = (fix.get("reason", "") +
-                                 f"; python-version pinned to {DEFAULT_PYTHON_VERSION}").lstrip("; ")[:300]
+            # VALIDATION ONLY — Python does not author the version. If the
+            # model's patched workflow still carries a python-version that
+            # isn't a real CPython release, reject it so the MODEL picks a
+            # valid one on retry. (Previously this silently forced the value
+            # to DEFAULT_PYTHON_VERSION, which was Python authoring the fix.)
+            bad = invalid_workflow_python_versions(content)
+            if bad:
+                return False, (
+                    "workflow still sets python-version to "
+                    + ", ".join(f"'{v}'" for v in bad)
+                    + " — not a real released CPython version. Choose a real "
+                      "release (e.g. 3.10, 3.11, 3.12) in 'corrected'.")
             ok, reason = validate_workflow_edit(original_text, content)
             if not ok:
                 return False, reason
@@ -2247,6 +2634,11 @@ def main():
         print(f"[SECURITY] redacting {len(redacted)} potential secret pattern(s): "
               f"{', '.join(redacted)}")
     log_text = redact_secrets(log_text)
+    log_text = _strip_log_timestamps(log_text)  # clean AI-facing log lines
+    log_text, log_corrupted = sanitize_log_text(log_text)
+    if log_corrupted:
+        print("[SECURITY] log contained control/replacement characters "
+              "(mojibake) — stripped before analysis.")
 
     exit_code = get_exit_code(log_text, args.exit_code)
     signal = extract_error_signal(log_text)
@@ -2257,6 +2649,31 @@ def main():
 
     focused = extract_focused_failure(log_text)
     issue_block = format_focused_issue(focused, exit_code)
+
+    # If the PRIMARY error is itself garbled (e.g. a corrupted version tag like
+    # '\x00\x003.12' from an empty --build-arg), the log is unreadable at the
+    # decisive point. A confident diagnosis on that premise is a hallucination
+    # waiting to happen — escalate for a human instead of guessing.
+    primary = focused.get("primary_message", "")
+    if log_corrupted and looks_garbled(primary):
+        print("[GATE] the primary error line is garbled/corrupted — the log is "
+              "unreadable at the point that matters. Refusing to diagnose on a "
+              "corrupted signal; escalating.")
+        msg = ("The CI log is corrupted at the failing line — the primary error "
+               "reads as garbled/non-printable text (e.g. a Python version tag "
+               "like `\\x00\\x003.12`). This usually means a build argument or "
+               "variable resolved to an EMPTY value (for example "
+               "`--build-arg PYTHON_VERSION=` with no value, giving `FROM "
+               "python:` with no tag). Check that every variable the failing "
+               "step references is actually set — a missing workflow step that "
+               "was supposed to define it is the most common cause. I can't "
+               "safely diagnose from an unreadable error signal.")
+        print(f"       {msg}")
+        if token and repo:
+            open_issue(token, repo,
+                       msg + f"\n\n**Garbled signal (first 300 chars):**\n"
+                       + f"```\n{signal[:300]}\n```", run_url)
+        sys.exit(0)
 
     # Validation scoping: the error evidence itself (never model output)
     # decides which pre-existing problems a patch MUST fix.
@@ -2280,6 +2697,40 @@ def main():
         issue_block = issue_block + "\n\n" + path_facts
         CURRENT_FAILURE_CONTEXT = issue_block + "\n" + signal
 
+    # ── PYTHON-VERSION COHERENCE (observation, not diagnosis) ──
+    # If the runner Python, the image Python, and/or .python-version disagree,
+    # surface the drift so the model aligns them to the source of truth.
+    coherence = check_python_version_coherence(allowed_files)
+    if coherence:
+        issue_block = issue_block + "\n\n" + coherence
+        CURRENT_FAILURE_CONTEXT = issue_block + "\n" + signal
+
+    # ── VERSION-FILE / UNDEFINED-VERSION GATE (observation, not diagnosis) ──
+    # Two escalate-don't-guess cases the edit-only patch engine can't handle:
+    #  (a) the workflow points at a version file that DOESN'T EXIST — the fix is
+    #      to CREATE that file (or stop referencing it), not edit anything; or
+    #  (b) the failure is a version error and NO version is defined anywhere.
+    # In both, sending it to the model just makes it flail on the workflow and
+    # produce "no effective change" (exactly what looped here). Escalate first.
+    if is_python_version_failure(issue_block, signal):
+        missing_vf = missing_version_file(issue_block, signal, allowed_files)
+        if missing_vf or python_version_is_undefined(allowed_files):
+            gate_msg = undefined_python_version_message(issue_block, signal)
+            reason = (f"the workflow references version file '{missing_vf}' which "
+                      f"does not exist" if missing_vf
+                      else "the repo defines NO usable Python version")
+            print(f"[GATE] Python-version failure — {reason}. The fix requires "
+                  f"creating/removing a file, which this tool can't author. "
+                  f"Refusing to guess; escalating.")
+            print(f"       {gate_msg}")
+            if token and repo:
+                open_issue(token, repo,
+                           gate_msg
+                           + f"\n\n**Failure Python identified:**\n"
+                           + f"```\n{issue_block[:1200]}\n```",
+                           run_url)
+            sys.exit(0)
+
     # ── DETERMINISTIC CONTEXT RETRIEVAL (not diagnosis) ──
     context_map = gather_deterministic_context(log_text, allowed_files)
     suggested_files = flatten_suggested_files(context_map)
@@ -2289,6 +2740,20 @@ def main():
         print(f"[EVIDENCE] Files pre-loaded as evidence (not a diagnosis): {suggested_files}")
     else:
         print("[EVIDENCE] No deterministic retrieval match — AI starts from log evidence only.")
+
+    # ── OFFENDING-LINE LOCATION (observation, not diagnosis) ──
+    # Read the deterministically-retrieved files and pin the exact line(s)
+    # that contain the value(s) the error names, so the model has the precise
+    # 'evidence' string to copy instead of grabbing the wrong lines.
+    preloaded_contents = {}
+    for f in suggested_files:
+        c = _read_evidence_file(f)
+        if c is not None:
+            preloaded_contents[f] = c
+    offending = locate_offending_lines(focused, signal, preloaded_contents)
+    if offending:
+        issue_block = issue_block + "\n\n" + offending
+        CURRENT_FAILURE_CONTEXT = issue_block + "\n" + signal
 
     # ── AI INVESTIGATION AGENT ──
     print("\n━━━ AI INVESTIGATION AGENT ━━━")
