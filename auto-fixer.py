@@ -955,6 +955,67 @@ Schema when you need another file:
 
 
 # ── Investigation loop ───────────────────────────────────────────────────────
+def locate_offending_lines(focused: dict, signal: str,
+                           evidence_files: dict) -> str:
+    """OBSERVATION ONLY (not diagnosis, not fix-authoring): the failure log
+    often names a specific offending VALUE (a quoted version like '3.1', a
+    port, a tag). A slow/small model reliably knows WHAT is wrong but often
+    fails to copy the EXACT line into its find/replace pair — it grabs the
+    lines above the bug, or produces evidence==corrected. This helper finds
+    the exact existing line(s) that contain the flagged value and hands them
+    back verbatim, so the model has the precise 'evidence' string to copy.
+    Python states the line that EXISTS; it never writes the replacement."""
+    if not evidence_files:
+        return ""
+    haystack = "\n".join(filter(None, [
+        focused.get("primary_message", ""),
+        "\n".join(focused.get("gh_errors", []) or []),
+        signal or "",
+    ]))
+    # Distinctive quoted or standalone tokens the error complains about, e.g.
+    # The version '3.1' ... was not found  ->  token 3.1
+    tokens = set()
+    for m in re.finditer(r"['\"]([\w.\-:/]{2,40})['\"]", haystack):
+        tokens.add(m.group(1))
+    # setup-python style bare "version 'X'"/"version X"
+    for m in re.finditer(r"version\s+['\"]?(\d+\.\d+(?:\.\d+)?)['\"]?", haystack, re.I):
+        tokens.add(m.group(1))
+    if not tokens:
+        return ""
+
+    found = []
+    seen_lines = set()
+    for fname, content in evidence_files.items():
+        if not isinstance(content, str):
+            continue
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if not line or line in seen_lines:
+                continue
+            for tok in tokens:
+                # Match the token as a whole value, not a coincidental substring.
+                if re.search(r'(?<![\w.])' + re.escape(tok) + r'(?![\w.])', line):
+                    found.append((fname, line, tok))
+                    seen_lines.add(line)
+                    break
+            if len(found) >= 6:
+                break
+        if len(found) >= 6:
+            break
+    if not found:
+        return ""
+    print(f"[EVIDENCE] Offending-line locator pinned {len(found)} exact "
+          f"line(s) containing the value(s) the error flags.")
+    lines = "\n".join(
+        f"- In '{f}', this EXACT line contains the flagged value '{tok}':\n"
+        f"    {line}"
+        for f, line, tok in found)
+    return ("Exact offending line(s) located in the repository (the error names "
+            "these value(s); the lines below are copied VERBATIM from the real "
+            "files — use the relevant one as your 'evidence' string EXACTLY, and "
+            "change ONLY the flagged value in 'corrected'):\n" + lines)
+
+
 def enrich_issue_with_path_checks(focused: dict, signal: str,
                                   allowed_files: set) -> str:
     """OBSERVATION ONLY (not diagnosis): scan the primary error + supporting
@@ -2348,6 +2409,20 @@ def main():
         print(f"[EVIDENCE] Files pre-loaded as evidence (not a diagnosis): {suggested_files}")
     else:
         print("[EVIDENCE] No deterministic retrieval match — AI starts from log evidence only.")
+
+    # ── OFFENDING-LINE LOCATION (observation, not diagnosis) ──
+    # Read the deterministically-retrieved files and pin the exact line(s)
+    # that contain the value(s) the error names, so the model has the precise
+    # 'evidence' string to copy instead of grabbing the wrong lines.
+    preloaded_contents = {}
+    for f in suggested_files:
+        c = _read_evidence_file(f)
+        if c is not None:
+            preloaded_contents[f] = c
+    offending = locate_offending_lines(focused, signal, preloaded_contents)
+    if offending:
+        issue_block = issue_block + "\n\n" + offending
+        CURRENT_FAILURE_CONTEXT = issue_block + "\n" + signal
 
     # ── AI INVESTIGATION AGENT ──
     print("\n━━━ AI INVESTIGATION AGENT ━━━")
