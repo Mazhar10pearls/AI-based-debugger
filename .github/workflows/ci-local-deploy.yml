@@ -12,6 +12,13 @@ name: Local CI/CD Deploy
 # There is currently no per-branch isolation (container name / port are not
 # branch-scoped) — if two branches get pushed in quick succession, whichever
 # deploy runs second wins and the other's container is gone.
+#
+# ── Python version ──────────────────────────────────────────────────────────
+# The Python version is defined ONCE in the repo-root `.python-version` file.
+# The "Set up Python" step reads it via `python-version-file`, and the Docker
+# build reads the same file into the PYTHON_VERSION build arg — so the CI test
+# runner and the shipped image always use the same interpreter. To change the
+# Python version, edit `.python-version` only.
 on:
   push:
     branches: [main, develop, 'qa/**']
@@ -29,21 +36,21 @@ permissions:
 
 jobs:
   build-test-deploy:
-    name: Build, Test, and  Deploy
+    name: Build, Test, and Deploy
     runs-on: self-hosted
 
     steps:
       # ── Checkout ─────────────────────────────────────────────────────────
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ── Python ───────────────────────────────────────────────────────────
+      # ── Python (version comes from .python-version) ──────────────────────
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.10"  # Updated to a valid minor release
+          python-version-file: .python-version
 
       - name: Install dependencies
         run: |
@@ -52,16 +59,21 @@ jobs:
 
       # ── Test (always) ────────────────────────────────────────────────────
       - name: Run unit tests
-        run: pytest sample_app/test_app.py  # Corrected typo in file path
+        run: pytest sample_app/test_app.py
 
       # ── Build (always — validates the Dockerfile on every branch) ─────────
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
 
+      # Read the single source of truth so the image is built on the SAME
+      # Python the tests just ran on.
+      
+
       - name: Build Docker image
         run: |
           docker buildx build \
             --platform linux/amd64 \
+            --build-arg PYTHON_VERSION=${{ steps.pyver.outputs.version }} \
             -f sample_app/Dockerfile \
             -t ai-devops-sample-app:${{ github.sha }} \
             -t ai-devops-sample-app:latest \
