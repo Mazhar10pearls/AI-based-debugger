@@ -1117,6 +1117,9 @@ do not explain the error.
 
 Rules:
 - ONE `findings` entry PER distinct bug, even if several share a file or line.
+- If the issue lists numbered FACT entries (a repository-side audit of broken
+  references), emit one `findings` entry PER FACT — each has already been
+  verified against the real repository; do not merge or skip any.
 - Each finding's `solution` = the precise text change (quote the exact line to
   change and what it becomes).
 - If the pinned facts fully explain the error, respond
@@ -1240,6 +1243,92 @@ def locate_offending_lines(focused: dict, signal: str,
             "these value(s); the lines below are copied VERBATIM from the real "
             "files — use the relevant one as your 'evidence' string EXACTLY, and "
             "change ONLY the flagged value in 'corrected'):\n" + lines)
+
+
+def preflight_reference_audit(evidence_files: dict, allowed_files: set) -> tuple:
+    """OBSERVATION ONLY (not diagnosis, not fix-authoring): audit the evidence
+    files THEMSELVES for references that do not resolve to anything that
+    exists, and for invalid version tags — using the exact same observation
+    maps the post-patch validator uses. This is what catches MULTI-BUG files:
+    a CI log usually names only the FIRST failure (the build dies at the
+    first broken COPY), while the same file may carry more broken references
+    that would fail the NEXT run — the log's error tokens can never cover
+    those. For each broken reference Python reports the fact, the closest
+    real path that DOES exist, and the exact verbatim line(s) carrying it;
+    it never states which is 'the bug' or authors any replacement.
+    Returns (facts_text, audit_tokens, facts)."""
+    facts, seen = [], set()
+    for fname, content in (evidence_files or {}).items():
+        if not isinstance(content, str):
+            continue
+        problems = {}
+        problems.update(_missing_ref_map(content, fname))
+        problems.update(_dockerfile_problem_map(fname, content))
+        for token, desc in problems.items():
+            key = (fname, token)
+            if key in seen:
+                continue
+            seen.add(key)
+            line_hits = []
+            for raw in content.splitlines():
+                if token in raw and raw.strip():
+                    line_hits.append(raw.strip())
+                    if len(line_hits) >= 2:
+                        break
+            closest = ""
+            if not token.startswith("python:"):
+                closest = _closest_allowed_file(token, allowed_files)
+            facts.append({"token": token, "file": fname, "desc": desc,
+                          "lines": line_hits, "closest": closest})
+    if not facts:
+        return "", [], []
+    print(f"[EVIDENCE] Pre-flight reference audit found {len(facts)} broken "
+          f"reference(s)/tag(s) across the evidence files — the log likely "
+          f"names only the first; ALL will be shipped as numbered facts.")
+    parts = [
+        "Repository-side audit of the evidence files (OBSERVED FACTS — every "
+        "numbered item is a reference or tag that does NOT resolve to anything "
+        "that exists. The CI log may only show the FIRST one, because the "
+        "build stops there. You MUST reconcile EVERY numbered fact — one "
+        "findings/issues entry EACH; do not stop after the first):"]
+    for i, f in enumerate(facts, 1):
+        line = f"- FACT {i}: In '{f['file']}', {f['desc']}."
+        if f["closest"]:
+            line += f" The closest path that DOES exist is '{f['closest']}'."
+        for l in f["lines"]:
+            line += f"\n    exact line (copy VERBATIM as 'evidence'): {l}"
+        parts.append(line)
+    tokens = []
+    for f in facts:
+        tokens.append(f["token"])
+        base = f["token"].rsplit("/", 1)[-1]
+        if base and base != f["token"]:
+            tokens.append(base)
+        if f["closest"]:
+            tokens.append(f["closest"])
+    return "\n".join(parts), tokens, facts
+
+
+def unaddressed_audit_facts(issues: list, audit_facts: list) -> list:
+    """VALIDATION ONLY: which audited broken references does the model's issue
+    list NOT touch? A fact counts as addressed when some issue's 'evidence'
+    line contains its token (i.e. the model is editing the line that carries
+    it). Python never writes the missing entries itself — it reports the gap
+    so the MODEL authors them on the retry."""
+    out = []
+    for i, f in enumerate(audit_facts or [], 1):
+        tok = f.get("token", "")
+        if not tok:
+            continue
+        addressed = any(isinstance(it, dict) and tok in (it.get("evidence") or "")
+                        for it in issues or [])
+        if not addressed:
+            msg = (f"FACT {i}: '{tok}' in '{f.get('file','?')}' — no issue "
+                   f"entry edits the line carrying it")
+            if f.get("lines"):
+                msg += f" (exact line: {f['lines'][0]})"
+            out.append(msg)
+    return out
 
 
 def enrich_issue_with_path_checks(focused: dict, signal: str,
@@ -1844,6 +1933,13 @@ as the ones already listed (other paths, other version strings, etc.) that
 point to something which doesn't match what actually exists elsewhere in
 the evidence — and fix those too, using the same file/evidence/corrected
 format.
+
+If the "## ISSUE TO SOLVE" section contains numbered FACT entries (a
+repository-side audit of broken references), you MUST emit one "issues"
+entry PER FACT — the audit already verified each one against the real
+repository. Use the "exact line" shown with each FACT as your "evidence"
+string, copied VERBATIM. A patch that fixes some FACTs but not all will
+be REJECTED.
 
 Output ONLY one JSON object. No markdown fences.
 
@@ -2956,18 +3052,34 @@ def main():
         issue_block = issue_block + "\n\n" + offending
         CURRENT_FAILURE_CONTEXT = issue_block + "\n" + signal
 
+    # ── PRE-FLIGHT REFERENCE AUDIT (observation, not diagnosis) ──
+    # The log names only the FIRST failure; the same files may carry MORE
+    # broken references (multi-bug files). Audit the evidence files with the
+    # validator's own observation maps and ship every broken reference as a
+    # numbered FACT with its exact verbatim line. The audit tokens also widen
+    # the excerpt windows so every buggy line survives excerpting.
+    audit_text, audit_tokens, audit_facts = preflight_reference_audit(
+        preloaded_contents, allowed_files)
+    if audit_text:
+        issue_block = issue_block + "\n\n" + audit_text
+        CURRENT_FAILURE_CONTEXT = issue_block + "\n" + signal
+        for t in audit_tokens:
+            if t not in error_tokens:
+                error_tokens.append(t)
+
     # ── AI INVESTIGATION AGENT ──
     print("\n━━━ AI INVESTIGATION AGENT ━━━")
     warm_up_model()
 
     investigation = None
-    if FAST_CONFIRM and offending and preloaded_contents:
-        # Deterministic tooling pinned the exact offending line(s): ship a
+    if FAST_CONFIRM and (offending or audit_facts) and preloaded_contents:
+        # Deterministic tooling pinned the exact offending line(s) and/or the
+        # reference audit produced verified numbered facts: ship a
         # confirm-or-refute brief (~half the prompt, one turn) instead of the
         # open-ended multi-turn investigation. Falls back below on refusal,
         # low confidence, or any failure — the full loop is unchanged.
-        print("[CONFIRM] offending lines are pinned — trying single-turn "
-              "fast-path confirmation before full investigation.")
+        print("[CONFIRM] pinned lines / audited facts available — trying "
+              "single-turn fast-path confirmation before full investigation.")
         investigation = ai_confirm_pinned(issue_block, exit_code,
                                           preloaded_contents, error_tokens)
     if investigation is None:
@@ -3017,6 +3129,27 @@ def main():
                        f"```\n{issue_block[:1200]}\n```",
                        run_url)
         sys.exit(0)
+
+    # ── RE-AUDIT OVER EVERYTHING THE INVESTIGATION READ ──
+    # Files the model requested mid-investigation weren't covered by the
+    # pre-flight audit (which only saw the preloaded set). Re-run it over the
+    # full evidence so the patch stage's completeness check knows about EVERY
+    # broken reference, wherever it lives.
+    full_audit_text, full_audit_tokens, full_audit_facts = \
+        preflight_reference_audit(evidence, allowed_files)
+    if len(full_audit_facts) > len(audit_facts):
+        print(f"[EVIDENCE] re-audit over full evidence found "
+              f"{len(full_audit_facts) - len(audit_facts)} additional broken "
+              f"reference(s) in files read mid-investigation.")
+        if audit_text and audit_text in issue_block:
+            issue_block = issue_block.replace(audit_text, full_audit_text)
+        else:
+            issue_block = issue_block + "\n\n" + full_audit_text
+        CURRENT_FAILURE_CONTEXT = issue_block + "\n" + signal
+        audit_text, audit_facts = full_audit_text, full_audit_facts
+        for t in full_audit_tokens:
+            if t not in error_tokens:
+                error_tokens.append(t)
 
     # ── CORROBORATION RESCUE (observation, not diagnosis) ──
     # Fires ONLY when confidence was DEFAULTED because the model failed to
@@ -3132,6 +3265,32 @@ def main():
                            run_url)
             sys.exit(3)
         rejected_fingerprints.add(fp)
+
+        # ── COMPLETENESS CHECK vs the audited facts (validation only) ──
+        # A partial patch would be rejected by validation anyway (the leftover
+        # broken refs are in the failure context) — catching it HERE saves the
+        # validation/test time and produces a retry note that names exactly
+        # which FACTs were skipped, with their verbatim lines to copy.
+        missing_facts = unaddressed_audit_facts(issues, audit_facts)
+        if missing_facts:
+            detail = (f"patch addresses {len(audit_facts) - len(missing_facts)}"
+                      f"/{len(audit_facts)} audited bug(s) — unaddressed: "
+                      + "; ".join(missing_facts))
+            print(f"[REPAIR] {detail}", file=sys.stderr)
+            if repair_round < MAX_REPAIR_ROUNDS:
+                rejection_history.append(f"round {repair_round}: {detail}")
+                retry_note = (
+                    "Your previous patch FIXED SOME BUGS BUT NOT ALL of the "
+                    "numbered FACTs. These audited broken references were left "
+                    "untouched — emit one issues entry for EACH, using the "
+                    "exact line shown as your 'evidence' string:\n"
+                    + "\n".join(f"- {m}" for m in missing_facts)
+                    + "\nKeep the correct entries you already produced AND add "
+                      "the missing ones — the full set must cover every "
+                      "numbered FACT in one response.")
+                continue
+            print("[REPAIR] final round — attempting the partial patch anyway "
+                  "and letting validation judge it.", file=sys.stderr)
 
         fixes, pair_rejects = issues_to_fixes(issues, evidence)
         for rej in pair_rejects:
