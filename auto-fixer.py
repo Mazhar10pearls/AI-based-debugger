@@ -1091,6 +1091,104 @@ Schema when you need another file:
 """
 
 
+# ── FAST-PATH CONFIRMATION (used when deterministic tooling pinned the bug) ──
+# When locate_offending_lines() has pinned the exact line(s) carrying the
+# flagged value, the model's job is CONFIRMATION, not investigation. Ship a
+# prompt roughly HALF the size of the investigation prompt: the issue block
+# (which already contains the pinned lines, path facts, and version-coherence
+# report) plus focused excerpts of ONLY the pinned files. No repo tree, no git
+# diff, no supporting log, no multi-turn rulebook. One turn; on refusal or
+# low confidence we fall back to the full investigation loop unchanged.
+# Rationale (observed run): 3 investigation turns × ~190s all returned
+# need_more_info on identical 10k-char prompts even though the pinned facts
+# already contained the answer — open-ended framing invites hedging.
+FAST_CONFIRM = os.environ.get("FAST_CONFIRM", "1") == "1"
+MAX_CONFIRM_PROMPT_CHARS = int(os.environ.get("MAX_CONFIRM_PROMPT_CHARS", "7000"))
+CONFIRM_TIMEOUT = int(os.environ.get(
+    "CONFIRM_TIMEOUT",
+    str(INVESTIGATION_TIMEOUT + INVESTIGATION_FIRST_TURN_EXTRA)))
+
+CONFIRM_SYSTEM = """\
+You are a DevOps failure-confirmation agent. Deterministic tooling has ALREADY
+located the exact offending line(s) and cross-file facts shown in the
+"## ISSUE TO SOLVE" section below. Your ONLY job is to confirm the diagnosis
+and enumerate EVERY distinct bug — or refute it if the pinned facts genuinely
+do not explain the error.
+
+Rules:
+- ONE `findings` entry PER distinct bug, even if several share a file or line.
+- Each finding's `solution` = the precise text change (quote the exact line to
+  change and what it becomes).
+- If the pinned facts fully explain the error, respond
+  `status: "root_cause_confirmed"` with confidence 0.8 or higher — the hard
+  verification work has already been done for you.
+- Use `status: "need_more_info"` (with `requested_files`) ONLY if the pinned
+  facts cannot explain the error.
+
+Output ONLY one JSON object. No markdown fences.
+**EMIT KEYS IN EXACTLY THIS ORDER:** `status`, `confidence`, `root_cause`,
+`solution`, `all_issues_found`, `commit_message`, `findings`, and a ONE-sentence
+`analysis` LAST.
+
+{"status":"root_cause_confirmed","confidence":0.9,"root_cause":"...","solution":"...","all_issues_found":true,"commit_message":"fix: ...","findings":[{"issue":"...","root_cause":"...","solution":"..."}],"analysis":"one short sentence"}
+"""
+
+
+def ai_confirm_pinned(issue_block: str, exit_code: str, evidence: dict,
+                      error_tokens: list):
+    """Single lean confirm-or-refute call. Returns a finalized investigation
+    dict on success, or None to fall back to the full investigation loop."""
+    if not evidence:
+        return None
+    shipped = excerpt_evidence(dict(evidence), error_tokens or [], "CONFIRM")
+    ev_parts, total = [], 0
+    for f, c in shipped.items():
+        block = f"### {f}\n```\n{c}\n```"
+        if ev_parts and total + len(block) > MAX_CONFIRM_PROMPT_CHARS // 2:
+            break
+        ev_parts.append(block)
+        total += len(block)
+    ev_text = "\n\n".join(ev_parts) if ev_parts else "(none)"
+    prompt = (f"{CONFIRM_SYSTEM}\n"
+              f"## ISSUE TO SOLVE (includes pinned offending lines and "
+              f"verified cross-file facts)\n{issue_block}\n"
+              f"## Exit code: {exit_code}\n\n"
+              f"## File contents (focused excerpts of the pinned files — the "
+              f"shown lines are VERBATIM; `<<<SKIPPED N UNRELATED LINES>>>` "
+              f"markers are NOT file content)\n{ev_text}\n\n"
+              f"Respond with the JSON.")
+    if len(prompt) > MAX_CONFIRM_PROMPT_CHARS:
+        prompt = prompt[:MAX_CONFIRM_PROMPT_CHARS] + "\n\nRespond with the JSON."
+    try:
+        raw = _stream_ollama(prompt, INVESTIGATE_SCHEMA, num_predict=700,
+                             temperature=0.05, tag="CONFIRM",
+                             timeout=CONFIRM_TIMEOUT, retries=1)
+    except Exception as exc:
+        print(f"[CONFIRM] fast path failed ({exc}) — falling back to full "
+              f"investigation.", file=sys.stderr)
+        return None
+    data = _json_from(raw) or {}
+    status = data.get("status", "")
+    print(f"[CONFIRM] status={status or '(none)'} | "
+          f"confidence={data.get('confidence', '(omitted)')} | "
+          f"{(data.get('analysis') or '')[:140]}")
+    if status != "root_cause_confirmed":
+        print("[CONFIRM] model did not confirm on pinned facts — running full "
+              "investigation instead.")
+        return None
+    result = _finalize_investigation(data, False, evidence)
+    if result["confidence"] < 0.5:
+        print("[CONFIRM] confirmed but confidence below gate — running full "
+              "investigation instead.")
+        return None
+    result["failure_mode"] = None
+    result["evidence"] = dict(evidence)
+    result["investigation_log"] = [{
+        "turn": 1, "status": "root_cause_confirmed (fast-path confirm)",
+        "analysis": (data.get("analysis") or "")[:200]}]
+    return result
+
+
 # ── Investigation loop ───────────────────────────────────────────────────────
 def locate_offending_lines(focused: dict, signal: str,
                            evidence_files: dict) -> str:
@@ -1641,13 +1739,26 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                 evidence[f] = content if content is not None else "(could not read)"
                 print(f"[INVESTIGATE]   + read {f} ({len(evidence[f])} chars)")
 
+            # Carry the model's own hypothesis into the next turn — otherwise
+            # every turn restarts the diagnosis from scratch (observed: turn 2
+            # re-derived turn 1's conclusion in different words).
+            if analysis:
+                pending_notes.append(
+                    "Your previous-turn hypothesis (BUILD ON IT — do not "
+                    "restart from scratch): " + analysis[:220])
+
             stalled = (not to_read and requested and not last_turn)
             stall_count = stall_count + 1 if stalled else 0
-            force_now = last_turn or stall_count >= 2
+            # At ~190s/turn on this runner, ONE turn that yields no new
+            # evidence is already unaffordable — force the decision now
+            # instead of allowing a second stalled turn (was: >= 2).
+            force_now = last_turn or stall_count >= 1
 
             if force_now:
-                if stall_count >= 2 and not last_turn:
-                    print("[INVESTIGATE] no new evidence for 2 turns — forcing final decision.")
+                if stall_count >= 1 and not last_turn:
+                    print("[INVESTIGATE] a turn yielded no new evidence — "
+                          "forcing final decision now (turns are too "
+                          "expensive to waste).")
                 if _budget_exceeded():
                     result = _finalize_investigation(data, True, evidence)
                     break
@@ -2849,10 +2960,21 @@ def main():
     print("\n━━━ AI INVESTIGATION AGENT ━━━")
     warm_up_model()
 
-    investigation = ai_investigate(supporting_signal, exit_code, repo_tree, git_diff,
-                                   allowed_files, issue_block=issue_block,
-                                   suggested_files=suggested_files,
-                                   error_tokens=error_tokens)
+    investigation = None
+    if FAST_CONFIRM and offending and preloaded_contents:
+        # Deterministic tooling pinned the exact offending line(s): ship a
+        # confirm-or-refute brief (~half the prompt, one turn) instead of the
+        # open-ended multi-turn investigation. Falls back below on refusal,
+        # low confidence, or any failure — the full loop is unchanged.
+        print("[CONFIRM] offending lines are pinned — trying single-turn "
+              "fast-path confirmation before full investigation.")
+        investigation = ai_confirm_pinned(issue_block, exit_code,
+                                          preloaded_contents, error_tokens)
+    if investigation is None:
+        investigation = ai_investigate(supporting_signal, exit_code, repo_tree, git_diff,
+                                       allowed_files, issue_block=issue_block,
+                                       suggested_files=suggested_files,
+                                       error_tokens=error_tokens)
     root_cause = investigation["root_cause"]
     solution   = investigation["solution"]
     commit_msg = investigation["commit_message"]
@@ -2895,6 +3017,27 @@ def main():
                        f"```\n{issue_block[:1200]}\n```",
                        run_url)
         sys.exit(0)
+
+    # ── CORROBORATION RESCUE (observation, not diagnosis) ──
+    # Fires ONLY when confidence was DEFAULTED because the model failed to
+    # report one (a reporting failure — e.g. deadline-truncated JSON), AND the
+    # diagnosis cites the very value(s) the deterministic locator pinned in
+    # the real files. The observed facts corroborate the claim, so floor the
+    # confidence at 0.55 instead of escalating a correct answer over a
+    # reporting bug. A model that genuinely SAID a low confidence (0.3 etc.)
+    # is still gated normally — Python never overrides the model's judgment,
+    # only a defaulted placeholder.
+    if confidence < 0.5 and confidence_omitted and error_tokens:
+        _diag_blob = (root_cause + " " + (solution or "") + " " + " ".join(
+            (f.get("root_cause") or "") + " " + (f.get("solution") or "")
+            for f in findings)).lower()
+        _cited = sorted({t for t in error_tokens if t.lower() in _diag_blob})
+        if _cited:
+            print(f"[GATE] confidence was defaulted (model reporting failure), "
+                  f"but the diagnosis cites pinned value(s) "
+                  f"{', '.join(_cited[:4])} that Python located in the real "
+                  f"files — corroborated; flooring confidence at 0.55.")
+            confidence = 0.55
 
     if confidence < 0.5:
         gate_note = (" NOTE: the model never reported a confidence value — this is a "
