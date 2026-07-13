@@ -1355,6 +1355,14 @@ section below. NEVER use text from the error log, the root cause, or your
 own paraphrase as "evidence" — if the exact characters are not in the file
 contents shown, the patch will be rejected.
 
+DO NOT ESCAPE CHARACTERS. Write paths and text plainly:
+  - file: `.github/workflows/ci-local-deploy.yml`  ✔
+  - NOT `\\.github\\_workflows\\_ci-local-deploy.yml`  �’ WRONG
+  - evidence: `python-version: "3.1"`  ✔   corrected: `python-version: "3.10"`  ✔
+No backslashes before dots, slashes, underscores, or digits. A path uses
+forward slashes only. "evidence" and "corrected" must be DIFFERENT — the
+whole point is that "corrected" changes the broken part.
+
 Schema:
 {"issues":[{"file":"...","problem":"...","evidence":"...","corrected":"..."}]}
 
@@ -1435,6 +1443,43 @@ def ai_generate_patch(root_cause: str, solution: str, evidence: dict,
     return _normalize_issue_keys(issues)
 
 
+def _unescape_model_string(s):
+    """Small coder models frequently over-escape string values — treating a
+    file path or YAML snippet like a regex/Windows path and emitting things
+    like '\\.github\\_workflows\\_ci-local-deploy.yml' or '3\\.10'. This strips
+    escapes that JSON/YAML/paths never need, so the value can actually match
+    the real file content. Pure text cleanup — no diagnosis, no fix authoring."""
+    if not isinstance(s, str):
+        return s
+    out = s
+    # Drop backslashes before characters that are never escaped in a path,
+    # YAML scalar, or plain snippet (., _, /, -, :, spaces, digits, letters).
+    out = re.sub(r'\\([._/\-: 0-9A-Za-z])', r'\1', out)
+    # A backslash used as a path separator -> forward slash.
+    out = out.replace("\\", "/")
+    # Collapse accidental doubled separators introduced by the above.
+    out = re.sub(r'/{2,}', '/', out)
+    return out
+
+
+def _normalize_file_field(file: str, evidence: dict) -> str:
+    """Map a possibly-mangled file field onto a real evidence key."""
+    if not file:
+        return file
+    cand = _unescape_model_string(file).strip().strip("`'\"")
+    cand = _relstrip(cand)
+    if cand in evidence:
+        return cand
+    # Match by basename against evidence keys (handles residual path munging).
+    base = Path(cand).name.lower()
+    for k in evidence:
+        if Path(k).name.lower() == base:
+            return k
+    # Fuzzy last resort.
+    match = difflib.get_close_matches(cand, list(evidence.keys()), n=1, cutoff=0.6)
+    return match[0] if match else cand
+
+
 def _normalize_issue_keys(issues):
     KF = ("file_path", "path", "filename", "filepath", "name")
     KE = ("find", "wrong", "offending", "original", "bad", "before")
@@ -1449,6 +1494,10 @@ def _normalize_issue_keys(issues):
                 for a in alts:
                     if a in it:
                         it[want] = it.pop(a); break
+        # Deterministically un-mangle the string values the model over-escaped.
+        for k in ("file", "evidence", "corrected"):
+            if isinstance(it.get(k), str):
+                it[k] = _unescape_model_string(it[k])
         out.append(it)
     return out
 
@@ -1538,7 +1587,7 @@ def _closest_evidence_line(ev: str, evidence: dict) -> tuple:
 def issues_to_fixes(issues: list, evidence: dict) -> tuple:
     fixes_by_file, rejects = {}, []
     for n, it in enumerate(issues, 1):
-        file = (it.get("file") or "").strip()
+        file = _normalize_file_field((it.get("file") or "").strip(), evidence)
         ev   = it.get("evidence")
         cor  = it.get("corrected")
         prob = (it.get("problem") or "").strip()
@@ -1546,8 +1595,18 @@ def issues_to_fixes(issues: list, evidence: dict) -> tuple:
         if not isinstance(ev, str) or not ev.strip():
             rejects.append(f"issue #{n} ({file or '?'}): empty evidence")
             continue
-        if not isinstance(cor, str) or cor == ev:
-            rejects.append(f"issue #{n} ({file or '?'}): corrected missing or identical")
+        if not isinstance(cor, str) or not cor.strip():
+            rejects.append(f"issue #{n} ({file or '?'}): 'corrected' is empty — "
+                           f"you must supply the fixed text.")
+            continue
+        if cor.strip() == ev.strip():
+            rejects.append(
+                f"issue #{n} ({file or '?'}): 'evidence' and 'corrected' are "
+                f"IDENTICAL (both `{ev.strip()[:80]}`). 'corrected' must be the "
+                f"SAME line with the bug fixed — e.g. if evidence is "
+                f"`python-version: \"3.1\"` then corrected is "
+                f"`python-version: \"3.10\"`. Do not escape characters with "
+                f"backslashes; copy the text plainly.")
             continue
 
         holders = [f for f, c in evidence.items() if isinstance(c, str) and ev in c]
