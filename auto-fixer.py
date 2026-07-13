@@ -742,16 +742,6 @@ def extract_error_tokens(focused: dict, signal: str) -> list:
             base = tok.rsplit("/", 1)[-1]
             if len(base) >= 4:
                 tokens.add(base)
-    # bare filename-with-extension tokens (e.g. 'requiremesnts.txt') that carry
-    # no path separator and aren't quoted would otherwise slip through — these
-    # are exactly the typo'd-filename bugs, so capture them explicitly.
-    for m in re.finditer(
-            r'(?<![\w./\-])([\w\-]+\.(?:txt|py|ya?ml|json|toml|cfg|ini|lock|'
-            r'js|jsx|ts|tsx|go|java|rb|sh|md|dockerfile))(?![\w./\-])',
-            haystack, re.I):
-        tok = m.group(1)
-        if len(tok) >= 4:
-            tokens.add(tok)
     # drop trivially-common tokens that would match everything
     return [t for t in tokens if len(t) >= 3 and t.lower() not in
             ("run", "yml", "yaml", "true", "false", "with", "name", "uses")]
@@ -1131,59 +1121,21 @@ Schema when you need another file:
 
 
 # ── Investigation loop ───────────────────────────────────────────────────────
-def _token_is_dangling(tok: str, allowed_files: set) -> bool:
-    """True if a FILE/PATH-like token does NOT resolve to anything real in the
-    repo. Version numbers, image tags (python:3.1), and other non-file tokens
-    return False — deciding those aren't our call. Pure existence check."""
-    if ":" in tok:                       # image tag / url-ish, not a repo file
-        return False
-    if re.fullmatch(r'\d+(\.\d+)+', tok):  # a version number, not a path
-        return False
-    has_slash = "/" in tok
-    has_known_ext = bool(re.search(
-        r'\.(?:txt|py|ya?ml|json|toml|cfg|ini|lock|js|jsx|ts|tsx|go|java|rb|'
-        r'sh|md)$', tok, re.I))
-    if not (has_slash or has_known_ext):   # not clearly a file reference
-        return False
-    norm = _relstrip(tok)
-    base = norm.rsplit("/", 1)[-1]
-    for f in allowed_files:
-        if f == norm or Path(f).name == base or f.endswith("/" + norm):
-            return False
-    return not Path(norm).exists()
-
-
 def locate_offending_lines(focused: dict, signal: str,
-                           evidence_files: dict, allowed_files: set = None) -> str:
+                           evidence_files: dict) -> str:
     """OBSERVATION ONLY (not diagnosis, not fix-authoring): the failure log
     often names a specific offending VALUE (a quoted version like '3.1', a
-    path, a filename). A slow/small model reliably knows WHAT is wrong but
-    often fails to copy the EXACT line into its find/replace pair.
-
-    Critically, when the error names BOTH a broken value and a correct one
-    (e.g. a Dockerfile with a typo'd 'requiremesnts.txt' on one line and the
-    correct 'requirements.txt' on the next), the model tends to grab the line
-    with the CORRECT value and 'fix' it to itself (evidence == corrected). So
-    this helper splits tokens into DANGLING (name something that doesn't exist
-    in the repo) vs. RESOLVED, and pins the dangling-token lines as the broken
-    ones — it never offers a line solely because it holds an already-valid
-    value. Python states which reference doesn't resolve and where it lives; it
-    never writes the replacement."""
+    port, a tag). A slow/small model reliably knows WHAT is wrong but often
+    fails to copy the EXACT line into its find/replace pair — it grabs the
+    lines above the bug, or produces evidence==corrected. This helper finds
+    the exact existing line(s) that contain the flagged value and hands them
+    back verbatim, so the model has the precise 'evidence' string to copy.
+    Python states the line that EXISTS; it never writes the replacement."""
     if not evidence_files:
         return ""
     tokens = extract_error_tokens(focused, signal)
     if not tokens:
         return ""
-    allowed_files = allowed_files or set()
-
-    dangling = {t for t in tokens if _token_is_dangling(t, allowed_files)}
-    # If we found dangling references, ONLY those are broken — a line that holds
-    # a resolved token is (by definition) not the missing-reference bug.
-    active_tokens = dangling if dangling else set(tokens)
-
-    def _is_comment_only(line: str) -> bool:
-        s = line.lstrip()
-        return s.startswith("#") or s.startswith("//")
 
     found = []
     seen_lines = set()
@@ -1192,14 +1144,13 @@ def locate_offending_lines(focused: dict, signal: str,
             continue
         for raw_line in content.splitlines():
             line = raw_line.strip()
-            # A comment can't be the cause of a CI failure — never offer one as
-            # a fix target (this is what produced no-op edits on YAML comments).
-            if not line or line in seen_lines or _is_comment_only(line):
+            if not line or line in seen_lines:
                 continue
-            for tok in active_tokens:
+            for tok in tokens:
+                # Match the token as a whole value, not a coincidental substring.
                 try:
                     if re.search(r'(?<![\w.])' + re.escape(tok) + r'(?![\w.])', line):
-                        found.append((fname, line, tok, tok in dangling))
+                        found.append((fname, line, tok))
                         seen_lines.add(line)
                         break
                 except re.error:
@@ -1210,27 +1161,16 @@ def locate_offending_lines(focused: dict, signal: str,
             break
     if not found:
         return ""
-    kind = "dangling reference(s)" if dangling else "flagged value(s)"
     print(f"[EVIDENCE] Offending-line locator pinned {len(found)} exact "
-          f"line(s) containing the {kind}"
-          + (f" (dangling: {sorted(dangling)[:5]})" if dangling else "") + ".")
-    line_items = []
-    for f, line, tok, is_dangling in found:
-        tag = ("references '{}', which does NOT exist in the repository — "
-               "this is the line to fix".format(tok) if is_dangling
-               else "contains the flagged value '{}'".format(tok))
-        line_items.append(f"- In '{f}', this EXACT line {tag}:\n    {line}")
-    header = (
-        "Exact offending line(s) located in the repository. The lines below are "
-        "copied VERBATIM from the real files. Use the relevant one as your "
-        "'evidence' string EXACTLY, and in 'corrected' change ONLY the broken "
-        "token on that line. Do NOT emit an issue whose 'corrected' equals its "
-        "'evidence'. Do NOT target lines that are already correct.")
-    if dangling:
-        header += (" NOTE: the error also mentions value(s) that DO resolve "
-                   "correctly — do not touch those; fix only the dangling "
-                   "reference line(s) above.")
-    return header + "\n" + "\n".join(line_items)
+          f"line(s) containing the value(s) the error flags.")
+    lines = "\n".join(
+        f"- In '{f}', this EXACT line contains the flagged value '{tok}':\n"
+        f"    {line}"
+        for f, line, tok in found)
+    return ("Exact offending line(s) located in the repository (the error names "
+            "these value(s); the lines below are copied VERBATIM from the real "
+            "files — use the relevant one as your 'evidence' string EXACTLY, and "
+            "change ONLY the flagged value in 'corrected'):\n" + lines)
 
 
 def enrich_issue_with_path_checks(focused: dict, signal: str,
@@ -1756,11 +1696,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
             for k in ("root_cause", "solution", "findings", "commit_message"):
                 if data.get(k) and not merged.get(k):
                     merged[k] = data[k]
-            # best_assessment came from a COMPLETE, untruncated turn — the
-            # confidence in it is the model's own, so it must NOT be capped by
-            # the 'forced' rule (that rule is for punishing a forced conclusion
-            # the model never actually reached). Finalize forced=False.
-            return _finalize_investigation(merged, False, evidence)
+            return _finalize_investigation(merged, forced, evidence)
         return _finalize_investigation(data, forced, evidence)
 
     for turn in range(1, MAX_INVESTIGATION_TURNS + 1):
@@ -1866,36 +1802,20 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
             stalled = (not to_read and requested and not last_turn)
             stall_count = stall_count + 1 if stalled else 0
 
+            # Convergence guard: on this slow runner every extra turn risks a
+            # truncated final turn. If the model already has a concrete cause
+            # AND this need_more_info fetched nothing genuinely new, it is
+            # dithering, not investigating — force the decision NOW rather than
+            # spending another ~200s turn. (The model's stated confidence is
+            # preserved by _remember/_finalize_with_fallback.)
             has_concrete_cause = bool((data.get("root_cause") or "").strip()
                                       or data.get("findings"))
-            try:
-                cur_conf = float(data.get("confidence") or 0.0)
-            except (TypeError, ValueError):
-                cur_conf = 0.0
-
-            # BEST CASE: the model already gave a concrete cause at usable
-            # confidence on THIS complete (untruncated) turn. Don't spend
-            # another ~200s turn — that only risks a truncated final turn (which
-            # is exactly what kept discarding correct diagnoses). Accept the
-            # model's own complete-turn assessment as-is (forced=False, so its
-            # stated confidence stands and isn't capped to 0.4).
-            if not to_read and has_concrete_cause and cur_conf >= 0.5:
-                print(f"[INVESTIGATE] model already reached a concrete root "
-                      f"cause at confidence {cur_conf:.2f} on a complete turn — "
-                      f"accepting it directly (no extra turn, no truncation risk).")
-                result = _finalize_investigation(data, False, evidence)
-                break
-
-            # Convergence guard: on this slow runner every extra turn risks a
-            # truncated final turn. If the model has a concrete cause but LOW
-            # confidence (<0.5) and fetched nothing new, it is dithering — push
-            # it once for a firmer decision rather than looping.
             dithering = (not to_read and has_concrete_cause)
             force_now = last_turn or stall_count >= 2 or dithering
             if dithering and not last_turn and stall_count < 2:
-                print("[INVESTIGATE] model has a concrete cause but low "
-                      "confidence and requested nothing new — forcing one "
-                      "confirmation turn.")
+                print("[INVESTIGATE] model already has a concrete root cause and "
+                      "requested nothing new — forcing confirmation instead of "
+                      "burning another turn.")
 
             if force_now:
                 if stall_count >= 2 and not last_turn:
@@ -2264,13 +2184,6 @@ def issues_to_fixes(issues: list, evidence: dict) -> tuple:
                 f"issue #{n} ({file or '?'}): you copied a "
                 f"'<<<SKIPPED ...>>>' marker — that marker is NOT file "
                 f"content. Copy only real lines from the file.")
-            continue
-        ev_first = ev.strip().splitlines()[0].lstrip() if ev.strip() else ""
-        if ev_first.startswith("#") or ev_first.startswith("//"):
-            rejects.append(
-                f"issue #{n} ({file or '?'}): 'evidence' is a COMMENT line "
-                f"(`{ev.strip()[:60]}`). A comment cannot cause a CI failure — "
-                f"target the actual broken command/value line instead.")
             continue
         if cor.strip() == ev.strip():
             rejects.append(
@@ -3130,8 +3043,7 @@ def main():
         c = _read_evidence_file(f)
         if c is not None:
             preloaded_contents[f] = c
-    offending = locate_offending_lines(focused, signal, preloaded_contents,
-                                       allowed_files)
+    offending = locate_offending_lines(focused, signal, preloaded_contents)
     if offending:
         issue_block = issue_block + "\n\n" + offending
         CURRENT_FAILURE_CONTEXT = issue_block + "\n" + signal
