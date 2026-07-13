@@ -373,8 +373,13 @@ def retrieve_files_by_error_tokens(error_tokens: list, allowed_files: set,
     if not error_tokens:
         return []
     scores = {}
+    # Prose documentation (README, guides) only MENTIONS the error's tokens in
+    # sentences — it never participates in a build/runtime failure. Excluding it
+    # keeps the model's prompt focused on files that actually run, and avoids
+    # shipping doc prose as "evidence".
+    candidate_files = {f for f in allowed_files if not _is_prose_doc(f)}
     # 1) filename matches (cheap)
-    for f in allowed_files:
+    for f in candidate_files:
         name = Path(f).name.lower()
         for tok in error_tokens:
             tbase = tok.rsplit("/", 1)[-1].lower()
@@ -382,7 +387,7 @@ def retrieve_files_by_error_tokens(error_tokens: list, allowed_files: set,
                 scores[f] = scores.get(f, 0) + 2
     # 2) content matches (bounded scan)
     scanned = 0
-    for f in sorted(allowed_files):
+    for f in sorted(candidate_files):
         if scanned >= 200:
             break
         p = Path(f)
@@ -2170,7 +2175,11 @@ def ai_generate_patch(root_cause: str, solution: str, evidence: dict,
     if remaining < 45:
         raise RuntimeError(f"only {remaining:.0f}s of budget left — not enough "
                            f"for a patch call")
-    timeout = min(PATCH_TIMEOUT, int(remaining) - 10)
+    # Never let a single patch call consume the whole remaining budget — cap it
+    # at ~55% of what's left so a failed/slow round still leaves room for one
+    # retry. (The 330s-eats-everything-then-no-round-2 failure mode.)
+    budget_cap = max(120, int(remaining * 0.55))
+    timeout = min(PATCH_TIMEOUT, budget_cap, int(remaining) - 10)
     retries = MAX_RETRIES if remaining > 2 * timeout else 1
     print(f"[PATCH] timeout {timeout}s, retries {retries} "
           f"(budget remaining {remaining:.0f}s)")
@@ -2373,6 +2382,50 @@ def _reanchor_pair(ev: str, cor: str, evidence: dict):
     return hint_file, hint_line, new_line
 
 
+def build_issues_from_findings(findings: list, evidence: dict) -> list:
+    """VALIDATION-SIDE PAIRING (change stays 100% model-authored): when the
+    investigation/confirm step already produced findings whose `solution` is a
+    concrete replacement LINE (e.g. 'CMD [\"python\", \"app.py\"]'), pair each
+    with the closest existing line in the evidence and emit a ready
+    issue-dict — so a successful, high-confidence confirm is turned straight
+    into a patch WITHOUT a second, slow, failure-prone patch-generation model
+    call. Python only LOCATES the line the model's solution replaces (same
+    principle as the re-anchor rescue and _salvage_fragment); it never authors
+    the fix. Findings whose solution isn't a locatable single line are skipped
+    and left for the model patch call to handle. Returns a list of issue-dicts
+    (possibly empty)."""
+    issues = []
+    for f in findings or []:
+        if not isinstance(f, dict):
+            continue
+        sol = (f.get("solution") or "").strip()
+        # Must be a single concrete line, not prose or a multi-line block.
+        if not sol or "\n" in sol or len(sol) > 300:
+            continue
+        # Reject obviously-prose solutions ("change X to Y", "update the ...").
+        low = sol.lower()
+        if low.split(" ", 1)[0] in ("change", "update", "replace", "set", "add",
+                                     "remove", "fix", "modify", "use", "ensure",
+                                     "make", "correct", "rename"):
+            continue
+        hint_file, hint_line, ratio = _closest_evidence_line(sol, evidence)
+        if not hint_file or ratio < 0.6:
+            continue
+        if hint_line.strip() == sol.strip():
+            continue  # solution already present — nothing to change
+        issues.append({
+            "file": hint_file,
+            "evidence": hint_line,
+            "corrected": sol,
+            "problem": (f.get("issue") or f.get("root_cause") or "").strip(),
+        })
+    if issues:
+        print(f"[PATCH] derived {len(issues)} concrete fix(es) directly from the "
+              f"confirmed findings (model authored each 'solution'; Python only "
+              f"located the verbatim line it replaces).")
+    return issues
+
+
 def issues_to_fixes(issues: list, evidence: dict) -> tuple:
     fixes_by_file, rejects = {}, []
     for n, it in enumerate(issues, 1):
@@ -2513,11 +2566,34 @@ def _resolve_content(fix: dict) -> tuple:
     return None, "no 'edits' or 'fixed_content'"
 
 
+def _is_prose_doc(file: str) -> bool:
+    """True if `file` is human documentation prose (README, guides, changelog)
+    where filenames are MENTIONED in sentences/tables, not REFERENCED as build
+    inputs. Such files can never cause a CI build/runtime failure — nothing
+    executes them — so scanning them for 'broken references' produces only
+    false positives. Observation-only classification by extension/name."""
+    p = Path(file)
+    if p.suffix.lower() in (".md", ".markdown", ".rst", ".adoc", ".mdx"):
+        return True
+    name = p.name.lower()
+    # prose .txt (README.txt, NOTES.txt) — but NOT dependency manifests like
+    # requirements.txt / constraints.txt, whose names ARE real reference targets.
+    if p.suffix.lower() == ".txt" and not name.endswith("requirements.txt") \
+            and name not in ("constraints.txt",):
+        prose_names = ("readme", "notes", "changelog", "changes", "history",
+                       "authors", "contributors", "license", "copying", "todo")
+        if any(name.startswith(x) for x in prose_names):
+            return True
+    return False
+
+
 def _missing_ref_map(content: str, file: str) -> dict:
     """Map of token -> problem message for repo-file references that don't
     exist. Pure observation; blocking decisions happen in _compare_ref_problems."""
     problems = {}
-    if not content:
+    if not content or _is_prose_doc(file):
+        # Documentation prose mentions filenames constantly; those mentions are
+        # not references that can break a build. Never audit them.
         return problems
     all_repo = [_relstrip(str(p)) for p in Path(".").rglob("*")
                 if p.is_file() and not any(d in SKIP_DIRS for d in p.parts)]
@@ -3416,6 +3492,22 @@ def main():
              (it.get("corrected") or ""))
             for it in iss if isinstance(it, dict)))
 
+    # ── DIRECT PATCH FROM CONFIRMED FINDINGS (skip the 2nd model call) ──
+    # If the confirm/investigation step already produced concrete solution
+    # lines that Python can pair with verbatim source lines, AND together they
+    # cover every audited FACT, use them directly on round 1 — no separate,
+    # slow, timeout-prone patch-generation model call. Falls back to the model
+    # loop automatically if these don't validate.
+    prebuilt_issues = build_issues_from_findings(findings, evidence)
+    if prebuilt_issues and unaddressed_audit_facts(prebuilt_issues, audit_facts):
+        # they don't cover all audited bugs — let the model do the full job
+        print("[PATCH] findings-derived fixes don't cover every audited FACT — "
+              "using the model patch call instead.")
+        prebuilt_issues = None
+    elif prebuilt_issues:
+        print("[PATCH] findings-derived fixes cover every audited FACT — "
+              "applying them directly (no patch-generation model call needed).")
+
     for repair_round in range(1, MAX_REPAIR_ROUNDS + 1):
         if _budget_exceeded():
             print(f"[BUDGET] time budget exceeded before repair round {repair_round}.")
@@ -3439,18 +3531,23 @@ def main():
             sys.exit(5)
         active_issue_block = retry_issue_block or issue_block
         _patch_t0 = time.time()
-        try:
-            issues = ai_generate_patch(patch_root_cause, solution, evidence,
-                                       retry_note, active_issue_block,
-                                       error_tokens=error_tokens)
-        except Exception as exc:
-            last_patch_duration = time.time() - _patch_t0
-            print(f"[ERROR] patch generation failed: {exc}", file=sys.stderr)
-            if repair_round == MAX_REPAIR_ROUNDS:
-                if token and repo:
-                    open_issue(token, repo, f"AI patch generation failed: {exc}", run_url)
-                sys.exit(2)
-            continue
+        if repair_round == 1 and prebuilt_issues:
+            issues = prebuilt_issues
+            print("  using fixes derived from the confirmed findings "
+                  "(no patch-generation model call).")
+        else:
+            try:
+                issues = ai_generate_patch(patch_root_cause, solution, evidence,
+                                           retry_note, active_issue_block,
+                                           error_tokens=error_tokens)
+            except Exception as exc:
+                last_patch_duration = time.time() - _patch_t0
+                print(f"[ERROR] patch generation failed: {exc}", file=sys.stderr)
+                if repair_round == MAX_REPAIR_ROUNDS:
+                    if token and repo:
+                        open_issue(token, repo, f"AI patch generation failed: {exc}", run_url)
+                    sys.exit(2)
+                continue
         last_patch_duration = time.time() - _patch_t0
 
         print(f"  issues reported: {len(issues)}")
