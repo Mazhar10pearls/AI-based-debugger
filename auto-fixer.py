@@ -1658,6 +1658,46 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
     timed_out_cold = False
     parse_failures = 0
     turn_num_predict = 800
+    # Best COMPLETE self-assessment the model gave on any turn. A later turn
+    # that truncates before emitting status/confidence must never downgrade a
+    # good earlier read — the model's own most-recent complete confidence wins.
+    best_assessment = None  # (confidence, data)
+
+    def _remember(data: dict):
+        nonlocal best_assessment
+        raw_conf = data.get("confidence")
+        if raw_conf is None:
+            return
+        try:
+            conf = float(raw_conf)
+        except (TypeError, ValueError):
+            return
+        has_cause = bool((data.get("root_cause") or "").strip()
+                         or (data.get("findings")))
+        if not has_cause:
+            return
+        if best_assessment is None or conf >= best_assessment[0]:
+            best_assessment = (conf, dict(data))
+
+    def _finalize_with_fallback(data, forced):
+        """Finalize on `data`, but if `data` lost its confidence to truncation
+        while an earlier complete turn had a real one + a concrete cause, use
+        that earlier assessment instead of defaulting to 0.4 and escalating a
+        diagnosis the model actually reached."""
+        this_conf = data.get("confidence")
+        this_cause = (data.get("root_cause") or "").strip() or bool(data.get("findings"))
+        if (this_conf is None or not this_cause) and best_assessment is not None:
+            print(f"[INVESTIGATE] final turn was incomplete "
+                  f"(confidence={this_conf}, cause={'yes' if this_cause else 'no'}); "
+                  f"falling back to the model's last COMPLETE assessment "
+                  f"(confidence={best_assessment[0]}).")
+            merged = dict(best_assessment[1])
+            # keep any richer root_cause/findings the truncated turn did emit
+            for k in ("root_cause", "solution", "findings", "commit_message"):
+                if data.get(k) and not merged.get(k):
+                    merged[k] = data[k]
+            return _finalize_investigation(merged, forced, evidence)
+        return _finalize_investigation(data, forced, evidence)
 
     for turn in range(1, MAX_INVESTIGATION_TURNS + 1):
         if _budget_exceeded():
@@ -1727,9 +1767,10 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
             stall_count += 2
 
         log.append({"turn": turn, "status": status, "analysis": analysis[:200]})
+        _remember(data)
 
         if status == "root_cause_confirmed":
-            result = _finalize_investigation(data, False, evidence)
+            result = _finalize_with_fallback(data, False)
             break
 
         if status == "need_more_info":
@@ -1760,13 +1801,27 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
 
             stalled = (not to_read and requested and not last_turn)
             stall_count = stall_count + 1 if stalled else 0
-            force_now = last_turn or stall_count >= 2
+
+            # Convergence guard: on this slow runner every extra turn risks a
+            # truncated final turn. If the model already has a concrete cause
+            # AND this need_more_info fetched nothing genuinely new, it is
+            # dithering, not investigating — force the decision NOW rather than
+            # spending another ~200s turn. (The model's stated confidence is
+            # preserved by _remember/_finalize_with_fallback.)
+            has_concrete_cause = bool((data.get("root_cause") or "").strip()
+                                      or data.get("findings"))
+            dithering = (not to_read and has_concrete_cause)
+            force_now = last_turn or stall_count >= 2 or dithering
+            if dithering and not last_turn and stall_count < 2:
+                print("[INVESTIGATE] model already has a concrete root cause and "
+                      "requested nothing new — forcing confirmation instead of "
+                      "burning another turn.")
 
             if force_now:
                 if stall_count >= 2 and not last_turn:
                     print("[INVESTIGATE] no new evidence for 2 turns — forcing final decision.")
                 if _budget_exceeded():
-                    result = _finalize_investigation(data, True, evidence)
+                    result = _finalize_with_fallback(data, True)
                     break
                 final_prompt = _build_investigation_prompt(
                     signal, exit_code, repo_tree, git_diff, evidence, True,
@@ -1782,12 +1837,13 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                 except Exception as exc:
                     print(f"[INVESTIGATE] final turn failed: {exc}", file=sys.stderr)
                     data2 = data
-                result = _finalize_investigation(data2, True, evidence)
+                _remember(data2)
+                result = _finalize_with_fallback(data2, True)
                 break
             continue
 
         if data.get("root_cause"):
-            result = _finalize_investigation(data, True, evidence)
+            result = _finalize_with_fallback(data, True)
         break
 
     if result is None:
