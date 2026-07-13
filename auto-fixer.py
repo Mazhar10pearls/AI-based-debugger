@@ -435,6 +435,36 @@ def _strip_log_timestamps(log_text: str) -> str:
     return "\n".join(_strip_ts(l) for l in log_text.splitlines())
 
 
+# GitHub-Actions logs occasionally carry mojibake — null bytes, BOMs, or U+FFFD
+# replacement chars (e.g. a corrupted `--build-arg PYTHON_VERSION=` producing a
+# base image tag like '\x00\x003.12'). If that garbage reaches the AI it drives
+# a nonsense diagnosis. Strip control chars and collapse replacement-char runs.
+_CTRL_CHARS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+_REPLACEMENT_RUN = re.compile(r'[\ufffd\ufeff]+')
+
+
+def sanitize_log_text(log_text: str) -> tuple:
+    """Remove control/replacement characters from log text. Returns
+    (clean_text, corrupted_bool) — corrupted is True if any were found, so the
+    caller can lower confidence on a diagnosis built from a garbled signal."""
+    corrupted = bool(_CTRL_CHARS.search(log_text) or _REPLACEMENT_RUN.search(log_text))
+    clean = _REPLACEMENT_RUN.sub("", _CTRL_CHARS.sub("", log_text))
+    return clean, corrupted
+
+
+def looks_garbled(text: str) -> bool:
+    """True if a short string still looks corrupted after sanitizing — e.g. a
+    primary error like \"The version '3.12\" that was cut mid-token, or one with
+    a high ratio of non-ASCII noise. Used to refuse anchoring a confident
+    diagnosis on an unreadable error."""
+    if not text:
+        return False
+    if "\ufffd" in text or any(ord(c) < 32 and c not in "\t\n" for c in text):
+        return True
+    printable = sum(1 for c in text if c.isprintable() or c in "\t\n")
+    return printable / max(1, len(text)) < 0.85
+
+
 def _best_error_line(log_text: str) -> str:
     lines = [l.strip() for l in log_text.splitlines() if l.strip()]
     lines = [l for l in lines if not any(n in l.lower() for n in NOISE_KEYWORDS)]
@@ -1222,6 +1252,41 @@ def is_python_version_failure(issue_block: str, signal: str) -> bool:
     return any(p.search(blob) for p in PY_VERSION_FAILURE_SIGNATURES)
 
 
+def _extract_version_file_name(blob: str) -> str:
+    """Pull the referenced version-file path from either the workflow
+    `python-version-file: X` form or the error's `file at: X` form. Tries all
+    matches and returns the first that actually looks like a filename (the
+    `python-version-file` regex can otherwise capture the stray word 'at' from
+    'python version file at:')."""
+    candidates = []
+    for pat in (_VERSION_FILE_REF, _MISSING_FILE_ERR):
+        for m in pat.finditer(blob):
+            candidates.append(m.group(1).strip().strip("`'\":,"))
+    for cand in candidates:
+        if cand and ("." in cand or "/" in cand):
+            return cand
+    return ""
+
+
+def missing_version_file(issue_block: str, signal: str, allowed_files: set) -> str:
+    """Return the missing version-file path if the failure is 'the workflow
+    points at a version file that does not exist', else ''. This is distinct
+    from 'no version defined anywhere' — a version may well exist elsewhere
+    (e.g. the Dockerfile), but setup-python's python-version-file target is
+    absent. The fix is to CREATE that file (or stop referencing it), which the
+    edit-only patch engine cannot do — so this must escalate, not go to the
+    model. Observation only; Python names the missing file the error/workflow
+    already state."""
+    cand = _extract_version_file_name(f"{issue_block}\n{signal}")
+    if not cand:
+        return ""
+    norm = _relstrip(cand)
+    # Confirm it really is absent (present in neither the readable tree nor disk).
+    if norm in allowed_files or Path(norm).is_file():
+        return ""
+    return cand
+
+
 def python_version_is_undefined(allowed_files: set) -> bool:
     """True when the repo declares NO concrete Python version anywhere the tool
     can read (.python-version, workflow python-version:, Dockerfile FROM/ARG,
@@ -1254,15 +1319,7 @@ def undefined_python_version_message(issue_block: str, signal: str) -> str:
     back to the generic 'no version defined anywhere' message. Python only
     reports what the error/workflow already state; it does not choose a value."""
     blob = f"{issue_block}\n{signal}"
-    named = None
-    # Prefer the explicit `python-version-file: X` reference (unambiguous);
-    # fall back to the "file at: X" phrasing in the error message.
-    m = _VERSION_FILE_REF.search(blob) or _MISSING_FILE_ERR.search(blob)
-    if m:
-        cand = m.group(1).strip().strip("`'\":,")
-        # Sanity: must look like a filename, not a stray word.
-        if "." in cand or "/" in cand:
-            named = cand
+    named = _extract_version_file_name(blob)
     if named:
         return (
             f"The workflow's `setup-python` step is configured with "
@@ -2578,6 +2635,10 @@ def main():
               f"{', '.join(redacted)}")
     log_text = redact_secrets(log_text)
     log_text = _strip_log_timestamps(log_text)  # clean AI-facing log lines
+    log_text, log_corrupted = sanitize_log_text(log_text)
+    if log_corrupted:
+        print("[SECURITY] log contained control/replacement characters "
+              "(mojibake) — stripped before analysis.")
 
     exit_code = get_exit_code(log_text, args.exit_code)
     signal = extract_error_signal(log_text)
@@ -2588,6 +2649,31 @@ def main():
 
     focused = extract_focused_failure(log_text)
     issue_block = format_focused_issue(focused, exit_code)
+
+    # If the PRIMARY error is itself garbled (e.g. a corrupted version tag like
+    # '\x00\x003.12' from an empty --build-arg), the log is unreadable at the
+    # decisive point. A confident diagnosis on that premise is a hallucination
+    # waiting to happen — escalate for a human instead of guessing.
+    primary = focused.get("primary_message", "")
+    if log_corrupted and looks_garbled(primary):
+        print("[GATE] the primary error line is garbled/corrupted — the log is "
+              "unreadable at the point that matters. Refusing to diagnose on a "
+              "corrupted signal; escalating.")
+        msg = ("The CI log is corrupted at the failing line — the primary error "
+               "reads as garbled/non-printable text (e.g. a Python version tag "
+               "like `\\x00\\x003.12`). This usually means a build argument or "
+               "variable resolved to an EMPTY value (for example "
+               "`--build-arg PYTHON_VERSION=` with no value, giving `FROM "
+               "python:` with no tag). Check that every variable the failing "
+               "step references is actually set — a missing workflow step that "
+               "was supposed to define it is the most common cause. I can't "
+               "safely diagnose from an unreadable error signal.")
+        print(f"       {msg}")
+        if token and repo:
+            open_issue(token, repo,
+                       msg + f"\n\n**Garbled signal (first 300 chars):**\n"
+                       + f"```\n{signal[:300]}\n```", run_url)
+        sys.exit(0)
 
     # Validation scoping: the error evidence itself (never model output)
     # decides which pre-existing problems a patch MUST fix.
@@ -2619,23 +2705,31 @@ def main():
         issue_block = issue_block + "\n\n" + coherence
         CURRENT_FAILURE_CONTEXT = issue_block + "\n" + signal
 
-    # ── UNDEFINED-PYTHON-VERSION GATE (observation, not diagnosis) ──
-    # If this is a Python-version failure but the repo declares NO version
-    # anywhere, there is nothing to anchor a fix to. The AI must not invent a
-    # version — escalate with a precise message and stop before the model call.
-    if (is_python_version_failure(issue_block, signal)
-            and python_version_is_undefined(allowed_files)):
-        gate_msg = undefined_python_version_message(issue_block, signal)
-        print("[GATE] Python-version failure but the repo defines NO usable "
-              "version — refusing to guess; escalating.")
-        print(f"       {gate_msg}")
-        if token and repo:
-            open_issue(token, repo,
-                       gate_msg
-                       + f"\n\n**Failure Python identified:**\n"
-                       + f"```\n{issue_block[:1200]}\n```",
-                       run_url)
-        sys.exit(0)
+    # ── VERSION-FILE / UNDEFINED-VERSION GATE (observation, not diagnosis) ──
+    # Two escalate-don't-guess cases the edit-only patch engine can't handle:
+    #  (a) the workflow points at a version file that DOESN'T EXIST — the fix is
+    #      to CREATE that file (or stop referencing it), not edit anything; or
+    #  (b) the failure is a version error and NO version is defined anywhere.
+    # In both, sending it to the model just makes it flail on the workflow and
+    # produce "no effective change" (exactly what looped here). Escalate first.
+    if is_python_version_failure(issue_block, signal):
+        missing_vf = missing_version_file(issue_block, signal, allowed_files)
+        if missing_vf or python_version_is_undefined(allowed_files):
+            gate_msg = undefined_python_version_message(issue_block, signal)
+            reason = (f"the workflow references version file '{missing_vf}' which "
+                      f"does not exist" if missing_vf
+                      else "the repo defines NO usable Python version")
+            print(f"[GATE] Python-version failure — {reason}. The fix requires "
+                  f"creating/removing a file, which this tool can't author. "
+                  f"Refusing to guess; escalating.")
+            print(f"       {gate_msg}")
+            if token and repo:
+                open_issue(token, repo,
+                           gate_msg
+                           + f"\n\n**Failure Python identified:**\n"
+                           + f"```\n{issue_block[:1200]}\n```",
+                           run_url)
+            sys.exit(0)
 
     # ── DETERMINISTIC CONTEXT RETRIEVAL (not diagnosis) ──
     context_map = gather_deterministic_context(log_text, allowed_files)
