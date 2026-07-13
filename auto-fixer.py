@@ -1717,60 +1717,49 @@ PATCH_SCHEMA = {
 }
 
 PATCH_SYSTEM = """\
-You are a patch-generation agent. Another engineer already investigated this \
-CI/CD failure and confirmed the root cause(s) below. Your job is to emit the \
-concrete text-level fix for EVERY issue listed — do not re-diagnose, but do
-not silently skip any of them either.
+You are a precise patch-generation agent. Your SOLE task: for EACH root cause \
+listed below, emit the exact text-level fix — no re-diagnosis, no skipping.
 
-Stay scoped to the "## ISSUE TO SOLVE" section if one is present.
+CRITICAL RULES:
 
-IMPORTANT: if multiple issues are listed under "## Confirmed root cause",
-you MUST emit one "issues" entry per problem — a single file can have
-several independent bugs (e.g. a bad version string AND one or more
-mismatched filenames used in different commands). Before finishing, re-scan
-the file contents you were given for any other reference of the same kind
-as the ones already listed (other paths, other version strings, etc.) that
-point to something which doesn't match what actually exists elsewhere in
-the evidence — and fix those too, using the same file/evidence/corrected
-format.
+1. **ONE ISSUE PER BUG** — a file can have 2+ independent bugs. Example:
+   Dockerfile with bug #1 (typo in COPY path), bug #2 (wrong Python version).
+   You MUST emit 2 separate "issues" entries, not merge them.
 
-Output ONLY one JSON object. No markdown fences.
+2. **EVIDENCE = ONE BROKEN LINE, EXACTLY AS IT APPEARS IN THE FILE**
+   - Copy ONLY the single line containing the bug
+   - Strip any surrounding context (don't copy step names, uses:, with:, etc.)
+   - If file shows: `    COPY requiremesnts.txt .\n    RUN pip install...`
+     Then evidence is JUST: `    COPY requiremesnts.txt .`
+   - Match indentation exactly (spaces/tabs as-is)
+   - NEVER include `<<<SKIPPED...>>>` markers — those are NOT real file content
 
-"issues" = ONE ENTRY PER BUG. Each entry:
-  - "file": exact ### header path
-  - "evidence": the ONE broken line, copied EXACTLY from the file contents.
-  - "corrected": that SAME line with only the bug fixed. MUST differ from "evidence".
-  - "problem": one sentence (last).
+3. **CORRECTED = SAME LINE WITH BUG FIXED, AND DIFFERENT FROM EVIDENCE**
+   - Fix ONLY the bug itself, nothing else
+   - If evidence is `COPY requiremesnts.txt .`, corrected is `COPY requirements.txt .`
+   - If evidence is `python-version: "3.1"`, corrected is `python-version: "3.10"`
+   - **EVIDENCE AND CORRECTED MUST BE DIFFERENT STRINGS** — this is non-negotiable
+   - If you can't make them different, you haven't understood the bug
 
-**"evidence" MUST BE EXACTLY ONE LINE — the single line that contains the
-bug.** Never include surrounding lines like the step name, `uses:`, or
-`with:`. A multi-line block where nothing actually changes will be REJECTED.
-Example: if the broken line is `          python-version: "3.2"`, then
-evidence is that one line and corrected is the same line with a valid value.
+4. **EXACT COPY FROM FILE CONTENTS**
+   - The text you use in "evidence" MUST appear verbatim in the file excerpts shown
+   - If you can't find it in the shown file, you must describe it differently
+   - Never paraphrase or use synonyms
 
-File contents may be shown as focused excerpts; omitted regions appear as
-`<<<SKIPPED N UNRELATED LINES>>>`. NEVER copy a skip marker into "evidence"
-or "corrected" — it is not file content.
+5. **MULTIPLE BUGS IN ONE FILE?**
+   Emit multiple entries:
+   {"issues":[
+     {"file":"Dockerfile","evidence":"COPY requiremesnts.txt .","corrected":"COPY requirements.txt .","problem":"typo in filename"},
+     {"file":"Dockerfile","evidence":"FROM python:3.1","corrected":"FROM python:3.10","problem":"invalid Python version"},
+     ...
+   ]}
 
-CRITICAL: "evidence" must be copied VERBATIM from the "## File contents"
-section below. NEVER use text from the error log, the root cause, or your
-own paraphrase as "evidence" — if the exact characters are not in the file
-contents shown, the patch will be rejected.
+6. **DO NOT ESCAPE PATHS/TEXT**
+   Write plainly: `requirements.txt` not `requirements\\.txt`
+   Use forward slashes: `.github/workflows/ci.yml` not `.github\\workflows\\ci.yml`
 
-DO NOT ESCAPE CHARACTERS. Write paths and text plainly:
-  - file: `.github/workflows/ci-local-deploy.yml`  ✔
-  - NOT `\\.github\\_workflows\\_ci-local-deploy.yml`  → WRONG
-  - evidence: `python-version: "3.1"`  ✔   corrected: `python-version: "3.10"`  ✔
-No backslashes before dots, slashes, underscores, or digits. A path uses
-forward slashes only. "evidence" and "corrected" must be DIFFERENT — the
-whole point is that "corrected" changes the broken part.
-
-Schema:
+Output ONLY one JSON object:
 {"issues":[{"file":"...","evidence":"...","corrected":"...","problem":"..."}]}
-
-**REMEMBER**: "evidence" and "corrected" must be DIFFERENT strings. Emit
-a separate entry for each distinct bug — do not merge multiple bugs into
-one entry, and do not stop after the first one.
 """
 
 
@@ -2020,6 +2009,11 @@ def issues_to_fixes(issues: list, evidence: dict) -> tuple:
                 f"lines around it — and 'corrected' is that SAME line with the "
                 f"bug fixed, e.g. evidence `python-version: \"3.1\"` → "
                 f"corrected `python-version: \"3.10\"`.")
+            # DEBUG: Print the full strings to help understand what went wrong
+            print(f"[DEBUG] Issue #{n} rejection detail:\n"
+                  f"  evidence ({len(ev)} chars): {repr(ev[:150])}\n"
+                  f"  corrected ({len(cor)} chars): {repr(cor[:150])}",
+                  file=sys.stderr)
             continue
 
         holders = [f for f, c in evidence.items() if isinstance(c, str) and ev in c]
@@ -2659,7 +2653,55 @@ def open_issue(token, repo, reason, run_url=""):
 # ═══════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════
+def _analyze_patch_failures(issues: list, evidence: dict, pair_rejects: list) -> str:
+    """Diagnose why patches were rejected and provide actionable feedback."""
+    problems = []
+    
+    for n, it in enumerate(issues, 1):
+        if not isinstance(it, dict):
+            problems.append(f"Issue #{n}: not a dict")
+            continue
+        
+        ev = it.get("evidence", "")
+        cor = it.get("corrected", "")
+        file_ref = it.get("file", "?")
+        
+        # Check 1: Empty evidence or corrected
+        if not ev or not str(ev).strip():
+            problems.append(f"Issue #{n} ({file_ref}): evidence is empty")
+        if not cor or not str(cor).strip():
+            problems.append(f"Issue #{n} ({file_ref}): corrected is empty")
+        
+        # Check 2: Identical (stripped)
+        if str(ev).strip() == str(cor).strip():
+            problems.append(f"Issue #{n} ({file_ref}): evidence and corrected are IDENTICAL — "
+                          f"the bug was not fixed. evidence='{str(ev)[:60]}'")
+        
+        # Check 3: Evidence contains markers
+        if "SKIPPED" in str(ev):
+            problems.append(f"Issue #{n} ({file_ref}): evidence contains '<<<SKIPPED...>>>' marker "
+                          f"which is not file content")
+        
+        # Check 4: Evidence not found in any evidence file
+        ev_found = any(str(ev) in str(c) for c in evidence.values() if c)
+        if not ev_found and str(ev).strip():
+            problems.append(f"Issue #{n} ({file_ref}): evidence '{str(ev)[:60]}' not found "
+                          f"in any evidence file — may be paraphrased or wrong")
+        
+        # Check 5: Multi-line evidence with no actual change per line
+        if "\n" in str(ev) and str(ev).strip() == str(cor).strip():
+            problems.append(f"Issue #{n} ({file_ref}): multi-line evidence with no changes")
+    
+    # Add pair rejection details
+    for rej in pair_rejects:
+        if "IDENTICAL" in rej or "identical" in rej:
+            problems.append(f"Pair rejection: {rej[:100]}")
+    
+    return "; ".join(problems) if problems else "No specific diagnosis available"
+
+
 def main():
+
     global _run_start_time
     _run_start_time = time.time()
 
@@ -2997,19 +3039,30 @@ def main():
         if not fixes:
             detail = "; ".join(pair_rejects) or "model reported no locatable issues"
             print(f"[ERROR] no usable fixes this round. {detail}", file=sys.stderr)
+            
+            # ANALYSIS: Help the model understand what went wrong
+            analysis = _analyze_patch_failures(issues, evidence, pair_rejects)
+            if analysis:
+                print(f"[ANALYSIS] Patch failure root cause(s): {analysis}", file=sys.stderr)
+            
             if repair_round == MAX_REPAIR_ROUNDS:
                 if token and repo:
                     open_issue(token, repo,
-                               f"AI produced no usable fixes. Root cause: {root_cause}\n\n{detail}", run_url)
+                               f"AI produced no usable fixes. Root cause: {root_cause}\n\n{detail}\n\n**Analysis:** {analysis}", run_url)
                 sys.exit(3)
             rejection_history.append(f"round {repair_round}: {detail}")
             retry_note = ("Your previous patch attempts were rejected before they "
                           "could even be applied, for these reasons (fix ALL of "
                           "them):\n"
                           + "\n".join(f"- {r}" for r in rejection_history)
-                          + "\nMake sure 'evidence' is copied EXACTLY from the file "
-                            "contents shown — ONE line only, the broken line — and "
-                            "'corrected' is that same line with the bug fixed.")
+                          + "\n\n**KEY REMINDERS:**\n"
+                            "1. 'evidence' MUST be EXACTLY ONE LINE copied verbatim from the file\n"
+                            "2. 'corrected' MUST be that same line with ONLY the bug fixed\n"
+                            "3. 'evidence' and 'corrected' MUST BE DIFFERENT\n"
+                            "4. Do NOT include context lines (step names, uses:, with:, etc.)\n"
+                            "5. Do NOT copy '<<<SKIPPED...>>>' markers\n"
+                            "6. Match indentation exactly\n"
+                            f"\n**Analysis:** {analysis}")
             continue
 
         print("\n━━━ PYTHON VALIDATION ENGINE ━━━")
