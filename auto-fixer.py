@@ -21,8 +21,8 @@ import yaml
 
 # ── Ollama ────────────────────────────────────────────────────────────────────
 OLLAMA_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/api/generate")
-OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL",   "qwen2.5-coder:7b")  # was gemma3:4b — better JSON/exact-copy compliance
-AI_TIMEOUT     = int(os.environ.get("AI_TIMEOUT", "240"))  # was 210 — the 7B prefills ~2x slower; guards a compliant answer from being deadline-truncated mid-JSON
+OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL",   "gemma3:4b")
+AI_TIMEOUT     = int(os.environ.get("AI_TIMEOUT", "210"))
 MAX_RETRIES    = int(os.environ.get("AI_MAX_RETRIES", "2"))
 RETRY_BACKOFF  = [20, 20]
 OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "16384"))   # larger context window
@@ -1834,11 +1834,7 @@ def ai_generate_patch(root_cause: str, solution: str, evidence: dict,
     if remaining < 45:
         raise RuntimeError(f"only {remaining:.0f}s of budget left — not enough "
                            f"for a patch call")
-    # Cap a single patch call at ~55% of the remaining budget so one round
-    # can't consume everything and starve a round-2 retry. This matters now
-    # that the slower 7B raises PATCH_TIMEOUT to AI_TIMEOUT+90 = 330s.
-    budget_cap = max(120, int(remaining * 0.55))
-    timeout = min(PATCH_TIMEOUT, budget_cap, int(remaining) - 10)
+    timeout = min(PATCH_TIMEOUT, int(remaining) - 10)
     retries = MAX_RETRIES if remaining > 2 * timeout else 1
     print(f"[PATCH] timeout {timeout}s, retries {retries} "
           f"(budget remaining {remaining:.0f}s)")
