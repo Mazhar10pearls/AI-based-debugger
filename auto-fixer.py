@@ -356,7 +356,33 @@ NOISE_KEYWORDS = [
     "##[group]", "##[endgroup]", "set up job", "complete job", "post job",
     "add mask", "git config", "git version", "persist-credentials",
     "fetch-depth", "collecting ", "rootdir:", "configfile:",
+    # deprecation / runtime warnings that are never the actual failure but
+    # frequently sit right next to it in GitHub Actions logs (this is what
+    # got mis-picked as "command context" for a python-version error):
+    "deprecationwarning", "--trace-deprecation", "trace-warnings",
+    "node --trace", "(use `node", "punycode", "experimentalwarning",
+    "npm warn", "warning:", "deprecated", "notice]", "downloading",
+    "already satisfied", "reading package", "resolving", "setup-python",
+    "actions/checkout", "actions/setup", "run docker", "##[debug]",
 ]
+# A line that is plausibly the COMMAND that triggered a failure: a shell
+# invocation or a known tool call. Used to reject "the line above the error"
+# when that line is just a warning or log noise.
+COMMAND_LINE_HINTS = [
+    re.compile(r'^\s*(?:\$|>|\+)\s'),                       # shell prompt / set -x echo
+    re.compile(r'\b(?:python|pip|pytest|npm|yarn|node|go|mvn|gradle|'
+               r'docker|docker\s+buildx|curl|make|bash|sh)\b', re.I),
+    re.compile(r'\brun:\s'),                                # workflow "run:" line
+]
+
+
+def _looks_like_command(line: str) -> bool:
+    s = (line or "").strip()
+    if not s or any(n in s.lower() for n in NOISE_KEYWORDS):
+        return False
+    return any(p.search(s) for p in COMMAND_LINE_HINTS)
+
+
 FILE_REF_HINTS = [re.compile(r'File "[^"]+"'),
                   re.compile(r'[\w./\-]+\.[A-Za-z0-9]+:\d+'),
                   re.compile(r'\bDockerfile(\.\w+)?\b')]
@@ -393,6 +419,20 @@ STRONG_ERROR_LINE_PATTERNS = [
     re.compile(r'^\s*error\b[: ]', re.I),
     re.compile(r'\bfatal\b', re.I),
 ]
+
+
+_TS_PREFIX = re.compile(
+    r'^\s*\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\s+')
+
+
+def _strip_ts(line: str) -> str:
+    """Remove the leading GitHub-Actions ISO-8601 timestamp from a log line so
+    the AI sees the clean message, not '2026-07-13T01:51:41.5Z Error: ...'."""
+    return _TS_PREFIX.sub("", line)
+
+
+def _strip_log_timestamps(log_text: str) -> str:
+    return "\n".join(_strip_ts(l) for l in log_text.splitlines())
 
 
 def _best_error_line(log_text: str) -> str:
@@ -488,10 +528,14 @@ def extract_focused_failure(log_text: str) -> dict:
                 msg_line_idx = i
                 break
         if msg_line_idx is not None:
-            if msg_line_idx > 0:
-                prev = log_lines[msg_line_idx - 1].strip()
-                if prev and not any(n in prev.lower() for n in NOISE_KEYWORDS):
-                    command_context_lines.append(prev)
+            # Search a small window ABOVE the error for a line that actually
+            # looks like a command (not just whatever line happened to precede
+            # it — that was grabbing Node deprecation warnings as "context").
+            for j in range(msg_line_idx - 1, max(-1, msg_line_idx - 8), -1):
+                cand = log_lines[j].strip()
+                if _looks_like_command(cand):
+                    command_context_lines.append(cand)
+                    break
             error_filename = None
             for ref in file_refs:
                 if ref in primary_message:
@@ -1034,25 +1078,36 @@ def enrich_issue_with_path_checks(focused: dict, signal: str,
     ]))
     # path-like tokens: a/b/c.ext or bare dir/file references
     path_re = re.compile(r'(?<![\w./\-])((?:[\w.\-]+/)+[\w.\-]+)(?![\w./\-])')
+    # Prefixes/patterns that are runner or system paths, URLs, or GH expressions
+    # — never repo files, and previously the source of false "missing" flags.
+    _skip_prefixes = ("http", "${{", "/home/", "/usr/", "/opt/", "/tmp/",
+                      "/var/", "/etc/", "./_", "actions-runner", "_work/",
+                      "node_modules/", "site-packages/", "dist-packages/")
     observations = []
     seen = set()
     for m in path_re.finditer(haystack):
         token = m.group(1).strip("'\":,()[]")
-        if not token or token in seen or token.startswith(("http", "${{", "/home/", "/usr/")):
+        low = token.lower()
+        if (not token or token in seen
+                or low.startswith(_skip_prefixes)
+                or "site-packages" in low or "actions-runner" in low
+                or "/_" in token
+                # require a real file-ish extension OR a short repo-relative
+                # depth; long absolute-looking chains are runner noise.
+                or token.count("/") > 4):
             continue
         seen.add(token)
         norm = _relstrip(token)
         if norm in allowed_files or Path(norm).exists():
             continue  # path is real — nothing to note
         near = _closest_allowed_file(norm, allowed_files)
+        # Only report when there IS a close real match — an unmatched token in
+        # a noisy log is far more likely to be noise than a genuine missing
+        # repo file, and reporting it just distracts the model.
         if near and near != norm:
             observations.append(
                 f"- Path '{token}' referenced in the error does NOT exist in the "
                 f"repository. The closest real path is '{near}'.")
-        else:
-            observations.append(
-                f"- Path '{token}' referenced in the error does NOT exist in the "
-                f"repository, and no close match was found.")
         if len(observations) >= 6:
             break
     if not observations:
@@ -1878,25 +1933,16 @@ MAX_WORKFLOW_VALUE_DIFFS = 3
 SENSITIVE_WORKFLOW_KEYS = {"permissions", "secrets", "env", "on", "runs-on", "uses", "if"}
 
 
-def normalize_workflow_python_versions(original_text: str, new_text: str) -> tuple:
-    old_matches = list(WORKFLOW_PYVERSION_LINE.finditer(original_text))
-    new_matches = list(WORKFLOW_PYVERSION_LINE.finditer(new_text))
-    if len(old_matches) != len(new_matches):
-        return new_text, False
-    changed = False
-    out = new_text
-    for om, nm in zip(reversed(old_matches), reversed(new_matches)):
-        o_major, o_minor = int(om.group(3)), int(om.group(4))
-        if o_major == 3 and o_minor in VALID_PYTHON_MINORS:
-            continue
-        n_prefix, n_q1, _n_major, _n_minor, n_q2, n_rest = nm.groups()
-        quote = n_q1 or n_q2 or '"'
-        new_line = f"{n_prefix}{quote}{DEFAULT_PYTHON_VERSION}{quote}{n_rest}"
-        if new_line != nm.group(0):
-            changed = True
-            print(f"[NORMALIZE] python-version forced to {DEFAULT_PYTHON_VERSION}")
-        out = out[:nm.start()] + new_line + out[nm.end():]
-    return out, changed
+def invalid_workflow_python_versions(text: str) -> list:
+    """VALIDATION ONLY: return the list of python-version values in a workflow
+    that are NOT real CPython releases. Python observes and reports; it never
+    rewrites the value — the model must author a valid version itself."""
+    bad = []
+    for m in WORKFLOW_PYVERSION_LINE.finditer(text):
+        major, minor = int(m.group(3)), int(m.group(4))
+        if not (major == 3 and minor in VALID_PYTHON_MINORS):
+            bad.append(f"{major}.{minor}")
+    return bad
 
 
 def validate_workflow_edit(original_text: str, new_text: str) -> tuple:
@@ -1969,11 +2015,18 @@ def validate_fix(fix: dict) -> tuple:
         except yaml.YAMLError as e:
             return False, f"YAML error: {e}"
         if WORKFLOW_PATTERN.search(file):
-            content, snapped = normalize_workflow_python_versions(original_text, content)
-            if snapped:
-                fix["fixed_content"] = content
-                fix["reason"] = (fix.get("reason", "") +
-                                 f"; python-version pinned to {DEFAULT_PYTHON_VERSION}").lstrip("; ")[:300]
+            # VALIDATION ONLY — Python does not author the version. If the
+            # model's patched workflow still carries a python-version that
+            # isn't a real CPython release, reject it so the MODEL picks a
+            # valid one on retry. (Previously this silently forced the value
+            # to DEFAULT_PYTHON_VERSION, which was Python authoring the fix.)
+            bad = invalid_workflow_python_versions(content)
+            if bad:
+                return False, (
+                    "workflow still sets python-version to "
+                    + ", ".join(f"'{v}'" for v in bad)
+                    + " — not a real released CPython version. Choose a real "
+                      "release (e.g. 3.10, 3.11, 3.12) in 'corrected'.")
             ok, reason = validate_workflow_edit(original_text, content)
             if not ok:
                 return False, reason
@@ -2367,6 +2420,7 @@ def main():
         print(f"[SECURITY] redacting {len(redacted)} potential secret pattern(s): "
               f"{', '.join(redacted)}")
     log_text = redact_secrets(log_text)
+    log_text = _strip_log_timestamps(log_text)  # clean AI-facing log lines
 
     exit_code = get_exit_code(log_text, args.exit_code)
     signal = extract_error_signal(log_text)
