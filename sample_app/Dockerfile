@@ -1,8 +1,8 @@
 FROM python:3.12
 WORKDIR /app
-COPY requirements.txt .
+COPY requiremesnts.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 EXPOSE 5000
-CMD ["python", "apsspp.py"]
+CMD ["python", "app.py"]
  
