@@ -16,37 +16,32 @@ import sys
 import time
 from pathlib import Path
 
-import anthropic          # Claude API client (pip install anthropic)
-import requests           # still used for the GitHub REST API
+import requests
 import yaml
 
-# ── Claude API (Anthropic) ────────────────────────────────────────────────────
-# NOTE: this uses the Anthropic *API*, billed via prepaid credits on
-# console.anthropic.com. It is a SEPARATE product from a Claude Pro/Max chat
-# subscription — a Pro plan does NOT include API access and does not discount it.
-# Create a key at console.anthropic.com and export it as ANTHROPIC_API_KEY
-# (e.g. as a GitHub Actions repo secret).
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
-AI_TIMEOUT      = int(os.environ.get("AI_TIMEOUT", "120"))   # Haiku has no cold start
-MAX_RETRIES     = int(os.environ.get("AI_MAX_RETRIES", "3"))
-RETRY_BACKOFF   = [2, 5, 10]                                 # seconds, for transient/429
-AI_TEMPERATURE  = float(os.environ.get("AI_TEMPERATURE", "0.05"))
+# ── Ollama ────────────────────────────────────────────────────────────────────
+OLLAMA_API_URL = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/api/generate")
+OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL",   "gemma3:4b")
+AI_TIMEOUT     = int(os.environ.get("AI_TIMEOUT", "210"))
+MAX_RETRIES    = int(os.environ.get("AI_MAX_RETRIES", "2"))
+RETRY_BACKOFF  = [20, 20]
+OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "16384"))   # larger context window
+OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "10m")
 
-# Patch generation is a cheaper task than investigation (small JSON output).
-# It keeps its own evidence budget and its own token cap.
-PATCH_TIMEOUT            = int(os.environ.get("PATCH_TIMEOUT", str(AI_TIMEOUT)))
+# Patch generation is a cheaper task than investigation (small JSON output) but
+# was drowning in prefill: all evidence files were concatenated up to 16k chars.
+# It now gets its own (smaller) evidence budget and its own timeout.
+PATCH_TIMEOUT            = int(os.environ.get("PATCH_TIMEOUT", str(AI_TIMEOUT + 90)))
 MAX_PATCH_EVIDENCE_CHARS = int(os.environ.get("MAX_PATCH_EVIDENCE_CHARS", "6000"))
 PATCH_NUM_PREDICT        = int(os.environ.get("PATCH_NUM_PREDICT", "1200"))
 
 INVESTIGATION_TIMEOUT = int(os.environ.get("INVESTIGATION_TIMEOUT", str(AI_TIMEOUT)))
 INVESTIGATION_RETRIES = int(os.environ.get("INVESTIGATION_RETRIES", "1"))
-# No cold-start penalty with a hosted model, so the first-turn buffer is 0 by
-# default (kept as a knob only for parity with the old timeout-recovery path).
-INVESTIGATION_FIRST_TURN_EXTRA = int(os.environ.get("INVESTIGATION_FIRST_TURN_EXTRA", "0"))
+INVESTIGATION_FIRST_TURN_EXTRA = int(os.environ.get("INVESTIGATION_FIRST_TURN_EXTRA", "60"))
 
-# Lowered from 900 → 300: Claude API turns return in seconds, not the ~300s an
-# 8GB local runner needed per turn, so the whole budget can shrink.
-TOTAL_TIME_BUDGET = int(os.environ.get("TOTAL_TIME_BUDGET", "300"))
+# Raised from 600 → 900: a single investigation turn on the 8GB runner has been
+# observed taking ~300s, so 600s left no room for a patch round + tests.
+TOTAL_TIME_BUDGET = int(os.environ.get("TOTAL_TIME_BUDGET", "900"))
 _run_start_time = None
 
 
@@ -113,8 +108,7 @@ ALWAYS_HIDDEN   = {".git", "auto-fixer.py"}
 # the model. Pure observation/filtering; no diagnosis.
 SELF_WORKFLOW_MARKERS = [
     re.compile(r'auto-?fixer\.py'),
-    re.compile(r'ANTHROPIC_(?:API_KEY|MODEL)\b'),   # the auto-fixer's own config
-    re.compile(r'OLLAMA_(?:API_URL|MODEL)\b'),      # legacy, for old workflow files
+    re.compile(r'OLLAMA_(?:API_URL|MODEL)\b'),
     re.compile(r'auto-?fixer-on-failure', re.I),
 ]
 _SELF_WORKFLOW_CACHE = {}
@@ -191,35 +185,6 @@ DOCKERFILE_REF_PATTERNS = [
 DOCKERFILE_FROM_PYTHON = re.compile(r'^(\s*FROM\s+)python:([^\s]+)(.*)$', re.I | re.M)
 VALID_PYTHON_MINORS = set(range(8, 14))
 DEFAULT_PYTHON_VERSION = os.environ.get("DEFAULT_PYTHON_VERSION", "3.12")
-
-# ── Container RUNTIME (CMD/ENTRYPOINT) failure detection ─────────────────────
-# These fire when an image BUILDS successfully but the container dies at start
-# because its start command targets something that isn't in the image — a
-# different failure class from a build error, and one where the fix lives in
-# the Dockerfile CMD/ENTRYPOINT, not in the app source. We detect the class and
-# extract the missing runtime target so the deterministic layer can ship the
-# exact CMD context to the model instead of hoping it hunts for it.
-CONTAINER_LOG_BLOCK = re.compile(
-    r'-{3,}\s*container logs\s*-{3,}(.*?)(?:-{3,}|\Z)', re.I | re.S)
-CONTAINER_RUNTIME_MISSING_TARGET = [
-    # python: can't open file '/app/apsspp.py': [Errno 2] No such file or directory
-    re.compile(r"can'?t open file ['\"]([^'\"]+)['\"]", re.I),
-    # exec: "app.py": executable file not found  /  OCI runtime exec failed
-    re.compile(r'exec:\s*["\']([^"\']+)["\'].*?(?:not found|no such file|stat)', re.I),
-    # /app/start.sh: no such file or directory   (shell form)
-    re.compile(r'([/\w.\-]+):\s*no such file or directory', re.I),
-    # standard_init_linux ... exec /app/x: no such file or directory
-    re.compile(r'exec\s+([/\w.\-]+):\s*no such file or directory', re.I),
-]
-CONTAINER_RUNTIME_SMOKE_HINT = re.compile(
-    r'(runtime/CMD error|container exited early|image does not run|'
-    r'smoke test failed)', re.I)
-
-DOCKERFILE_STARTCMD_PATTERNS = [
-    (re.compile(r'^\s*CMD\b.*$', re.I | re.M), "CMD"),
-    (re.compile(r'^\s*ENTRYPOINT\b.*$', re.I | re.M), "ENTRYPOINT"),
-]
-DOCKERFILE_WORKDIR = re.compile(r'^\s*WORKDIR\s+(\S+)', re.I | re.M)
 
 WORKFLOW_PYVERSION_LINE = re.compile(
     r'^(\s*python-version\s*:\s*)([\'"]?)(\d+)\.(\d+)([\'"]?)(.*)$', re.M)
@@ -748,16 +713,6 @@ def extract_error_tokens(focused: dict, signal: str) -> list:
             base = tok.rsplit("/", 1)[-1]
             if len(base) >= 4:
                 tokens.add(base)
-    # bare filename-with-extension tokens (e.g. 'requiremesnts.txt') that carry
-    # no path separator and aren't quoted would otherwise slip through — these
-    # are exactly the typo'd-filename bugs, so capture them explicitly.
-    for m in re.finditer(
-            r'(?<![\w./\-])([\w\-]+\.(?:txt|py|ya?ml|json|toml|cfg|ini|lock|'
-            r'js|jsx|ts|tsx|go|java|rb|sh|md|dockerfile))(?![\w./\-])',
-            haystack, re.I):
-        tok = m.group(1)
-        if len(tok) >= 4:
-            tokens.add(tok)
     # drop trivially-common tokens that would match everything
     return [t for t in tokens if len(t) >= 3 and t.lower() not in
             ("run", "yml", "yaml", "true", "false", "with", "name", "uses")]
@@ -828,220 +783,127 @@ def excerpt_evidence(evidence: dict, tokens: list, tag: str) -> dict:
     return out
 
 
-# ── AI plumbing (Claude API) ─────────────────────────────────────────────────
-# Structured output is obtained via *forced tool use*: the JSON schema is handed
-# to the model as a tool's input_schema and tool_choice forces that tool, so the
-# model's only legal move is to emit an argument object matching the schema.
-# This preserves the exact contract the old Ollama `format=schema` gave us —
-# including honoring the `required` list (e.g. investigation must return
-# `confidence`). Optional fields (the two-mode investigate schema) are handled
-# natively, which is why forced tool use is used rather than strict JSON-schema
-# output_config. The `_finalize_investigation` omitted-confidence guard remains
-# as a defensive backstop for the rare (<0.2%) non-compliant response.
-STRUCT_TOOL_NAME = "emit_result"
-
-_client = None
+# ── AI plumbing ──────────────────────────────────────────────────────────────
+def _detect_endpoint():
+    url = OLLAMA_API_URL.rstrip("/")
+    if "/api/generate" in url:
+        return url, "native"
+    if "/v1/completions" in url or "/v1/chat" in url:
+        return url, "openai"
+    base = re.sub(r"/(v1|api)/.*$", "", url)
+    return f"{base}/api/generate", "native"
 
 
-def _get_client():
-    global _client
-    if _client is None:
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if not api_key:
-            raise RuntimeError(
-                "ANTHROPIC_API_KEY is not set. This uses the Anthropic API "
-                "(console.anthropic.com), which is billed separately from any "
-                "Claude Pro/Max chat subscription. Create a key and export it "
-                "as ANTHROPIC_API_KEY (e.g. a GitHub Actions secret).")
-        _client = anthropic.Anthropic(api_key=api_key, max_retries=0)
-    return _client
-
-
-def _retryable(exc) -> bool:
-    if isinstance(exc, (anthropic.APITimeoutError, anthropic.APIConnectionError,
-                        anthropic.RateLimitError)):
-        return True
-    if isinstance(exc, anthropic.APIStatusError):
-        return exc.status_code in (408, 409, 500, 502, 503, 504, 529)
-    return False
-
-
-class PreflightError(RuntimeError):
-    """Raised when the Claude API can't be reached/used. Carries a category so
-    main() can decide whether to escalate (config problem) or just fail the run
-    (infra problem)."""
-    def __init__(self, category, message):
-        super().__init__(message)
-        self.category = category   # "config" | "auth" | "connectivity" | "model"
-
-
-def preflight_claude(timeout=15) -> dict:
-    """
-    Verify the Claude API is usable BEFORE any real work, using the models
-    endpoint (metadata only — costs no tokens). It confirms three things in one
-    call:
-      1. the API key is present and valid (catches missing/typo'd secrets),
-      2. the runner actually has HTTPS egress to api.anthropic.com
-         (catches firewall/MTU-blackhole problems), and
-      3. the configured ANTHROPIC_MODEL string exists and is available to the
-         account (catches a bad/deprecated model id).
-
-    Returns the model metadata dict on success; raises PreflightError otherwise.
-    NOTE: this does NOT verify credit balance — models.retrieve is free, so a
-    zero-credit account still passes here and fails on the first real message
-    with a clear billing error instead.
-    """
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        raise PreflightError(
-            "config",
-            "ANTHROPIC_API_KEY is not set. The Claude API is billed via "
-            "console.anthropic.com credits, separate from any Claude Pro/Max "
-            "subscription. Add the key as a GitHub Actions repo secret.")
-
-    print(f"[PREFLIGHT] checking Claude API reachability + model "
-          f"'{ANTHROPIC_MODEL}' (metadata call, no token cost) ...")
-    t0 = time.time()
+def _extract_token(line: bytes, fmt: str) -> str:
+    if not line:
+        return ""
     try:
-        client = _get_client()
-        model = client.models.retrieve(ANTHROPIC_MODEL, timeout=float(timeout))
-    except anthropic.AuthenticationError as exc:
-        raise PreflightError(
-            "auth",
-            f"Claude API rejected the key (401). Check ANTHROPIC_API_KEY is a "
-            f"current Console key that hasn't been revoked. ({exc})") from exc
-    except anthropic.NotFoundError as exc:
-        raise PreflightError(
-            "model",
-            f"Model '{ANTHROPIC_MODEL}' was not found / is not available to this "
-            f"account (404). Fix ANTHROPIC_MODEL — e.g. "
-            f"'claude-haiku-4-5-20251001' (note Haiku needs the full dated "
-            f"string), 'claude-sonnet-5', or 'claude-opus-4-8'. ({exc})") from exc
-    except anthropic.PermissionDeniedError as exc:
-        raise PreflightError(
-            "auth",
-            f"The key is valid but not permitted to use this model/endpoint "
-            f"(403). Check the key's workspace and model access in Console. "
-            f"({exc})") from exc
-    except (anthropic.APIConnectionError, anthropic.APITimeoutError) as exc:
-        raise PreflightError(
-            "connectivity",
-            f"Could not reach api.anthropic.com from this runner "
-            f"({type(exc).__name__}). The runner needs outbound HTTPS (443) to "
-            f"api.anthropic.com. If small requests work but this hangs, suspect "
-            f"the MTU/PMTUD blackhole — clamp MSS to PMTU (iptables) or lower "
-            f"the interface MTU. Quick check from the runner:\n"
-            f"  curl -sS https://api.anthropic.com/v1/models "
-            f"-H \"x-api-key: $ANTHROPIC_API_KEY\" "
-            f"-H \"anthropic-version: 2023-06-01\"\n({exc})") from exc
-    except anthropic.APIStatusError as exc:
-        raise PreflightError(
-            "connectivity",
-            f"Claude API returned an unexpected status during preflight "
-            f"({exc.status_code}). ({exc})") from exc
-
-    ctx = getattr(model, "max_input_tokens", None)
-    out = getattr(model, "max_tokens", None)
-    display = getattr(model, "display_name", ANTHROPIC_MODEL)
-    print(f"[PREFLIGHT] ✓ reachable in {time.time()-t0:.1f}s — using '{display}' "
-          f"(id={ANTHROPIC_MODEL}"
-          + (f", ctx={ctx}" if ctx else "")
-          + (f", max_out={out}" if out else "") + ").")
-    return {"id": ANTHROPIC_MODEL, "display_name": display,
-            "max_input_tokens": ctx, "max_tokens": out}
+        text = line.decode("utf-8", errors="replace").strip()
+        if text.startswith("data: "):
+            text = text[6:].strip()
+        if text in ("", "[DONE]"):
+            return ""
+        obj = json.loads(text)
+        return obj.get("choices", [{}])[0].get("text", "") if fmt == "openai" \
+            else obj.get("response", "")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return ""
 
 
-def _call_claude(prompt, schema=None, num_predict=2000, temperature=AI_TEMPERATURE,
-                 tag="AI", retries=MAX_RETRIES, timeout=AI_TIMEOUT) -> str:
-    """
-    Call Claude and return a raw JSON *string* (so the existing `_json_from`
-    parser and its truncation-repair path keep working unchanged).
-
-    When `schema` is provided, the model is forced to answer through a synthetic
-    tool whose input_schema IS that schema; the tool's `input` (already a dict)
-    is re-serialized to a string for the caller. Without a schema, the model's
-    text output is returned verbatim.
-    """
-    client = _get_client()
-    kwargs = {
-        "model": ANTHROPIC_MODEL,
-        "max_tokens": num_predict,
-        "temperature": temperature,
-        "messages": [{"role": "user", "content": prompt}],
-        "timeout": float(timeout),
-    }
-    forced_tool = schema is not None
-    if forced_tool:
-        kwargs["tools"] = [{
-            "name": STRUCT_TOOL_NAME,
-            "description": ("Return the investigation/patch/review result as a "
-                            "single object strictly matching the input schema. "
-                            "Every field marked required MUST be present."),
-            "input_schema": schema,
-        }]
-        kwargs["tool_choice"] = {"type": "tool", "name": STRUCT_TOOL_NAME,
-                                 "disable_parallel_tool_use": True}
-
-    print(f"[{tag}] Claude API | prompt {len(prompt)} chars | model {ANTHROPIC_MODEL}"
-          f"{' | forced-tool' if forced_tool else ''}")
+def _stream_ollama(prompt, schema=None, num_predict=2000, temperature=0.05,
+                   num_ctx=OLLAMA_NUM_CTX, tag="AI", retries=MAX_RETRIES,
+                   timeout=AI_TIMEOUT) -> str:
+    endpoint, fmt = _detect_endpoint()
+    if fmt == "openai":
+        payload = {"model": OLLAMA_MODEL, "prompt": prompt, "temperature": temperature,
+                   "max_tokens": num_predict, "stream": True}
+    else:
+        payload = {"model": OLLAMA_MODEL, "prompt": prompt,
+                   "options": {"temperature": temperature, "num_predict": num_predict,
+                               "num_ctx": num_ctx},
+                   "keep_alive": OLLAMA_KEEP_ALIVE, "stream": True}
+        if schema:
+            payload["format"] = schema
+    print(f"[{tag}] {endpoint} ({fmt}) | prompt {len(prompt)} chars | model {OLLAMA_MODEL}")
 
     last = None
     for attempt in range(retries):
         try:
-            t0 = time.time()
-            resp = client.messages.create(**kwargs)
-            elapsed = time.time() - t0
-
-            if forced_tool:
-                tool_inputs = [b.input for b in resp.content
-                               if getattr(b, "type", None) == "tool_use"
-                               and getattr(b, "name", None) == STRUCT_TOOL_NAME]
-                if not tool_inputs:
-                    # Extremely unusual on a forced-tool call; fall back to any text.
-                    text = "".join(getattr(b, "text", "") for b in resp.content
-                                   if getattr(b, "type", None) == "text").strip()
-                    raw = text
-                else:
-                    raw = json.dumps(tool_inputs[0])
-            else:
-                raw = "".join(getattr(b, "text", "") for b in resp.content
-                              if getattr(b, "type", None) == "text").strip()
-
-            trunc = getattr(resp, "stop_reason", None) == "max_tokens"
-            usage = getattr(resp, "usage", None)
-            tok_note = (f" | in={usage.input_tokens} out={usage.output_tokens}"
-                        if usage else "")
-            print(f"[{tag}] done in {elapsed:.1f}s — {len(raw)} chars"
-                  f"{tok_note}{' (max_tokens-truncated)' if trunc else ''}")
-
+            t0, collected = time.time(), []
+            deadline = t0 + timeout
+            resp = requests.post(endpoint, json=payload, timeout=(10, timeout), stream=True)
+            resp.raise_for_status()
+            hit_deadline = False
+            for line in resp.iter_lines():
+                # Per-read timeout resets on every token, so a steady stream can
+                # run far past `timeout` (observed: 355s on a 300s cap). Enforce
+                # a hard wall-clock deadline; partial output is still salvageable
+                # by the truncated-JSON repair in _json_from.
+                if time.time() > deadline:
+                    hit_deadline = True
+                    print(f"[{tag}] hard wall-clock deadline {timeout}s hit "
+                          f"mid-stream — stopping with partial output.")
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                    break
+                tok = _extract_token(line, fmt)
+                if tok:
+                    collected.append(tok)
+            raw = "".join(collected).strip()
+            print(f"[{tag}] done in {time.time()-t0:.1f}s — {len(raw)} chars"
+                  + (" (deadline-truncated)" if hit_deadline else ""))
+            if not raw and not hit_deadline:
+                try:
+                    body = resp.json()
+                    raw = (body.get("choices", [{}])[0].get("text", "")
+                           if fmt == "openai" else body.get("response", "")).strip()
+                except Exception:
+                    pass
             if not raw:
-                raise RuntimeError("Claude returned an empty response.")
+                raise requests.exceptions.Timeout(
+                    f"deadline hit with no usable output after {timeout}s")
             return raw
-
-        except Exception as exc:
+        except requests.exceptions.Timeout as exc:
             last = exc
-            # Preserve the word 'timeout' in the surfaced message so the
-            # investigation loop's timeout-recovery branch still triggers.
-            if isinstance(exc, anthropic.APITimeoutError):
-                print(f"[{tag}] request timed out after {timeout}s.", file=sys.stderr)
-            if _retryable(exc) and attempt < retries - 1:
-                wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
-                reason = type(exc).__name__
-                print(f"[{tag}] {reason}; retrying in {wait}s "
-                      f"(attempt {attempt + 1}/{retries})...")
+            if attempt < retries - 1:
+                wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF)-1)]
+                print(f"[{tag}] timeout after {timeout}s; retrying in {wait}s "
+                      f"(attempt {attempt+1}/{retries})...")
                 time.sleep(wait)
-                continue
-            if isinstance(exc, anthropic.AuthenticationError):
-                raise RuntimeError(
-                    "Claude API auth failed (401). Check ANTHROPIC_API_KEY is a "
-                    "valid Console key with available credits.") from exc
-            if not _retryable(exc):
-                # Non-retryable (e.g. 400 bad request) — surface immediately.
-                is_to = isinstance(exc, anthropic.APITimeoutError)
-                raise RuntimeError(
-                    f"Claude API call failed{' (timeout)' if is_to else ''}: {exc}") from exc
+            else:
+                print(f"[{tag}] timeout after {timeout}s (no retries left).")
+        except requests.exceptions.ConnectionError as exc:
+            raise RuntimeError(f"Cannot connect to Ollama at {endpoint}: {exc}")
+        except requests.exceptions.RequestException as exc:
+            raise RuntimeError(f"Ollama request failed: {exc}")
+    raise RuntimeError(f"Ollama did not respond after {retries} attempts: {last}")
 
-    raise RuntimeError(f"Claude API did not succeed after {retries} attempts "
-                       f"(timeout/transient): {last}")
+
+def warm_up_model() -> bool:
+    endpoint, fmt = _detect_endpoint()
+    warm_timeout = int(os.environ.get("OLLAMA_WARMUP_TIMEOUT", "240"))
+    print(f"[WARMUP] pinging {OLLAMA_MODEL} to load it into memory "
+          f"(timeout {warm_timeout}s) ...")
+    t0 = time.time()
+    try:
+        if fmt == "openai":
+            payload = {"model": OLLAMA_MODEL, "prompt": "ok", "max_tokens": 1, "stream": False}
+        else:
+            payload = {"model": OLLAMA_MODEL, "prompt": "ok",
+                       "options": {"num_predict": 1, "num_ctx": OLLAMA_NUM_CTX},
+                       "keep_alive": OLLAMA_KEEP_ALIVE, "stream": False}
+        resp = requests.post(endpoint, json=payload, timeout=(10, warm_timeout))
+        resp.raise_for_status()
+        print(f"[WARMUP] model resident in {time.time()-t0:.1f}s — held for {OLLAMA_KEEP_ALIVE}.")
+        return True
+    except requests.exceptions.Timeout:
+        print(f"[WARMUP] warm-up timed out after {warm_timeout}s — continuing anyway.", file=sys.stderr)
+        return False
+    except Exception as exc:
+        print(f"[WARMUP] warm-up call failed ({exc}) — continuing anyway.", file=sys.stderr)
+        return False
 
 
 def _close_truncated_json(text: str):
@@ -1230,59 +1092,21 @@ Schema when you need another file:
 
 
 # ── Investigation loop ───────────────────────────────────────────────────────
-def _token_is_dangling(tok: str, allowed_files: set) -> bool:
-    """True if a FILE/PATH-like token does NOT resolve to anything real in the
-    repo. Version numbers, image tags (python:3.1), and other non-file tokens
-    return False — deciding those aren't our call. Pure existence check."""
-    if ":" in tok:                       # image tag / url-ish, not a repo file
-        return False
-    if re.fullmatch(r'\d+(\.\d+)+', tok):  # a version number, not a path
-        return False
-    has_slash = "/" in tok
-    has_known_ext = bool(re.search(
-        r'\.(?:txt|py|ya?ml|json|toml|cfg|ini|lock|js|jsx|ts|tsx|go|java|rb|'
-        r'sh|md)$', tok, re.I))
-    if not (has_slash or has_known_ext):   # not clearly a file reference
-        return False
-    norm = _relstrip(tok)
-    base = norm.rsplit("/", 1)[-1]
-    for f in allowed_files:
-        if f == norm or Path(f).name == base or f.endswith("/" + norm):
-            return False
-    return not Path(norm).exists()
-
-
 def locate_offending_lines(focused: dict, signal: str,
-                           evidence_files: dict, allowed_files: set = None) -> str:
+                           evidence_files: dict) -> str:
     """OBSERVATION ONLY (not diagnosis, not fix-authoring): the failure log
     often names a specific offending VALUE (a quoted version like '3.1', a
-    path, a filename). A slow/small model reliably knows WHAT is wrong but
-    often fails to copy the EXACT line into its find/replace pair.
-
-    Critically, when the error names BOTH a broken value and a correct one
-    (e.g. a Dockerfile with a typo'd 'requiremesnts.txt' on one line and the
-    correct 'requirements.txt' on the next), the model tends to grab the line
-    with the CORRECT value and 'fix' it to itself (evidence == corrected). So
-    this helper splits tokens into DANGLING (name something that doesn't exist
-    in the repo) vs. RESOLVED, and pins the dangling-token lines as the broken
-    ones — it never offers a line solely because it holds an already-valid
-    value. Python states which reference doesn't resolve and where it lives; it
-    never writes the replacement."""
+    port, a tag). A slow/small model reliably knows WHAT is wrong but often
+    fails to copy the EXACT line into its find/replace pair — it grabs the
+    lines above the bug, or produces evidence==corrected. This helper finds
+    the exact existing line(s) that contain the flagged value and hands them
+    back verbatim, so the model has the precise 'evidence' string to copy.
+    Python states the line that EXISTS; it never writes the replacement."""
     if not evidence_files:
         return ""
     tokens = extract_error_tokens(focused, signal)
     if not tokens:
         return ""
-    allowed_files = allowed_files or set()
-
-    dangling = {t for t in tokens if _token_is_dangling(t, allowed_files)}
-    # If we found dangling references, ONLY those are broken — a line that holds
-    # a resolved token is (by definition) not the missing-reference bug.
-    active_tokens = dangling if dangling else set(tokens)
-
-    def _is_comment_only(line: str) -> bool:
-        s = line.lstrip()
-        return s.startswith("#") or s.startswith("//")
 
     found = []
     seen_lines = set()
@@ -1291,14 +1115,13 @@ def locate_offending_lines(focused: dict, signal: str,
             continue
         for raw_line in content.splitlines():
             line = raw_line.strip()
-            # A comment can't be the cause of a CI failure — never offer one as
-            # a fix target (this is what produced no-op edits on YAML comments).
-            if not line or line in seen_lines or _is_comment_only(line):
+            if not line or line in seen_lines:
                 continue
-            for tok in active_tokens:
+            for tok in tokens:
+                # Match the token as a whole value, not a coincidental substring.
                 try:
                     if re.search(r'(?<![\w.])' + re.escape(tok) + r'(?![\w.])', line):
-                        found.append((fname, line, tok, tok in dangling))
+                        found.append((fname, line, tok))
                         seen_lines.add(line)
                         break
                 except re.error:
@@ -1309,27 +1132,16 @@ def locate_offending_lines(focused: dict, signal: str,
             break
     if not found:
         return ""
-    kind = "dangling reference(s)" if dangling else "flagged value(s)"
     print(f"[EVIDENCE] Offending-line locator pinned {len(found)} exact "
-          f"line(s) containing the {kind}"
-          + (f" (dangling: {sorted(dangling)[:5]})" if dangling else "") + ".")
-    line_items = []
-    for f, line, tok, is_dangling in found:
-        tag = ("references '{}', which does NOT exist in the repository — "
-               "this is the line to fix".format(tok) if is_dangling
-               else "contains the flagged value '{}'".format(tok))
-        line_items.append(f"- In '{f}', this EXACT line {tag}:\n    {line}")
-    header = (
-        "Exact offending line(s) located in the repository. The lines below are "
-        "copied VERBATIM from the real files. Use the relevant one as your "
-        "'evidence' string EXACTLY, and in 'corrected' change ONLY the broken "
-        "token on that line. Do NOT emit an issue whose 'corrected' equals its "
-        "'evidence'. Do NOT target lines that are already correct.")
-    if dangling:
-        header += (" NOTE: the error also mentions value(s) that DO resolve "
-                   "correctly — do not touch those; fix only the dangling "
-                   "reference line(s) above.")
-    return header + "\n" + "\n".join(line_items)
+          f"line(s) containing the value(s) the error flags.")
+    lines = "\n".join(
+        f"- In '{f}', this EXACT line contains the flagged value '{tok}':\n"
+        f"    {line}"
+        for f, line, tok in found)
+    return ("Exact offending line(s) located in the repository (the error names "
+            "these value(s); the lines below are copied VERBATIM from the real "
+            "files — use the relevant one as your 'evidence' string EXACTLY, and "
+            "change ONLY the flagged value in 'corrected'):\n" + lines)
 
 
 def enrich_issue_with_path_checks(focused: dict, signal: str,
@@ -1443,94 +1255,6 @@ def collect_python_version_declarations(allowed_files: set) -> dict:
             if m:
                 decls[f"{f} (requires-python)"] = f"{m.group(1)}.{m.group(2)}"
     return decls
-
-
-def detect_container_runtime_error(log_text: str, focused: dict):
-    """Return (is_cmd_error, missing_target) if the log shows a container that
-    BUILT but failed to START because its CMD/ENTRYPOINT target is missing.
-    Pure classification — no fix implied."""
-    block_m = CONTAINER_LOG_BLOCK.search(log_text)
-    scope = block_m.group(1) if block_m else log_text
-    # Only treat as a runtime CMD error if there's a runtime/smoke signal AND a
-    # concrete missing target; a build-stage 'no such file' is a different class.
-    smoke = bool(CONTAINER_RUNTIME_SMOKE_HINT.search(log_text))
-    for pat in CONTAINER_RUNTIME_MISSING_TARGET:
-        m = pat.search(scope) or pat.search(log_text)
-        if m:
-            target = m.group(1).strip()
-            # ignore obvious library/interpreter paths
-            if target and not target.startswith(("/usr/", "/lib", "/bin/", "/proc")):
-                return (smoke or "container logs" in log_text.lower()), target
-    return False, ""
-
-
-def enrich_container_runtime_error(log_text: str, focused: dict,
-                                   allowed_files: set) -> tuple:
-    """OBSERVATION ONLY (not diagnosis, not fix-authoring): when the container
-    builds but its start command fails, the missing thing is a CONTAINER path
-    (e.g. '/app/apsspp.py') that won't be found by repo-path checks. This
-    helper (a) states that the failure is a start-command (CMD/ENTRYPOINT)
-    error, (b) locates the Dockerfile CMD/ENTRYPOINT line that produces that
-    path, copied verbatim, and (c) reports the closest file that actually
-    EXISTS in the repo. Python states what exists and where the reference
-    lives (the same job as the grep/offending-line locators); it never says
-    which is 'the bug' or writes the corrected line.
-
-    Returns (text, is_cmd_error) so the caller can log + escalate clearly."""
-    is_cmd_error, target = detect_container_runtime_error(log_text, focused)
-    if not is_cmd_error or not target:
-        return "", False
-
-    target_base = Path(target).name  # '/app/apsspp.py' -> 'apsspp.py'
-    print(f"[EVIDENCE] ⚠ Container CMD/ENTRYPOINT runtime error detected: the "
-          f"image starts but its start command targets '{target}', which is "
-          f"missing from the image.")
-
-    dockerfiles = [f for f in allowed_files if "dockerfile" in Path(f).name.lower()]
-    cmd_lines = []
-    for df in dockerfiles:
-        content = _read_evidence_file(df)
-        if not content:
-            continue
-        workdir_m = DOCKERFILE_WORKDIR.search(content)
-        workdir = workdir_m.group(1) if workdir_m else ""
-        for pat, label in DOCKERFILE_STARTCMD_PATTERNS:
-            for lm in pat.finditer(content):
-                line = lm.group(0).strip()
-                # only report the start line if it plausibly produces the target
-                if target_base in line or Path(target).name in line or (
-                        workdir and workdir.strip("/") in target.strip("/")):
-                    cmd_lines.append((df, label, line, workdir))
-
-    # closest EXISTING repo file to the missing basename
-    near = _closest_allowed_file(target_base, allowed_files)
-
-    parts = [
-        "CONTAINER START-COMMAND (CMD/ENTRYPOINT) RUNTIME ERROR — the image "
-        "built successfully but the container exits immediately because its "
-        "start command points at something that is not in the image. This is a "
-        "Dockerfile CMD/ENTRYPOINT problem, NOT an application-code problem.",
-        f"- At startup the container tried to run '{target}', but that path "
-        f"does not exist inside the image.",
-    ]
-    if cmd_lines:
-        for df, label, line, workdir in cmd_lines[:3]:
-            wd = f" (combined with WORKDIR {workdir})" if workdir else ""
-            parts.append(f"- In '{df}', this EXACT {label} line produces that "
-                         f"path{wd} — copy it VERBATIM as your 'evidence' string:\n"
-                         f"    {line}")
-    else:
-        parts.append("- The Dockerfile CMD/ENTRYPOINT line that starts the "
-                     "container is where this path originates.")
-    if near and Path(near).name != target_base:
-        parts.append(f"- The file '{target_base}' does NOT exist in the "
-                     f"repository. The closest existing file is '{near}'.")
-    else:
-        parts.append(f"- The file '{target_base}' does NOT exist in the "
-                     f"repository and no close match was found — the start "
-                     f"command may name the wrong file, or the file was never "
-                     f"added.")
-    return "\n".join(parts), True
 
 
 def check_python_version_coherence(allowed_files: set) -> str:
@@ -1817,50 +1541,6 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
     timed_out_cold = False
     parse_failures = 0
     turn_num_predict = 800
-    # Best COMPLETE self-assessment the model gave on any turn. A later turn
-    # that truncates before emitting status/confidence must never downgrade a
-    # good earlier read — the model's own most-recent complete confidence wins.
-    best_assessment = None  # (confidence, data)
-
-    def _remember(data: dict):
-        nonlocal best_assessment
-        raw_conf = data.get("confidence")
-        if raw_conf is None:
-            return
-        try:
-            conf = float(raw_conf)
-        except (TypeError, ValueError):
-            return
-        has_cause = bool((data.get("root_cause") or "").strip()
-                         or (data.get("findings")))
-        if not has_cause:
-            return
-        if best_assessment is None or conf >= best_assessment[0]:
-            best_assessment = (conf, dict(data))
-
-    def _finalize_with_fallback(data, forced):
-        """Finalize on `data`, but if `data` lost its confidence to truncation
-        while an earlier complete turn had a real one + a concrete cause, use
-        that earlier assessment instead of defaulting to 0.4 and escalating a
-        diagnosis the model actually reached."""
-        this_conf = data.get("confidence")
-        this_cause = (data.get("root_cause") or "").strip() or bool(data.get("findings"))
-        if (this_conf is None or not this_cause) and best_assessment is not None:
-            print(f"[INVESTIGATE] final turn was incomplete "
-                  f"(confidence={this_conf}, cause={'yes' if this_cause else 'no'}); "
-                  f"falling back to the model's last COMPLETE assessment "
-                  f"(confidence={best_assessment[0]}).")
-            merged = dict(best_assessment[1])
-            # keep any richer root_cause/findings the truncated turn did emit
-            for k in ("root_cause", "solution", "findings", "commit_message"):
-                if data.get(k) and not merged.get(k):
-                    merged[k] = data[k]
-            # best_assessment came from a COMPLETE, untruncated turn — the
-            # confidence in it is the model's own, so it must NOT be capped by
-            # the 'forced' rule (that rule is for punishing a forced conclusion
-            # the model never actually reached). Finalize forced=False.
-            return _finalize_investigation(merged, False, evidence)
-        return _finalize_investigation(data, forced, evidence)
 
     for turn in range(1, MAX_INVESTIGATION_TURNS + 1):
         if _budget_exceeded():
@@ -1875,7 +1555,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                                              error_tokens=error_tokens)
         pending_notes = []
         try:
-            raw = _call_claude(prompt, INVESTIGATE_SCHEMA, num_predict=turn_num_predict,
+            raw = _stream_ollama(prompt, INVESTIGATE_SCHEMA, num_predict=turn_num_predict,
                                  temperature=0.05, tag=f"INVESTIGATE-T{turn}",
                                  timeout=turn_timeout, retries=INVESTIGATION_RETRIES)
         except Exception as exc:
@@ -1891,7 +1571,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                     last_turn, None, issue_block=issue_block,
                     error_tokens=error_tokens)
                 try:
-                    raw = _call_claude(lean_prompt, INVESTIGATE_SCHEMA, num_predict=800,
+                    raw = _stream_ollama(lean_prompt, INVESTIGATE_SCHEMA, num_predict=800,
                                          temperature=0.05, tag="INVESTIGATE-T1-LEAN",
                                          timeout=INVESTIGATION_TIMEOUT + INVESTIGATION_FIRST_TURN_EXTRA,
                                          retries=INVESTIGATION_RETRIES)
@@ -1930,10 +1610,9 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
             stall_count += 2
 
         log.append({"turn": turn, "status": status, "analysis": analysis[:200]})
-        _remember(data)
 
         if status == "root_cause_confirmed":
-            result = _finalize_with_fallback(data, False)
+            result = _finalize_investigation(data, False, evidence)
             break
 
         if status == "need_more_info":
@@ -1964,50 +1643,20 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
 
             stalled = (not to_read and requested and not last_turn)
             stall_count = stall_count + 1 if stalled else 0
-
-            has_concrete_cause = bool((data.get("root_cause") or "").strip()
-                                      or data.get("findings"))
-            try:
-                cur_conf = float(data.get("confidence") or 0.0)
-            except (TypeError, ValueError):
-                cur_conf = 0.0
-
-            # BEST CASE: the model already gave a concrete cause at usable
-            # confidence on THIS complete (untruncated) turn. Don't spend
-            # another ~200s turn — that only risks a truncated final turn (which
-            # is exactly what kept discarding correct diagnoses). Accept the
-            # model's own complete-turn assessment as-is (forced=False, so its
-            # stated confidence stands and isn't capped to 0.4).
-            if not to_read and has_concrete_cause and cur_conf >= 0.5:
-                print(f"[INVESTIGATE] model already reached a concrete root "
-                      f"cause at confidence {cur_conf:.2f} on a complete turn — "
-                      f"accepting it directly (no extra turn, no truncation risk).")
-                result = _finalize_investigation(data, False, evidence)
-                break
-
-            # Convergence guard: on this slow runner every extra turn risks a
-            # truncated final turn. If the model has a concrete cause but LOW
-            # confidence (<0.5) and fetched nothing new, it is dithering — push
-            # it once for a firmer decision rather than looping.
-            dithering = (not to_read and has_concrete_cause)
-            force_now = last_turn or stall_count >= 2 or dithering
-            if dithering and not last_turn and stall_count < 2:
-                print("[INVESTIGATE] model has a concrete cause but low "
-                      "confidence and requested nothing new — forcing one "
-                      "confirmation turn.")
+            force_now = last_turn or stall_count >= 2
 
             if force_now:
                 if stall_count >= 2 and not last_turn:
                     print("[INVESTIGATE] no new evidence for 2 turns — forcing final decision.")
                 if _budget_exceeded():
-                    result = _finalize_with_fallback(data, True)
+                    result = _finalize_investigation(data, True, evidence)
                     break
                 final_prompt = _build_investigation_prompt(
                     signal, exit_code, repo_tree, git_diff, evidence, True,
                     pending_notes, issue_block=issue_block,
                     error_tokens=error_tokens)
                 try:
-                    raw2 = _call_claude(final_prompt, INVESTIGATE_SCHEMA,
+                    raw2 = _stream_ollama(final_prompt, INVESTIGATE_SCHEMA,
                                           num_predict=800, temperature=0.05,
                                           tag="INVESTIGATE-FINAL",
                                           timeout=INVESTIGATION_TIMEOUT,
@@ -2016,13 +1665,12 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                 except Exception as exc:
                     print(f"[INVESTIGATE] final turn failed: {exc}", file=sys.stderr)
                     data2 = data
-                _remember(data2)
-                result = _finalize_with_fallback(data2, True)
+                result = _finalize_investigation(data2, True, evidence)
                 break
             continue
 
         if data.get("root_cause"):
-            result = _finalize_with_fallback(data, True)
+            result = _finalize_investigation(data, True, evidence)
         break
 
     if result is None:
@@ -2190,7 +1838,7 @@ def ai_generate_patch(root_cause: str, solution: str, evidence: dict,
     retries = MAX_RETRIES if remaining > 2 * timeout else 1
     print(f"[PATCH] timeout {timeout}s, retries {retries} "
           f"(budget remaining {remaining:.0f}s)")
-    raw = _call_claude(prompt, PATCH_SCHEMA, num_predict=PATCH_NUM_PREDICT,
+    raw = _stream_ollama(prompt, PATCH_SCHEMA, num_predict=PATCH_NUM_PREDICT,
                          temperature=0.05, tag="PATCH",
                          timeout=timeout, retries=retries)
     data = _json_from(raw)
@@ -2296,7 +1944,7 @@ def ai_review_failure(prior_root_cause: str, prior_solution: str, new_signal: st
               f"## New failure after applying the fix:\n```\n{new_signal}\n```\n\n"
               f"Return the JSON.")
     try:
-        raw = _call_claude(prompt, REVIEW_SCHEMA, num_predict=500,
+        raw = _stream_ollama(prompt, REVIEW_SCHEMA, num_predict=500,
                              temperature=0.05, tag="REVIEW", retries=1)
     except Exception as exc:
         print(f"[REVIEW] failed: {exc}", file=sys.stderr)
@@ -2363,13 +2011,6 @@ def issues_to_fixes(issues: list, evidence: dict) -> tuple:
                 f"issue #{n} ({file or '?'}): you copied a "
                 f"'<<<SKIPPED ...>>>' marker — that marker is NOT file "
                 f"content. Copy only real lines from the file.")
-            continue
-        ev_first = ev.strip().splitlines()[0].lstrip() if ev.strip() else ""
-        if ev_first.startswith("#") or ev_first.startswith("//"):
-            rejects.append(
-                f"issue #{n} ({file or '?'}): 'evidence' is a COMMENT line "
-                f"(`{ev.strip()[:60]}`). A comment cannot cause a CI failure — "
-                f"target the actual broken command/value line instead.")
             continue
         if cor.strip() == ev.strip():
             rejects.append(
@@ -2481,31 +2122,6 @@ def _resolve_content(fix: dict) -> tuple:
     return None, "no 'edits' or 'fixed_content'"
 
 
-def _nearest_existing_hint(token: str, all_repo_set: set) -> str:
-    """For a missing reference, return a ' (closest existing: X)' hint pointing
-    at the real path — so retry feedback tells the model exactly what to use
-    instead of only that its guess is wrong. Prefers a match that shares the
-    basename (a typo) or the directory (a moved/renamed file). Observation only."""
-    base = token.rsplit("/", 1)[-1]
-    parent = token.rsplit("/", 1)[0] if "/" in token else ""
-    # 1) same directory, near basename (the typo case: sample_app/req... )
-    same_dir = [f for f in all_repo_set
-                if (f.rsplit("/", 1)[0] if "/" in f else "") == parent]
-    pool = same_dir or list(all_repo_set)
-    match = difflib.get_close_matches(token, pool, n=1, cutoff=0.6) \
-        or difflib.get_close_matches(base, [f.rsplit("/", 1)[-1] for f in pool],
-                                     n=1, cutoff=0.6)
-    if match:
-        cand = match[0]
-        # if we matched on basename, resolve back to a full path
-        if cand not in all_repo_set:
-            full = [f for f in pool if f.rsplit("/", 1)[-1] == cand]
-            cand = full[0] if full else cand
-        if cand != token:
-            return f" (closest existing: '{cand}')"
-    return ""
-
-
 def _missing_ref_map(content: str, file: str) -> dict:
     """Map of token -> problem message for repo-file references that don't
     exist. Pure observation; blocking decisions happen in _compare_ref_problems."""
@@ -2528,8 +2144,7 @@ def _missing_ref_map(content: str, file: str) -> dict:
         candidates = {token, _relstrip(str(parent_dir / token))}
         if any(c in all_repo_set or Path(c).is_file() for c in candidates):
             continue
-        problems[token] = (f"references missing '{token}'"
-                           + _nearest_existing_hint(token, all_repo_set))
+        problems[token] = f"references missing '{token}'"
     return problems
 
 
@@ -2576,8 +2191,7 @@ def _dockerfile_problem_map(file: str, content: str) -> dict:
             candidates = {ref_clean, _relstrip(str(docker_dir / ref_clean))}
             if any(Path(c).is_file() or c in all_repo_set for c in candidates):
                 continue
-            problems[ref_clean] = (f"{label} references missing '{ref}'"
-                                   + _nearest_existing_hint(ref_clean, all_repo_set))
+            problems[ref_clean] = f"{label} references missing '{ref}'"
     for m in DOCKERFILE_FROM_PYTHON.finditer(content):
         version = m.group(2)
         base = version.split("-", 1)[0]
@@ -3030,29 +2644,11 @@ def pending_bot_pr(token, repo) -> str:
     return ""
 
 
-# Set in main() when the failure is classified as a container start-command
-# (CMD/ENTRYPOINT) runtime error, so every escalation says so plainly.
-IS_CMD_RUNTIME_ERROR = False
-
-
 def open_issue(token, repo, reason, run_url=""):
-    cmd_note = ""
-    title = "🚨 Auto-fixer could not fix CI — manual review"
-    if IS_CMD_RUNTIME_ERROR:
-        title = ("🚨 Auto-fixer could not resolve a container CMD/runtime error "
-                 "— manual review")
-        cmd_note = ("\n\n**Failure class:** container start-command "
-                    "(CMD/ENTRYPOINT) runtime error — the image builds but the "
-                    "container exits at startup because its start command "
-                    "targets a file that isn't in the image. The AI did not "
-                    "produce a valid fix for this; a human should correct the "
-                    "Dockerfile CMD/ENTRYPOINT (or add the missing file).")
     r = requests.post(f"https://api.github.com/repos/{repo}/issues",
-                      json={"title": title,
-                            "body": f"**Reason:** {reason}{cmd_note}\n\n"
-                                    f"**Failed run:** {run_url}",
-                            "labels": ["bug", "needs-manual-fix"]
-                                      + (["cmd-runtime-error"] if IS_CMD_RUNTIME_ERROR else [])},
+                      json={"title": "🚨 Auto-fixer could not fix CI — manual review",
+                            "body": f"**Reason:** {reason}\n\n**Failed run:** {run_url}",
+                            "labels": ["bug", "needs-manual-fix"]},
                       headers=_gh(token), timeout=30)
     if r.status_code in (200, 201):
         print(f"[ISSUE] {r.json().get('html_url','')}")
@@ -3164,7 +2760,7 @@ def main():
 
     # Validation scoping: the error evidence itself (never model output)
     # decides which pre-existing problems a patch MUST fix.
-    global CURRENT_FAILURE_CONTEXT, IS_CMD_RUNTIME_ERROR
+    global CURRENT_FAILURE_CONTEXT
     CURRENT_FAILURE_CONTEXT = issue_block + "\n" + signal
 
     supporting_signal = trim_supporting_signal(signal, focused)
@@ -3184,18 +2780,6 @@ def main():
     if error_tokens:
         print(f"[EVIDENCE] Error tokens for context windowing: "
               f"{sorted(error_tokens)[:8]}")
-
-    # ── CONTAINER-RUNTIME (CMD/ENTRYPOINT) ENRICHMENT (observation only) ──
-    # Must run before generic path checks: the missing target is a CONTAINER
-    # path, so it needs Dockerfile-aware handling, and we want the class label
-    # ('CMD runtime error') available for clear logging + escalation.
-    is_cmd_runtime_error = False
-    container_runtime_facts, is_cmd_runtime_error = enrich_container_runtime_error(
-        log_text, focused, allowed_files)
-    if container_runtime_facts:
-        IS_CMD_RUNTIME_ERROR = is_cmd_runtime_error
-        issue_block = issue_block + "\n\n" + container_runtime_facts
-        CURRENT_FAILURE_CONTEXT = issue_block + "\n" + signal
 
     # ── PATH-EXISTENCE ENRICHMENT (observation, not diagnosis) ──
     path_facts = enrich_issue_with_path_checks(focused, signal, allowed_files)
@@ -3256,30 +2840,14 @@ def main():
         c = _read_evidence_file(f)
         if c is not None:
             preloaded_contents[f] = c
-    offending = locate_offending_lines(focused, signal, preloaded_contents,
-                                       allowed_files)
+    offending = locate_offending_lines(focused, signal, preloaded_contents)
     if offending:
         issue_block = issue_block + "\n\n" + offending
         CURRENT_FAILURE_CONTEXT = issue_block + "\n" + signal
 
     # ── AI INVESTIGATION AGENT ──
     print("\n━━━ AI INVESTIGATION AGENT ━━━")
-    # No warm-up (hosted model, no cold start). Instead, run a cheap preflight
-    # that verifies key + egress + model in one metadata call, so a
-    # misconfiguration fails here with one clear line rather than mid-run.
-    try:
-        preflight_claude()
-    except PreflightError as exc:
-        print(f"[PREFLIGHT] ✗ {exc}", file=sys.stderr)
-        # Escalate config/auth/model problems (a human must fix the secret or
-        # the model string). For a pure connectivity failure, don't bother —
-        # the same blackhole may block the GitHub API too, and it's a runner
-        # infra issue the operator will see from the failed Actions run.
-        if exc.category in ("config", "auth", "model") and token and repo:
-            open_issue(token, repo,
-                       f"Auto-fixer is misconfigured and could not start "
-                       f"({exc.category}).\n\n{exc}", run_url)
-        sys.exit(1)
+    warm_up_model()
 
     investigation = ai_investigate(supporting_signal, exit_code, repo_tree, git_diff,
                                    allowed_files, issue_block=issue_block,
@@ -3312,8 +2880,8 @@ def main():
         print(f"[GATE] Investigation produced no usable model output ({failure_mode}) — escalating.")
         if token and repo:
             mode_detail = {
-                "infra_timeout":      "The investigation call(s) to the Claude API "
-                                      "timed out before returning any output.",
+                "infra_timeout":      "The investigation call(s) to Ollama timed out "
+                                      "before the model produced any output.",
                 "no_model_response":  "The model returned nothing usable.",
                 "unparseable_output": "The model responded, but its output was not "
                                       "valid JSON even after truncation repair — "
