@@ -1,3 +1,1 @@
-anthropic>=0.60.0
-requests
-PyYAML
+Flask==2.3.3
