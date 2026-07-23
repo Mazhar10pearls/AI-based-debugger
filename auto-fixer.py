@@ -86,7 +86,7 @@ def _budget_exceeded() -> bool:
 # Turns are ~3s now instead of ~100s, so let the agent actually investigate.
 # The agent drives its own loop via native tool calls and stops when it calls
 # submit_diagnosis. These are cost backstops, not a reasoning schedule.
-MAX_AGENT_TURNS   = int(os.environ.get("MAX_AGENT_TURNS", "12"))
+MAX_AGENT_TURNS   = int(os.environ.get("MAX_AGENT_TURNS", "25"))
 MAX_TOOL_CALLS    = int(os.environ.get("MAX_TOOL_CALLS", "30"))
 MAX_REPAIR_ROUNDS = int(os.environ.get("MAX_REPAIR_ROUNDS", "2"))
 MAX_LIST_ENTRIES  = int(os.environ.get("MAX_LIST_ENTRIES", "300"))
@@ -762,7 +762,10 @@ DIAGNOSIS_PROPERTIES = {
         "required": ["hypothesis", "disproved_by"],
         "properties": {"hypothesis": {"type": "string"},
                        "disproved_by": {"type": "string"}}},
-        "description": "Each rival plus the specific evidence that killed it."},
+        "description": "ONLY for candidate explanations that turned out not to be "
+                       "defects at all. If you found a REAL defect that simply is not "
+                       "the cause of the logged error, it is a finding with "
+                       "blocks=later_step — never a rejected hypothesis."},
     "root_cause": {"type": "string",
                    "description": "One sentence covering the underlying defect."},
     "solution": {"type": "string"},
@@ -777,7 +780,7 @@ DIAGNOSIS_PROPERTIES = {
     "commit_message": {"type": "string"},
     "findings": {"type": "array", "items": {
         "type": "object", "additionalProperties": False,
-        "required": ["file", "issue", "root_cause", "proof", "solution"],
+        "required": ["file", "issue", "root_cause", "proof", "blocks", "solution"],
         "properties": {
             "file": {"type": "string",
                      "description": "The file CONTAINING the bad text. Never the missing file."},
@@ -785,6 +788,11 @@ DIAGNOSIS_PROPERTIES = {
             "root_cause": {"type": "string"},
             "proof": {"type": "string",
                       "description": "The offending text, verbatim from a file you read."},
+            "blocks": {"type": "string", "enum": ["current_failure", "later_step"],
+                       "description": "current_failure = this defect caused the error in "
+                                      "the log. later_step = a real defect that a LATER "
+                                      "stage will hit once the current one is fixed. Both "
+                                      "belong here and both must be patched."},
             "solution": {"type": "string"}}},
         "description": "ONE ENTRY PER DEFECT. Several defects in one file means "
                        "several entries. The same defect in five files means five "
@@ -871,31 +879,52 @@ commands — reason from file contents alone.
 6. The file named in an error is where the failure SURFACED. The bug lives in
    whatever referenced or produced it. Never patch a file that does not exist.
 
-## FIND EVERY INSTANCE — NOT JUST THE FIRST
+## TWO DIFFERENT JOBS — DO NOT CONFUSE THEM
 
-A CI log reports the FIRST thing that broke, not everything that is broken. A
-build stops at the first fatal error, so a second defect three lines later is
-invisible until the first is fixed. Patching one and shipping it means the
-pipeline fails again on the next run, and the auto-fixer burns another cycle.
+Job A: explain the error in the log.
+Job B: list EVERY defect you found along the way.
 
-Before you call submit_diagnosis, sweep:
+These are separate, and the second is where this tool earns its keep. A build
+stops at the first fatal error, so a defect three lines later is invisible in the
+log until the first is fixed. If you patch only the logged cause, the pipeline
+fails again on the very next run and the auto-fixer burns another cycle.
 
-  * Take the broken value you found — a misspelled filename, a wrong path, a bad
-    version pin, a stale image tag — and search_repo for it. It may appear in a
-    Dockerfile, a compose file, a workflow, a shell script, a Makefile and a
-    README. Each occurrence in an executed file is a separate finding.
-  * Look at the whole file you are patching, not just the offending line. If a
-    Dockerfile's CMD references a nonexistent script, check its COPY lines and
-    its WORKDIR too — the same misunderstanding often produced several errors.
-  * Ask whether the defect is an instance of a class. One wrong relative path
-    often means several, written in the same sitting.
-  * If a sweep returns nothing further, say exactly that in completeness_check.
-    A clean sweep is a real result and worth recording.
+So: a defect that is NOT the cause of the logged error is STILL a finding. Mark
+it blocks="later_step". Mark the logged cause blocks="current_failure". Emit both.
 
-Emit ONE finding per defect. Several defects in one file means several entries
-with the same "file". The same defect across five files means five entries.
-Fixing only some of a set is worse than useless: the pipeline still fails and
-the failure now looks different.
+hypotheses_rejected is ONLY for candidate explanations that turned out not to be
+defects at all — a file you suspected but which is correct, a theory the evidence
+killed. The moment you can quote broken text from a real file, it is a finding,
+regardless of whether it explains today's error.
+
+Worked example of the mistake to avoid. A Dockerfile reads:
+
+    FROM python:0.12
+    RUN pip install -r requirments.txt          # the real file is requirements.txt
+
+The log says only that the base image could not be resolved, because the build
+never got as far as pip. Both lines are defects. The correct output is TWO
+findings — the image tag as current_failure, the misspelled requirements file as
+later_step. Writing "ruled out: the requirements typo, because the error is about
+the base image" is WRONG: that reasoning is sound as an explanation of the log and
+useless as engineering. The typo is real, you can quote it, and it will break the
+next build.
+
+## SWEEP BEFORE YOU SUBMIT
+
+  * Read every line of each file you are patching, not just the offending one.
+    One misunderstanding usually produced several errors in the same sitting.
+  * For each file path, image tag, version pin or command referenced in an
+    executed file (Dockerfile, workflow YAML, shell script, Makefile, compose
+    file), check it against the repository tree. Anything referenced but absent
+    is a defect — search_repo and list_directory are how you check.
+  * Take each broken value and search_repo for it. It may recur in a compose
+    file, a script, or a second Dockerfile. Every occurrence in an executed file
+    is its own finding.
+  * State plainly in completeness_check which sweeps you ran and what they
+    returned. A clean sweep is a real result worth recording.
+
+Do not stop investigating merely because you can explain the log.
 
 ## CONFIDENCE — CALIBRATION MATTERS MORE THAN OPTIMISM
 
@@ -924,10 +953,11 @@ def _finalize_investigation(data: dict, forced: bool) -> dict:
                 "issue":      (f.get("issue") or f.get("root_cause") or "").strip(),
                 "root_cause": (f.get("root_cause") or "").strip(),
                 "proof":      (f.get("proof") or "").strip(),
+                "blocks":     (f.get("blocks") or "current_failure").strip(),
                 "solution":   (f.get("solution") or "").strip(),
             })
     if not findings:
-        findings = [{"file": "", "proof": "",
+        findings = [{"file": "", "proof": "", "blocks": "current_failure",
                      "issue": data.get("root_cause") or "unknown",
                      "root_cause": data.get("root_cause") or "unknown",
                      "solution": data.get("solution") or ""}]
@@ -963,6 +993,47 @@ def _finalize_investigation(data: dict, forced: bool) -> dict:
     }
 
 
+EXECUTED_FILE_HINTS = (".sh", ".bash", ".yml", ".yaml", ".mk")
+EXECUTED_FILE_NAMES = ("dockerfile", "makefile", "docker-compose.yml",
+                       "docker-compose.yaml", "procfile")
+
+
+def _is_executed_file(rel: str) -> bool:
+    """Files whose contents are RUN by CI. A dangling path in a README is
+    cosmetic; a dangling path in a Dockerfile breaks the build."""
+    name = Path(rel).name.lower()
+    if name in EXECUTED_FILE_NAMES or name.startswith("dockerfile"):
+        return True
+    return rel.lower().endswith(EXECUTED_FILE_HINTS)
+
+
+def _missing_reference_report(evidence: dict) -> list:
+    """Report every path referenced in an executed file that does not exist.
+
+    This states FACTS — 'this file names a path that is not in the tree'. It
+    does not decide whether that is the bug, which finding it belongs to, or how
+    to fix it. The model draws all conclusions.
+    """
+    repo = {_relstrip(str(p)) for p in Path(".").rglob("*")
+            if p.is_file() and not any(d in SKIP_DIRS for d in p.parts)}
+    out = []
+    for rel, content in evidence.items():
+        if not isinstance(content, str) or not _is_executed_file(rel):
+            continue
+        parent = Path(rel).parent
+        seen = set()
+        for m in REPO_REF_EXT_PATTERN.finditer(content):
+            token = m.group(1)
+            if token in seen or "${{" in token or token.startswith("."):
+                continue
+            seen.add(token)
+            candidates = {token, _relstrip(str(parent / token))}
+            if any(c in repo or Path(c).is_file() for c in candidates):
+                continue
+            out.append((rel, token))
+    return out
+
+
 def _tool_args(call: dict) -> dict:
     try:
         return json.loads(call["function"].get("arguments") or "{}")
@@ -982,6 +1053,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
     result, forced_submit = None, False
     tool_calls_used = 0
     got_any_model_response = False
+    pushback_used = False
 
     diff_trimmed = git_diff[:INVESTIGATION_DIFF_CHARS]
     messages = [
@@ -1042,6 +1114,44 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
                        if c["function"]["name"] == "submit_diagnosis"), None)
         if submit:
             data = _tool_args(submit)
+
+            # Before accepting: report any dangling path in an executed file the
+            # agent read that its findings do not mention. Facts only — Python
+            # does not say whether these are bugs or how to fix them. This is the
+            # gate that catches "explained the log, missed the second defect".
+            uncovered = []
+            if not pushback_used and not forced_submit:
+                claimed = " ".join(
+                    f"{f.get('proof','')} {f.get('issue','')} {f.get('solution','')}"
+                    for f in (data.get("findings") or []) if isinstance(f, dict))
+                uncovered = [(rel, tok) for rel, tok in _missing_reference_report(evidence)
+                             if tok not in claimed]
+            if uncovered:
+                pushback_used = True
+                lines = "\n".join(f"  - {rel} references '{tok}', which is not in "
+                                   f"the repository tree" for rel, tok in uncovered)
+                print(f"[PUSHBACK] {len(uncovered)} dangling reference(s) not covered "
+                      f"by findings — asking the agent to reconsider.")
+                for rel, tok in uncovered:
+                    print(f"[PUSHBACK]   {rel} → '{tok}'")
+                log.append({"turn": turn, "status": "pushback",
+                            "analysis": f"{len(uncovered)} uncovered dangling reference(s)"})
+                messages.append({"role": "tool", "tool_call_id": submit["id"],
+                                 "content": "Diagnosis not accepted yet."})
+                messages.append({"role": "user", "content":
+                    f"Before this is accepted, note these facts about files you read:\n"
+                    f"{lines}\n\n"
+                    f"Each of these is a path named inside a file that CI executes, "
+                    f"which does not exist in the repository. None of them appears in "
+                    f"your findings. Decide for each one whether it is a defect that a "
+                    f"later build step will hit, or whether it is legitimate (generated "
+                    f"at build time, provided by the base image, created by an earlier "
+                    f"step, or otherwise fine). Investigate further if you need to.\n\n"
+                    f"If any is a defect, add it as a finding with blocks=\"later_step\" "
+                    f"and resubmit. If all are legitimate, resubmit unchanged and say so "
+                    f"in completeness_check."})
+                continue
+
             log.append({"turn": turn, "status": "submit_diagnosis",
                         "analysis": (data.get("analysis") or "")[:200]})
             result = _finalize_investigation(data, forced=forced_submit)
@@ -1108,8 +1218,14 @@ PATCH_SCHEMA = {
 
 PATCH_SYSTEM = """\
 You are a patch-generation agent. Another engineer already investigated this \
-CI/CD failure and confirmed the root cause below. Your ONLY job is to emit the \
-concrete text-level fix — do not re-diagnose.
+CI/CD failure and confirmed the defects below. Your job is to emit the concrete \
+text-level fix. Do not re-open the diagnosis or second-guess the findings.
+
+ONE EXCEPTION. If a "previous attempt failed" section reports that validation \
+rejected your patch because a file still references something missing, that is a \
+CONFIRMED additional defect found by a checker, not a theory. Fix it in the same \
+response as everything else. Never re-emit an identical patch after a rejection: \
+if you change nothing, the run fails again for the same reason.
 
 Stay scoped to the "## ISSUE TO SOLVE" section if one is present.
 
@@ -1713,6 +1829,7 @@ def open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
         items = "".join(
             f"\n{i+1}. **{f['issue']}**"
             + (f" (`{f['file']}`)" if f.get('file') else "")
+            + (" _(latent — would break a later step)_" if f.get("blocks") == "later_step" else "")
             + (f" — {f['root_cause']}"
                if f.get('root_cause') and f['root_cause'] != f['issue'] else "")
             + (f"  \n   _Proof:_ `{f['proof']}`" if f.get('proof') else "")
@@ -1874,10 +1991,14 @@ def main():
     print(f"  files read    : {', '.join(evidence.keys()) or '(none)'}")
     print(f"  tool calls    : {investigation.get('tool_calls_used', 0)}")
     files_touched = sorted({f['file'] for f in findings if f.get('file')})
+    latent = sum(1 for f in findings if f.get("blocks") == "later_step")
     print(f"  issues found  : {len(findings)} across {len(files_touched)} file(s)"
-          f"{' → ' + ', '.join(files_touched) if files_touched else ''}")
+          f"{' → ' + ', '.join(files_touched) if files_touched else ''}"
+          f"{f' ({latent} latent)' if latent else ''}")
     for i, fnd in enumerate(findings, 1):
-        print(f"    {i}. {fnd['issue']}" + (f"  [{fnd['file']}]" if fnd.get("file") else ""))
+        tag = "BLOCKS NOW " if fnd.get("blocks") == "current_failure" else "LATENT     "
+        print(f"    {i}. [{tag}] {fnd['issue']}"
+              + (f"  [{fnd['file']}]" if fnd.get("file") else ""))
         if fnd.get("root_cause"):
             print(f"       cause: {fnd['root_cause']}")
         if fnd.get("proof"):
@@ -1929,7 +2050,9 @@ def main():
 
     # ── PATCH GENERATION + VALIDATION LOOP ──
     findings_text = "\n".join(
-        f"- [{f['file'] or 'file unknown'}] {f['issue']}: {f['root_cause']}"
+        f"- [{f['file'] or 'file unknown'}]"
+        f"{' (LATENT — not the logged cause, but must still be fixed)' if f.get('blocks') == 'later_step' else ''}"
+        f" {f['issue']}: {f['root_cause']}"
         + (f"\n    offending text (verbatim): {f['proof']}" if f.get('proof') else "")
         + (f"\n    fix: {f['solution']}" if f.get('solution') else "")
         for f in findings)
@@ -1975,9 +2098,10 @@ def main():
             detail = "; ".join(pair_rejects) or "model reported no locatable issues"
             print(f"[ERROR] no usable fixes this round. {detail}", file=sys.stderr)
             # Feed the rejection back so the next round quotes real text.
-            retry_note = (f"Your previous issues were rejected because the "
-                          f"'evidence' strings were not found verbatim in the files: "
-                          f"{detail}. Copy the offending text EXACTLY this time.")
+            retry_note = (f"Your previous issues were rejected because the 'evidence' "
+                          f"strings were not found verbatim in the files: {detail}. Copy "
+                          f"the offending text EXACTLY, character for character, from the "
+                          f"### file contents this time.")
             if repair_round == MAX_REPAIR_ROUNDS:
                 if token and repo:
                     open_issue(token, repo,
@@ -1997,7 +2121,13 @@ def main():
         if not written:
             detail = "; ".join(reject_reasons) or "no detail captured"
             print(f"[ERROR] validation rejected all fixes. {detail}", file=sys.stderr)
-            retry_note = f"Your previous fix was rejected by validation: {detail}"
+            retry_note = (
+                f"Validation REJECTED your previous patch:\n{detail}\n\n"
+                f"A rejection of the form \"still references missing 'X'\" means the "
+                f"file contains a SECOND defect that the investigation did not list. "
+                f"It is confirmed — a checker found it in the patched file. Emit your "
+                f"original fix AND an additional issue entry correcting that reference, "
+                f"in the same response. Do not resend the previous patch unchanged.")
             if repair_round == MAX_REPAIR_ROUNDS:
                 if token and repo:
                     open_issue(token, repo,
