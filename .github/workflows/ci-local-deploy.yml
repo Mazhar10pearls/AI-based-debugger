@@ -1,15 +1,16 @@
 name: Local CI/CD Deploy
 
 # ── Git flow ────────────────────────────────────────────────────────────────
-# build + test  → runs on every push/PR to main & develop (and feature→develop PRs)
-# deploy        → ONLY on push to main (the box has one app + one port 5000)
+# build + test  → runs on every push/PR to main, develop & qa/** branches
+# deploy        → ONLY on push to develop (the box has one app + one port 5000)
 #
-#   feature/* ──PR──► develop ──► release/* ──► main ──► (deploy)
-#                       │            │            └─ deploy + tag
-#                       └ build+test └ build+test (no deploy)
+#   feature/* ──PR──► develop ──► release/* ──► main
+#                       │            │            └─ build+test only
+#                       │            └ build+test (no deploy)
+#                       └ build+test + DEPLOY
 #
 # Why split: building on every branch catches Dockerfile/test breakage BEFORE
-# merge, but only main may bind :5000 and run a container — otherwise two
+# merge, but only develop may bind :5000 and run a container — otherwise two
 # branches racing on an 8GB single-box runner collide on the port and on RAM.
 on:
   push:
@@ -71,8 +72,8 @@ jobs:
       # `docker build` succeeds even with a broken CMD/ENTRYPOINT (e.g. a typo'd
       # app filename); the failure only shows when the container actually runs.
       # This starts the image on a throwaway name+port and checks the app comes
-      # up, so runtime breakage surfaces on EVERY branch — not silently on a main
-      # deploy. Uses port 5001 so it never collides with the live :5000 container.
+      # up, so runtime breakage surfaces on EVERY branch — not silently on a
+      # develop deploy. Uses port 5001 so it never collides with live :5000.
       - name: Smoke-test the image
         run: |
           set -e
@@ -103,14 +104,15 @@ jobs:
           echo "Smoke test PASSED"
           docker rm -f "$SMOKE" >/dev/null 2>&1 || true
 
-      # ── Deploy (main + push only) ─────────────────────────────────────────
-      # Every deploy step is gated so PRs and develop pushes stop after build.
+      # ── Deploy (develop + push only) ──────────────────────────────────────
+      # Every deploy step is gated so PRs, main pushes and qa/** pushes stop
+      # after the smoke test. Only a real push to develop touches :5000.
       - name: Stop existing container
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
         run: docker rm -f ai-devops-sample-app || true
 
       - name: Start container
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
         run: |
           docker run -d \
             --name ai-devops-sample-app \
@@ -119,7 +121,7 @@ jobs:
             ai-devops-sample-app:${{ github.sha }}
 
       - name: Wait for app to be healthy
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
         run: |
           echo "Waiting for application to start..."
           for i in {1..20}; do
@@ -135,10 +137,10 @@ jobs:
           exit 1
 
       - name: Verify deployment
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
         run: curl -f http://127.0.0.1:5000
 
       # ── Housekeeping: drop old image tags so the 8GB box doesn't fill up ──
       - name: Prune dangling images
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
         run: docker image prune -f || true

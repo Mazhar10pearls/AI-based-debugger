@@ -84,20 +84,23 @@ def _budget_exceeded() -> bool:
 
 # ── Agentic-loop bounds ──────────────────────────────────────────────────────
 # Turns are ~3s now instead of ~100s, so let the agent actually investigate.
-MAX_INVESTIGATION_TURNS = int(os.environ.get("MAX_INVESTIGATION_TURNS", "4"))
-MAX_FILES_PER_REQUEST   = int(os.environ.get("MAX_FILES_PER_REQUEST", "2"))
-MAX_REPAIR_ROUNDS       = int(os.environ.get("MAX_REPAIR_ROUNDS", "2"))
+# The agent drives its own loop via native tool calls and stops when it calls
+# submit_diagnosis. These are cost backstops, not a reasoning schedule.
+MAX_AGENT_TURNS   = int(os.environ.get("MAX_AGENT_TURNS", "12"))
+MAX_TOOL_CALLS    = int(os.environ.get("MAX_TOOL_CALLS", "30"))
+MAX_REPAIR_ROUNDS = int(os.environ.get("MAX_REPAIR_ROUNDS", "2"))
+MAX_LIST_ENTRIES  = int(os.environ.get("MAX_LIST_ENTRIES", "300"))
+MAX_SEARCH_HITS   = int(os.environ.get("MAX_SEARCH_HITS", "60"))
 
 # ── Prompt / context budget (context is cheap now; stop starving the model) ──
 MAX_ERROR_LINES      = 14
 MAX_SUPPORTING_LINES = 10
 MAX_FILE_CHARS       = int(os.environ.get("MAX_FILE_CHARS", "8000"))
 MAX_TOTAL_CONTEXT    = int(os.environ.get("MAX_TOTAL_CONTEXT", "40000"))
-MAX_FILES_FIXED      = 4
+MAX_FILES_FIXED      = int(os.environ.get("MAX_FILES_FIXED", "10"))
 MAX_PROMPT_CHARS     = int(os.environ.get("MAX_PROMPT_CHARS", "60000"))
 INVESTIGATION_DIFF_CHARS = int(os.environ.get("INVESTIGATION_DIFF_CHARS", "1200"))
 MAX_TRACEBACK_LINES  = 12
-MAX_SEED_FILES       = int(os.environ.get("MAX_SEED_FILES", "6"))
 
 # ── Git flow ──────────────────────────────────────────────────────────────────
 GIT_BASE_BRANCH   = os.environ.get("GIT_BASE_BRANCH",   "develop")
@@ -476,52 +479,89 @@ def _read_evidence_file(rel: str):
     return redact_secrets(raw)
 
 
-# ── DETERMINISTIC RETRIEVAL (evidence only — never diagnosis) ────────────────
-def seed_evidence(focused: dict, stacks: set, allowed_files: set,
-                  log_text: str = "") -> dict:
-    """Gather the files a human would open first, given where the error surfaced.
+# ── AGENT TOOLS (the model drives these; Python only executes them) ─────────
+# seed_evidence() is gone. It selected which files the model saw first — a
+# filter, and therefore a form of pre-diagnosis. The agent now lists, searches
+# and reads the repository itself. Python supplies an unfiltered directory
+# listing and nothing else.
 
-    This function must never decide WHAT the bug is. It only answers the
-    question "which files are plausibly relevant?" — the AI does the reasoning.
-    """
-    candidates = []
-
-    # 1. Files the log itself names, if they actually exist in the repo.
-    for ref in focused.get("file_refs", []):
-        m = re.search(r'[\w./\-]+\.[A-Za-z0-9]+', ref)
-        if m:
-            cand = _relstrip(m.group(0).lstrip("/"))
-            if cand in allowed_files:
-                candidates.append(cand)
-        if re.fullmatch(r'Dockerfile(\.\w+)?', ref):
-            candidates += [f for f in sorted(allowed_files)
-                           if Path(f).name == ref]
-
-    # 2. The error surfaced from a container → Dockerfiles are primary evidence.
-    low = log_text.lower()
-    if "docker" in stacks or "container" in low or "entrypoint" in low:
-        candidates += [f for f in sorted(allowed_files)
-                       if "dockerfile" in Path(f).name.lower()
-                       or Path(f).name in ("docker-compose.yml", "docker-compose.yaml")]
-
-    # 3. It is a CI failure, so the CI config is always relevant context.
-    candidates += [f for f in sorted(allowed_files) if WORKFLOW_PATTERN.search(f)]
-
-    evidence, total = {}, 0
-    for f in dict.fromkeys(candidates):
-        if len(evidence) >= MAX_SEED_FILES:
-            break
-        content = _read_evidence_file(f)
-        if content is None:
+def _tool_list_directory(path: str, allowed_files: set) -> str:
+    """Unfiltered listing of a directory. No relevance ranking, no selection."""
+    path = _relstrip((path or ".").strip().lstrip("/")) or "."
+    if ".." in path:
+        return "Error: '..' is not permitted in paths."
+    base = Path(path)
+    if not base.exists():
+        return f"Error: '{path}' does not exist."
+    if base.is_file():
+        return f"'{path}' is a file, not a directory. Use read_file."
+    entries = []
+    for p in sorted(base.iterdir()):
+        if any(d in SKIP_DIRS for d in p.parts) or p.name in SKIP_DIRS:
             continue
-        if total + len(content) > MAX_TOTAL_CONTEXT and evidence:
-            break
-        evidence[f] = content
-        total += len(content)
-        print(f"[EVIDENCE] seeded {f} ({len(content)} chars)")
-    if not evidence:
-        print("[EVIDENCE] no seed files matched — the agent will request files itself")
-    return evidence
+        rel = _relstrip(str(p))
+        if p.is_dir():
+            entries.append(f"{rel}/")
+        elif not _is_read_blocked(rel):
+            entries.append(f"{rel}  ({p.stat().st_size} bytes)")
+    if not entries:
+        return f"'{path}' is empty or contains only excluded files."
+    truncated = ""
+    if len(entries) > MAX_LIST_ENTRIES:
+        truncated = f"\n...({len(entries) - MAX_LIST_ENTRIES} more entries omitted)"
+        entries = entries[:MAX_LIST_ENTRIES]
+    return "\n".join(entries) + truncated
+
+
+def _tool_read_file(path: str, allowed_files: set, evidence: dict) -> str:
+    """Read one file. Content is secret-redacted before it leaves the machine."""
+    path = _relstrip((path or "").strip().lstrip("/"))
+    if not path or ".." in path:
+        return "Error: invalid path."
+    if _is_read_blocked(path):
+        return f"Error: '{path}' is excluded from reading (secret or sensitive file)."
+    p = Path(path)
+    if not p.is_file():
+        # Bare absence, with nothing substituted. Reason about who referenced it.
+        return (f"'{path}' does not exist in the repository. Nothing was "
+                f"substituted for it.")
+    content = _read_evidence_file(path)
+    if content is None:
+        return f"Error: '{path}' could not be read (binary or too large)."
+    evidence[path] = content
+    return content
+
+
+def _tool_search_repo(pattern: str, is_regex: bool, allowed_files: set) -> str:
+    """Grep the repository. This is how the agent finds EVERY instance of a
+    defect rather than only the one the log happened to surface."""
+    pattern = (pattern or "").strip()
+    if not pattern:
+        return "Error: empty pattern."
+    try:
+        rx = re.compile(pattern if is_regex else re.escape(pattern))
+    except re.error as exc:
+        return f"Error: invalid regex — {exc}"
+    hits, scanned = [], 0
+    for rel in sorted(allowed_files):
+        p = Path(rel)
+        if not p.is_file() or not _is_text_file(p):
+            continue
+        scanned += 1
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            if rx.search(line):
+                hits.append(f"{rel}:{i}: {redact_secrets(line.strip())[:200]}")
+                if len(hits) >= MAX_SEARCH_HITS:
+                    return ("\n".join(hits)
+                            + f"\n...(hit the {MAX_SEARCH_HITS}-result cap; narrow the pattern)")
+    if not hits:
+        return (f"No matches for {pattern!r} in {scanned} files. "
+                f"An absence of matches is itself evidence.")
+    return "\n".join(hits) + f"\n\n({len(hits)} match(es) across {scanned} files scanned)"
 
 
 # ── AI plumbing (OpenAI, strict structured outputs) ──────────────────────────
@@ -609,6 +649,81 @@ def _call_openai(messages: list, schema: dict, schema_name: str,
     raise RuntimeError(f"OpenAI call failed after {retries} attempts: {last}")
 
 
+def _call_openai_tools(messages: list, tools: list, tool_choice,
+                       model: str = None, max_tokens: int = 2000,
+                       temperature: float = 0.0, tag: str = "AGENT",
+                       timeout: int = None, retries: int = MAX_RETRIES) -> dict:
+    """Chat call with native function calling. Returns the raw assistant message.
+
+    Unlike _call_openai (which forces one strict JSON blob), this lets the model
+    decide when it needs another tool and when it is finished — the loop ends
+    when it calls submit_diagnosis, not when a turn counter runs out.
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not set.")
+    model   = model or INVESTIGATE_MODEL
+    timeout = timeout or AI_TIMEOUT
+    is_reasoning = model.startswith(("o1", "o3", "o4", "gpt-5"))
+
+    payload = {"model": model, "messages": messages,
+               "tools": tools, "tool_choice": tool_choice}
+    if is_reasoning:
+        payload["max_completion_tokens"] = max_tokens
+    else:
+        payload["max_tokens"] = max_tokens
+        payload["temperature"] = temperature
+
+    chars = sum(len(str(m.get("content") or "")) for m in messages)
+    print(f"[{tag}] {model} | {len(messages)} msg(s), ~{chars} chars")
+
+    last = None
+    for attempt in range(retries):
+        try:
+            t0 = time.time()
+            r = requests.post(f"{OPENAI_BASE_URL}/chat/completions", json=payload,
+                              headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
+                                       "Content-Type": "application/json"},
+                              timeout=(10, timeout))
+            if r.status_code in (429, 500, 502, 503, 504):
+                try:
+                    wait = float(r.headers.get(
+                        "retry-after", RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]))
+                except ValueError:
+                    wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+                last = RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+                if attempt < retries - 1:
+                    print(f"[{tag}] {r.status_code} — retrying in {wait:.0f}s")
+                    time.sleep(wait)
+                    continue
+                raise last
+            if r.status_code == 401:
+                raise RuntimeError("OpenAI rejected the API key (401).")
+            r.raise_for_status()
+            body = r.json()
+            choice = body["choices"][0]
+            usage = body.get("usage", {})
+            print(f"[{tag}] {time.time() - t0:.1f}s | "
+                  f"in={usage.get('prompt_tokens','?')} out={usage.get('completion_tokens','?')}")
+            if choice["message"].get("refusal"):
+                raise RuntimeError(f"Model refused: {choice['message']['refusal']}")
+            if choice.get("finish_reason") == "length":
+                raise RuntimeError("Response truncated — raise max_tokens.")
+            return choice["message"]
+        except requests.exceptions.Timeout as exc:
+            last = exc
+            if attempt < retries - 1:
+                wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+                print(f"[{tag}] timeout after {timeout}s — retry in {wait}s")
+                time.sleep(wait)
+        except requests.exceptions.ConnectionError as exc:
+            raise RuntimeError(f"Cannot reach {OPENAI_BASE_URL}: {exc}")
+    raise RuntimeError(f"OpenAI tool call failed after {retries} attempts: {last}")
+
+
+PREFLIGHT_SCHEMA = {"type": "object", "additionalProperties": False,
+                    "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}
+
+
 def preflight_openai() -> bool:
     """Fail fast on a bad key / unreachable egress / model without strict support."""
     if not OPENAI_API_KEY:
@@ -617,12 +732,11 @@ def preflight_openai() -> bool:
     try:
         out = _call_openai(
             [{"role": "user",
-              "content": "Reply with status root_cause_confirmed and confidence 1.0. "
-                         "Leave every other field empty."}],
-            INVESTIGATE_SCHEMA, "investigation", model=INVESTIGATE_MODEL,
-            max_tokens=300, tag="PREFLIGHT", timeout=30, retries=1)
+              "content": "Reply with ok set to true."}],
+            PREFLIGHT_SCHEMA, "preflight", model=INVESTIGATE_MODEL,
+            max_tokens=200, tag="PREFLIGHT", timeout=30, retries=1)
         print(f"[PREFLIGHT] ok — {INVESTIGATE_MODEL} honours strict schema "
-              f"(status={out.get('status')})")
+              f"(ok={out.get('ok')})")
         return True
     except Exception as exc:
         print(f"[PREFLIGHT] failed: {exc}", file=sys.stderr)
@@ -630,48 +744,83 @@ def preflight_openai() -> bool:
 
 
 # ── AI INVESTIGATION AGENT ───────────────────────────────────────────────────
-INVESTIGATE_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["analysis", "hypotheses_considered", "hypotheses_rejected",
-                 "status", "requested_files", "root_cause", "solution",
-                 "why_fix_works", "confidence", "commit_message", "findings"],
-    "properties": {
-        "analysis":        {"type": "string"},
-        # Required fields the model cannot skip. Prose instructions to "consider
-        # alternatives" are ignorable; a required array is not.
-        "hypotheses_considered": {"type": "array", "items": {"type": "string"}},
-        "hypotheses_rejected": {"type": "array", "items": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["hypothesis", "disproved_by"],
-            "properties": {
-                "hypothesis":   {"type": "string"},
-                "disproved_by": {"type": "string"},
-            }}},
-        "status":          {"type": "string",
-                            "enum": ["need_more_info", "root_cause_confirmed"]},
-        "requested_files": {"type": "array", "items": {"type": "string"}},
-        "root_cause":      {"type": "string"},
-        "solution":        {"type": "string"},
-        "why_fix_works":   {"type": "string"},
-        "confidence":      {"type": "number"},
-        "commit_message":  {"type": "string"},
-        "findings": {"type": "array", "items": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["file", "issue", "root_cause", "proof", "solution"],
-            "properties": {
-                "file":       {"type": "string"},
-                "issue":      {"type": "string"},
-                "root_cause": {"type": "string"},
-                # Verbatim offending text. Forces the model to have actually
-                # read the file rather than pattern-matched the error string.
-                "proof":      {"type": "string"},
-                "solution":   {"type": "string"},
-            }}},
-    },
+# ── AI INVESTIGATION AGENT (native tool-calling loop) ────────────────────────
+def _fn(name, description, properties, required):
+    return {"type": "function", "function": {
+        "name": name, "description": description, "strict": True,
+        "parameters": {"type": "object", "additionalProperties": False,
+                       "properties": properties, "required": required}}}
+
+
+DIAGNOSIS_PROPERTIES = {
+    "analysis": {"type": "string",
+                 "description": "Your reasoning, in your own words."},
+    "hypotheses_considered": {"type": "array", "items": {"type": "string"},
+                              "description": "Every candidate cause you weighed."},
+    "hypotheses_rejected": {"type": "array", "items": {
+        "type": "object", "additionalProperties": False,
+        "required": ["hypothesis", "disproved_by"],
+        "properties": {"hypothesis": {"type": "string"},
+                       "disproved_by": {"type": "string"}}},
+        "description": "Each rival plus the specific evidence that killed it."},
+    "root_cause": {"type": "string",
+                   "description": "One sentence covering the underlying defect."},
+    "solution": {"type": "string"},
+    "why_fix_works": {"type": "string",
+                      "description": "Causal chain from the change to a green pipeline."},
+    "completeness_check": {"type": "string",
+                           "description": "How you verified you found EVERY instance "
+                                          "of this defect — which searches you ran and "
+                                          "what they returned. Say so plainly if you "
+                                          "did not sweep."},
+    "confidence": {"type": "number"},
+    "commit_message": {"type": "string"},
+    "findings": {"type": "array", "items": {
+        "type": "object", "additionalProperties": False,
+        "required": ["file", "issue", "root_cause", "proof", "solution"],
+        "properties": {
+            "file": {"type": "string",
+                     "description": "The file CONTAINING the bad text. Never the missing file."},
+            "issue": {"type": "string"},
+            "root_cause": {"type": "string"},
+            "proof": {"type": "string",
+                      "description": "The offending text, verbatim from a file you read."},
+            "solution": {"type": "string"}}},
+        "description": "ONE ENTRY PER DEFECT. Several defects in one file means "
+                       "several entries. The same defect in five files means five "
+                       "entries, one per file."},
 }
+DIAGNOSIS_REQUIRED = ["analysis", "hypotheses_considered", "hypotheses_rejected",
+                      "root_cause", "solution", "why_fix_works",
+                      "completeness_check", "confidence", "commit_message",
+                      "findings"]
+
+AGENT_TOOLS = [
+    _fn("list_directory",
+        "List the contents of a directory in the repository. Unfiltered — the "
+        "order and contents carry no hint about relevance. Use '.' for the root.",
+        {"path": {"type": "string", "description": "Directory path, or '.' for root."}},
+        ["path"]),
+    _fn("read_file",
+        "Read one file from the repository. Returns its full contents (secrets "
+        "redacted). If the path does not exist you are told so and nothing is "
+        "substituted for it.",
+        {"path": {"type": "string", "description": "Path relative to the repository root."}},
+        ["path"]),
+    _fn("search_repo",
+        "Search every readable file for a pattern and return matching lines as "
+        "path:line: text. This is how you find EVERY occurrence of a defect "
+        "instead of only the one the log happened to surface. Search for the "
+        "broken value, not the fixed one.",
+        {"pattern": {"type": "string", "description": "Literal text, or a regex if is_regex is true."},
+         "is_regex": {"type": "boolean", "description": "Treat pattern as a Python regex."}},
+        ["pattern", "is_regex"]),
+    _fn("submit_diagnosis",
+        "Submit your final diagnosis and end the investigation. Call this ONLY "
+        "when you can quote the offending text from files you have actually read "
+        "AND you have swept for other instances of the same defect.",
+        DIAGNOSIS_PROPERTIES, DIAGNOSIS_REQUIRED),
+]
 
 INVESTIGATE_SYSTEM = """\
 You are the sole debugging engineer for this CI/CD failure. Nothing else has \
@@ -680,81 +829,84 @@ diagnosed it and nothing else will. If you are wrong, the wrong patch ships.
 ## WHAT THE HARNESS DID — AND WHAT IT CANNOT DO
 
 A Python harness surrounds you. It is an I/O layer with no understanding of the
-failure. It dumped the raw CI logs, listed the repository tree, read some files,
-and it will later apply your patch and run validators against it. It did not
-diagnose anything and holds no theory of the bug.
+failure. It dumped the raw CI logs and an unfiltered directory listing, it
+executes the tools you call, and it will later apply your patch and run
+validators against it. It did not diagnose anything and holds no theory of the
+bug. It did not choose which files matter — that is now entirely your job.
 
-Two of its outputs LOOK authoritative and are not. Treat both as unverified:
+One of its outputs LOOKS authoritative and is not: "Primary error" in ISSUE TO
+SOLVE is simply the first log line that matched an ordered list of regexes. It
+is a guess at which line is salient, nothing more. The true cause is often a
+line much earlier in the log, or a condition that never appears in the log at
+all. The highlighted error is frequently a downstream symptom.
 
-  * "Primary error" in ISSUE TO SOLVE is simply the first log line that matched
-    an ordered list of regexes. It is a guess at which line is salient, nothing
-    more. The true cause is often a line much earlier in the log, or a condition
-    that never appears in the log at all. The highlighted error is frequently a
-    downstream symptom.
+## YOUR TOOLS
 
-  * The files under "Evidence gathered so far" on your first turn were selected
-    by keyword heuristics — the error mentioned a container, so Dockerfiles were
-    included; it is a CI failure, so workflow YAML was included. Their presence
-    is NOT evidence that any of them contains the bug, and their absence is NOT
-    evidence that a file is irrelevant. The bug may well be in a file you have
-    not seen yet. Ask for it.
+  list_directory(path)          — see what exists. Start at "." if unsure.
+  read_file(path)               — read one file's full contents.
+  search_repo(pattern, is_regex) — find every line matching a pattern, repo-wide.
+  submit_diagnosis(...)          — end the investigation with your conclusion.
 
-The harness cannot run commands for you. You cannot execute a build, run a test,
-grep, or list a directory. Your only instrument is requesting files by path.
-Reason accordingly: choose the file whose CONTENTS would settle the question.
+Call tools until you can prove the root cause. There is no fixed number of
+turns; you decide when you have enough. You cannot run builds, tests, or shell
+commands — reason from file contents alone.
 
 ## METHOD
 
 1. Form at least TWO competing hypotheses before you look for support for any of
-   them. If only one comes to mind, you have not understood the failure yet —
-   write out the mechanism until a second candidate appears.
+   them. If only one comes to mind, you have not understood the failure yet.
 2. For each hypothesis, state what evidence would DISPROVE it, then go get that
-   evidence. Requesting files in order to falsify your own favourite theory is
-   the entire purpose of this loop.
+   evidence. Requesting files to falsify your own favourite theory is the point.
 3. A hypothesis is confirmed only when you can quote the exact offending text
-   from a file you have actually read in this conversation. If you cannot quote
-   it, you are guessing — say so in your confidence score.
+   from a file you have actually read. If you cannot quote it, you are guessing.
 4. Eliminate rivals explicitly, with evidence. "The workflow YAML is not the
-   cause: every path in its run: lines exists in the repository tree" is
-   elimination. "The Dockerfile seems more likely" is not.
+   cause: every path in its run: lines exists in the tree" is elimination.
+   "The Dockerfile seems more likely" is not.
 5. Reason about the MECHANISM, never the wording. "No such file or directory:
-   'X'" means the process did not find X at the path it looked in. That has many
-   possible causes: a misspelled reference, a file never copied into the image,
-   a wrong WORKDIR, a multi-stage build that dropped it, a path resolved
-   relative to the wrong directory, a .dockerignore exclusion, a file that is
-   generated at build time and was not. Do not collapse to "typo" until you have
-   ruled the others out.
+   'X'" means the process did not find X where it looked. Possible causes
+   include a misspelled reference, a file never copied into the image, a wrong
+   WORKDIR, a multi-stage build that dropped it, a path resolved relative to the
+   wrong directory, a .dockerignore exclusion, or a file meant to be generated
+   at build time that was not. Do not collapse to "typo" until you rule these out.
 6. The file named in an error is where the failure SURFACED. The bug lives in
    whatever referenced or produced it. Never patch a file that does not exist.
 
-## REQUESTING EVIDENCE
+## FIND EVERY INSTANCE — NOT JUST THE FIRST
 
-Use status "need_more_info" and list paths in "requested_files". Ask for files
-that could KILL a hypothesis, not files that would flatter it. If a path you
-request does not exist, you will be told so and nothing will be substituted for
-it — that absence is itself evidence, so reason about why something referenced a
-path that isn't there.
+A CI log reports the FIRST thing that broke, not everything that is broken. A
+build stops at the first fatal error, so a second defect three lines later is
+invisible until the first is fixed. Patching one and shipping it means the
+pipeline fails again on the next run, and the auto-fixer burns another cycle.
 
-## CONFIRMING
+Before you call submit_diagnosis, sweep:
 
-Use status "root_cause_confirmed" only when you can point at specific text in a
-file you have read. Then fill in:
-  - hypotheses_considered: every candidate you weighed, including dropped ones.
-  - hypotheses_rejected: each rival plus the specific evidence that killed it.
-  - findings[].file: the file CONTAINING the bad text — never the missing file.
-  - findings[].proof: that text, copied verbatim from the evidence above.
-  - why_fix_works: the causal chain from your change to the pipeline passing.
+  * Take the broken value you found — a misspelled filename, a wrong path, a bad
+    version pin, a stale image tag — and search_repo for it. It may appear in a
+    Dockerfile, a compose file, a workflow, a shell script, a Makefile and a
+    README. Each occurrence in an executed file is a separate finding.
+  * Look at the whole file you are patching, not just the offending line. If a
+    Dockerfile's CMD references a nonexistent script, check its COPY lines and
+    its WORKDIR too — the same misunderstanding often produced several errors.
+  * Ask whether the defect is an instance of a class. One wrong relative path
+    often means several, written in the same sitting.
+  * If a sweep returns nothing further, say exactly that in completeness_check.
+    A clean sweep is a real result and worth recording.
+
+Emit ONE finding per defect. Several defects in one file means several entries
+with the same "file". The same defect across five files means five entries.
+Fixing only some of a set is worse than useless: the pipeline still fails and
+the failure now looks different.
 
 ## CONFIDENCE — CALIBRATION MATTERS MORE THAN OPTIMISM
 
-  0.9+     you quoted the offending text and eliminated every rival.
-  0.6-0.9  something is clearly wrong, but a rival survives or the fix is inferred.
+  0.9+       you quoted the offending text and eliminated every rival.
+  0.6-0.9    something is clearly wrong, but a rival survives or the fix is inferred.
   below 0.6  you are guessing.
 
-Prefer requesting more evidence over guessing. But if you are told this is your
-FINAL TURN, no further evidence is coming: give your best hypothesis with an
-honest low score. A truthful 0.4 routes this to a human, which is a correct and
-useful outcome. An inflated 0.95 ships a wrong patch to production.
+Prefer another tool call over guessing. But if you are told this is your FINAL
+TURN, no further evidence is coming: submit your best hypothesis with an honest
+low score. A truthful 0.4 routes this to a human, which is a correct and useful
+outcome. An inflated 0.95 ships a wrong patch to production.
 """
 
 
@@ -763,8 +915,6 @@ def _finalize_investigation(data: dict, forced: bool) -> dict:
         confidence = float(data.get("confidence", 0.4))
     except (TypeError, ValueError):
         confidence = 0.4
-    if forced and data.get("status") != "root_cause_confirmed":
-        confidence = min(confidence, 0.4)
 
     findings = []
     for f in (data.get("findings") or []):
@@ -792,14 +942,19 @@ def _finalize_investigation(data: dict, forced: bool) -> dict:
     # confidence score. Cap it so the <0.5 gate routes it to a human.
     considered = [c for c in (data.get("hypotheses_considered") or []) if c]
     if not rejected and len(considered) < 2 and confidence >= 0.5:
-        print(f"[CALIBRATE] confirmed with {len(considered)} hypothesis and no "
+        print(f"[CALIBRATE] submitted with {len(considered)} hypothesis and no "
               f"rivals eliminated — capping confidence {confidence:.0%} → 45%")
         confidence = 0.45
+    if forced and confidence > 0.6:
+        print(f"[CALIBRATE] diagnosis was forced at the turn limit — "
+              f"capping confidence {confidence:.0%} → 60%")
+        confidence = 0.6
 
     return {
         "root_cause":     data.get("root_cause") or "unknown",
         "solution":       data.get("solution") or "",
         "why_fix_works":  data.get("why_fix_works") or "",
+        "completeness_check": data.get("completeness_check") or "",
         "confidence":     confidence,
         "commit_message": data.get("commit_message") or "fix: auto-fixer change",
         "findings":       findings,
@@ -808,22 +963,25 @@ def _finalize_investigation(data: dict, forced: bool) -> dict:
     }
 
 
+def _tool_args(call: dict) -> dict:
+    try:
+        return json.loads(call["function"].get("arguments") or "{}")
+    except json.JSONDecodeError:
+        return {}
+
+
 def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
-                   issue_block: str = "", seed: dict = None) -> dict:
-    """Multi-turn investigation held as a real conversation.
+                   issue_block: str = "") -> dict:
+    """Native tool-calling agent loop.
 
-    Each turn appends only the newly read files, instead of rebuilding the
-    entire prompt from scratch.
+    The model lists, searches and reads the repository itself, and ends the loop
+    by calling submit_diagnosis. Python chooses nothing: not which files are
+    relevant, not when the investigation is complete.
     """
-    evidence = dict(seed or {})
-    log, result = [], None
-    dead_ends, stall_count = set(), 0
+    evidence, log = {}, []
+    result, forced_submit = None, False
+    tool_calls_used = 0
     got_any_model_response = False
-
-    def _ev_block(files: dict) -> str:
-        if not files:
-            return "(no files read yet)"
-        return "\n\n".join(f"### {f}\n```\n{c}\n```" for f, c in files.items())
 
     diff_trimmed = git_diff[:INVESTIGATION_DIFF_CHARS]
     messages = [
@@ -833,103 +991,91 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
             f"## Supporting log lines\n```\n{signal}\n```\n\n"
             f"## Exit code: {exit_code}\n\n"
             f"## Git diff\n```\n{diff_trimmed}\n```\n\n"
-            f"## Repository tree\n{repo_tree}\n\n"
-            f"## Evidence gathered so far\n{_ev_block(evidence)}"},
+            f"## Repository tree (unfiltered listing — no relevance implied)\n"
+            f"{repo_tree}\n\n"
+            f"Investigate. Use your tools freely, then call submit_diagnosis."},
     ]
 
-    for turn in range(1, MAX_INVESTIGATION_TURNS + 1):
-        if _budget_exceeded():
-            print(f"[INVESTIGATE] time budget exceeded before turn {turn}.")
-            break
-        last_turn = (turn == MAX_INVESTIGATION_TURNS)
-        if last_turn:
+    for turn in range(1, MAX_AGENT_TURNS + 1):
+        out_of_road = (turn == MAX_AGENT_TURNS
+                       or tool_calls_used >= MAX_TOOL_CALLS
+                       or _budget_exceeded())
+        if out_of_road:
+            forced_submit = True
+            reason = ("turn limit" if turn == MAX_AGENT_TURNS else
+                      "tool-call cap" if tool_calls_used >= MAX_TOOL_CALLS else
+                      "time budget")
+            print(f"[INVESTIGATE] {reason} reached — forcing submit_diagnosis.")
             messages.append({"role": "user", "content":
-                "FINAL TURN. Return status \"root_cause_confirmed\" now using your "
-                "best hypothesis from the evidence above. Lower your confidence "
-                "if you are not fully sure."})
+                "FINAL TURN. No further tool calls are available. Submit your best "
+                "diagnosis now with an honest confidence score, and state in "
+                "completeness_check that you could not finish sweeping."})
+            tool_choice = {"type": "function", "function": {"name": "submit_diagnosis"}}
+        else:
+            tool_choice = "auto"
 
         try:
-            data = _call_openai(messages, INVESTIGATE_SCHEMA, "investigation",
-                                model=INVESTIGATE_MODEL, max_tokens=1500,
-                                tag=f"INVESTIGATE-T{turn}")
+            msg = _call_openai_tools(messages, AGENT_TOOLS, tool_choice,
+                                     model=INVESTIGATE_MODEL, max_tokens=2500,
+                                     tag=f"AGENT-T{turn}")
         except Exception as exc:
             print(f"[INVESTIGATE] turn {turn} failed: {exc}", file=sys.stderr)
             break
 
         got_any_model_response = True
-        status = data["status"]
-        analysis = data.get("analysis", "")
-        print(f"[INVESTIGATE] turn {turn}: status={status} | "
-              f"{analysis[:160] if analysis else '(no analysis)'}")
-        log.append({"turn": turn, "status": status, "analysis": analysis[:200]})
+        messages.append(msg)
+        calls = msg.get("tool_calls") or []
+        if msg.get("content"):
+            print(f"[AGENT] {msg['content'].strip()[:200]}")
 
-        if status == "root_cause_confirmed":
-            result = _finalize_investigation(data, forced=last_turn)
-            break
-
-        # need_more_info — record the model's turn, then resolve its requests.
-        messages.append({"role": "assistant", "content": json.dumps(data)})
-
-        requested = [f.strip() for f in data.get("requested_files", []) if f.strip()]
-        to_read, notes = [], []
-        for f in requested[:MAX_FILES_PER_REQUEST]:
-            if f in evidence:
-                notes.append(f"'{f}' was already provided above — re-read it there.")
-                continue
-            if f in dead_ends:
-                notes.append(f"'{f}' was already denied. Do not request it again.")
-                continue
-            if f in allowed_files:
-                to_read.append(f)
-                continue
-            # No substitution. Naming a "closest match" would hand the model the
-            # answer in exactly the typo-class bug this tool exists to find.
-            # Absence is reported as bare fact; the model reasons about it.
-            print(f"[INVESTIGATE]   ✗ '{f}' — does not exist")
-            dead_ends.add(f)
-            notes.append(f"'{f}' does not exist in the repository tree. "
-                         f"Nothing was substituted for it.")
-
-        newly = {}
-        for f in to_read:
-            content = _read_evidence_file(f)
-            newly[f] = content if content is not None else "(could not read)"
-            evidence[f] = newly[f]
-            print(f"[INVESTIGATE]   + read {f} ({len(newly[f])} chars)")
-
-        stall_count = stall_count + 1 if not newly else 0
-        if stall_count >= 2 and not last_turn:
-            print("[INVESTIGATE] no new evidence for 2 turns — forcing decision.")
+        if not calls:
+            print("[INVESTIGATE] model returned no tool call — nudging.")
+            log.append({"turn": turn, "status": "no_tool_call",
+                        "analysis": (msg.get("content") or "")[:200]})
             messages.append({"role": "user", "content":
-                "No new files are available. Decide now with status "
-                "\"root_cause_confirmed\" and an honest confidence score."})
-            try:
-                data2 = _call_openai(messages, INVESTIGATE_SCHEMA, "investigation",
-                                     model=INVESTIGATE_MODEL, max_tokens=1500,
-                                     tag="INVESTIGATE-FINAL")
-                result = _finalize_investigation(data2, forced=True)
-            except Exception as exc:
-                print(f"[INVESTIGATE] forced turn failed: {exc}", file=sys.stderr)
-                result = _finalize_investigation(data, forced=True)
+                "You must either call an investigation tool or call "
+                "submit_diagnosis. Do not reply with prose alone."})
+            continue
+
+        # submit_diagnosis ends the loop, whatever else was requested alongside.
+        submit = next((c for c in calls
+                       if c["function"]["name"] == "submit_diagnosis"), None)
+        if submit:
+            data = _tool_args(submit)
+            log.append({"turn": turn, "status": "submit_diagnosis",
+                        "analysis": (data.get("analysis") or "")[:200]})
+            result = _finalize_investigation(data, forced=forced_submit)
             break
 
-        parts = []
-        if newly:
-            parts.append("## Newly read files\n" + _ev_block(newly))
-        if notes:
-            parts.append("## Notes on your request\n"
-                         + "\n".join(f"- {n}" for n in notes))
-        messages.append({"role": "user", "content": "\n\n".join(parts)
-                         or "No files could be read. Work with what you have."})
+        for call in calls:
+            name = call["function"]["name"]
+            args = _tool_args(call)
+            tool_calls_used += 1
+            if name == "list_directory":
+                target = args.get("path", ".")
+                out = _tool_list_directory(target, allowed_files)
+            elif name == "read_file":
+                target = args.get("path", "")
+                out = _tool_read_file(target, allowed_files, evidence)
+            elif name == "search_repo":
+                target = f"{args.get('pattern','')!r} regex={args.get('is_regex', False)}"
+                out = _tool_search_repo(args.get("pattern", ""),
+                                        bool(args.get("is_regex")), allowed_files)
+            else:
+                target, out = name, f"Error: unknown tool '{name}'."
+            print(f"[TOOL {tool_calls_used}/{MAX_TOOL_CALLS}] {name}({target}) "
+                  f"→ {len(out)} chars")
+            log.append({"turn": turn, "status": f"tool:{name}",
+                        "analysis": f"{target} → {out.splitlines()[0][:120] if out else ''}"})
+            messages.append({"role": "tool", "tool_call_id": call["id"],
+                             "content": out[:MAX_FILE_CHARS]})
 
     if result is None:
-        if got_any_model_response:
-            failure_mode = "not_converged"
-            root_cause = "unknown — investigation did not converge"
-        else:
-            failure_mode = "no_model_response"
-            root_cause = "model returned no usable response (API/network problem)"
-        result = {"root_cause": root_cause, "solution": "", "why_fix_works": "",
+        failure_mode = "not_converged" if got_any_model_response else "no_model_response"
+        result = {"root_cause": ("investigation did not converge"
+                                 if got_any_model_response
+                                 else "model returned no usable response (API/network problem)"),
+                  "solution": "", "why_fix_works": "", "completeness_check": "",
                   "confidence": 0.0, "commit_message": "fix: auto-fixer change",
                   "findings": [], "hypotheses_considered": [],
                   "hypotheses_rejected": [], "failure_mode": failure_mode}
@@ -937,6 +1083,7 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
         result["failure_mode"] = None
     result["evidence"] = evidence
     result["investigation_log"] = log
+    result["tool_calls_used"] = tool_calls_used
     return result
 
 
@@ -966,7 +1113,10 @@ concrete text-level fix — do not re-diagnose.
 
 Stay scoped to the "## ISSUE TO SOLVE" section if one is present.
 
-"issues" = ONE ENTRY PER BUG. Each entry:
+"issues" = ONE ENTRY PER DEFECT, across every affected file. Several defects in
+one file means several entries with the same "file". The same defect in five
+files means five entries. Emit ALL of them in this one response — a partial fix
+leaves the pipeline broken and wastes a repair round. Each entry:
   - "file": the exact path from a "### <path>" header below. Nothing else.
   - "problem": one sentence.
   - "evidence": EXACT text copied character-for-character from that file's
@@ -979,6 +1129,9 @@ Stay scoped to the "## ISSUE TO SOLVE" section if one is present.
     If you cannot copy it exactly, do not emit that issue at all.
   * "evidence" and "corrected" MUST be different strings.
   * Never invent a file path that has no "###" header below.
+  * Do not merge two defects into one entry, even in the same file. Separate
+    entries with distinct, individually-locatable "evidence" strings let the
+    validator accept the good ones when one is wrong.
 """
 
 
@@ -1547,7 +1700,8 @@ def _gh(token):
 
 def open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
             investigation_log=None, evidence_files=None, solution="",
-            findings=None, rejected=None, why_fix_works="") -> str:
+            findings=None, rejected=None, why_fix_works="",
+            completeness="") -> str:
     details = "".join(f"\n**`{f.get('file','?')}`** — {f.get('reason','')}\n" for f in fixes)
     trace = ""
     if investigation_log:
@@ -1577,6 +1731,7 @@ def open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
             f"**Overall root cause:** {root_cause}\n\n"
             f"**Solution:** {solution or 'n/a'}\n\n"
             + (f"**Why this fix works:** {why_fix_works}\n\n" if why_fix_works else "")
+            + (f"**Completeness sweep:** {completeness}\n\n" if completeness else "")
             + f"{files_read}"
             + f"**Files changed:** {', '.join(f'`{f}`' for f in written)}\n\n"
             + f"## What changed{details}\n\n> Auto-generated — review before merge.")
@@ -1688,9 +1843,6 @@ def main():
     repo_tree, allowed_files = repo_tree_text()
     print(f"[EVIDENCE] exit_code={exit_code} | {len(allowed_files)} readable file(s) in tree")
 
-    # Deterministic RETRIEVAL — which files are plausibly relevant. Not diagnosis.
-    seed = seed_evidence(focused, stacks, allowed_files, log_text)
-
     # ── AI INVESTIGATION AGENT ──
     print("\n━━━ AI INVESTIGATION AGENT ━━━")
     if not preflight_openai():
@@ -1703,7 +1855,7 @@ def main():
         sys.exit(0)
 
     investigation = ai_investigate(supporting_signal, exit_code, repo_tree, git_diff,
-                                   allowed_files, issue_block=issue_block, seed=seed)
+                                   allowed_files, issue_block=issue_block)
     root_cause = investigation["root_cause"]
     solution   = investigation["solution"]
     commit_msg = investigation["commit_message"]
@@ -1711,6 +1863,7 @@ def main():
     evidence   = investigation["evidence"]
     findings   = investigation.get("findings", [])
     why_fix_works = investigation.get("why_fix_works", "")
+    completeness  = investigation.get("completeness_check", "")
     considered = investigation.get("hypotheses_considered", [])
     rejected   = investigation.get("hypotheses_rejected", [])
     investigation_log = investigation.get("investigation_log")
@@ -1719,7 +1872,10 @@ def main():
     print(f"  OVERALL CAUSE : {root_cause}")
     print(f"  confidence    : {confidence:.0%}")
     print(f"  files read    : {', '.join(evidence.keys()) or '(none)'}")
-    print(f"  issues found  : {len(findings)}")
+    print(f"  tool calls    : {investigation.get('tool_calls_used', 0)}")
+    files_touched = sorted({f['file'] for f in findings if f.get('file')})
+    print(f"  issues found  : {len(findings)} across {len(files_touched)} file(s)"
+          f"{' → ' + ', '.join(files_touched) if files_touched else ''}")
     for i, fnd in enumerate(findings, 1):
         print(f"    {i}. {fnd['issue']}" + (f"  [{fnd['file']}]" if fnd.get("file") else ""))
         if fnd.get("root_cause"):
@@ -1734,6 +1890,8 @@ def main():
         print(f"      because:   {h['disproved_by'][:110]}")
     if why_fix_works:
         print(f"  why it works  : {why_fix_works[:200]}")
+    if completeness:
+        print(f"  sweep         : {completeness[:200]}")
 
     failure_mode = investigation.get("failure_mode")
     if failure_mode in ("no_model_response", "not_converged") and not investigation_log:
@@ -1901,7 +2059,7 @@ def main():
     if token and repo:
         open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
                 investigation_log, list(evidence.keys()), solution, findings,
-                rejected, why_fix_works)
+                rejected, why_fix_works, completeness)
     else:
         print(f"[PR] No token — merge {branch} manually.")
 
