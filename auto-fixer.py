@@ -1587,7 +1587,77 @@ def _yaml_leaf_diffs(old, new, path=""):
 
 
 MAX_WORKFLOW_VALUE_DIFFS = 3
-SENSITIVE_WORKFLOW_KEYS = {"permissions", "secrets", "env", "on", "runs-on", "uses", "if"}
+SENSITIVE_WORKFLOW_KEYS = {"permissions", "secrets", "env", "on", "runs-on", "if"}
+
+# `uses` is deliberately NOT in the blanket set above. Repointing `uses:` changes
+# which third-party code CI executes, so it cannot be waved through — but a typo
+# in an action name ("Unable to resolve action …, repository not found") is a
+# common, real failure that was previously unfixable. Instead of trusting the
+# model, _verify_uses_change proves the edit is a typo correction: same version
+# ref, only one of owner/repo altered, high string similarity, the old target
+# genuinely missing on GitHub and the new one genuinely present.
+USES_REF = re.compile(r"^([\w.\-]+)/([\w.\-]+?)(?:/([\w.\-/]+))?@([\w.\-/]+)$")
+USES_MIN_SIMILARITY = float(os.environ.get("USES_MIN_SIMILARITY", "0.75"))
+
+
+def _action_repo_exists(owner: str, repo: str, token: str) -> bool:
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    r = requests.get(f"https://api.github.com/repos/{owner}/{repo}",
+                     headers=headers, timeout=15)
+    if r.status_code == 200:
+        return True
+    if r.status_code == 404:
+        return False
+    raise RuntimeError(f"GitHub API returned {r.status_code} for {owner}/{repo}")
+
+
+def _verify_uses_change(old_v, new_v) -> tuple:
+    """Allow a `uses:` edit only if it is provably a typo correction."""
+    if not isinstance(old_v, str) or not isinstance(new_v, str):
+        return False, "uses: edit is not a string change"
+
+    if new_v.strip().startswith("./"):
+        # Local composite action — no supply-chain question, just path existence.
+        local = new_v.strip().split("@")[0]
+        return ((True, "ok") if Path(local).exists()
+                else (False, f"uses: points at local path '{local}' which does not exist"))
+
+    om, nm = USES_REF.match(old_v.strip()), USES_REF.match(new_v.strip())
+    if not om or not nm:
+        return False, f"uses: value is not a recognisable owner/repo@ref ({new_v!r})"
+
+    o_owner, o_repo, _o_sub, o_ref = om.groups()
+    n_owner, n_repo, _n_sub, n_ref = nm.groups()
+
+    if o_ref != n_ref:
+        return False, (f"uses: edit changes the pinned version ({o_ref} → {n_ref}); "
+                       f"only the action name may be corrected")
+    if o_owner != n_owner and o_repo != n_repo:
+        return False, ("uses: edit changes BOTH the owner and the repository — "
+                       "that is a repoint, not a typo correction")
+
+    old_full, new_full = f"{o_owner}/{o_repo}", f"{n_owner}/{n_repo}"
+    ratio = difflib.SequenceMatcher(None, old_full, new_full).ratio()
+    if ratio < USES_MIN_SIMILARITY:
+        return False, (f"uses: '{old_full}' → '{new_full}' is too dissimilar "
+                       f"({ratio:.0%}) to be a typo correction")
+
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_PAT", "")
+    try:
+        # Fails closed: if the API cannot be reached, the edit is not approved.
+        if _action_repo_exists(o_owner, o_repo, token):
+            return False, (f"uses: the original action '{old_full}' resolves fine, "
+                           f"so this edit is not fixing an unresolvable reference")
+        if not _action_repo_exists(n_owner, n_repo, token):
+            return False, f"uses: the replacement action '{new_full}' does not exist on GitHub"
+    except Exception as exc:
+        return False, f"uses: could not verify the action against GitHub ({exc})"
+
+    print(f"[VERIFY] uses: '{old_full}' (404) → '{new_full}' (200), "
+          f"ref {n_ref} unchanged, {ratio:.0%} similar — approved")
+    return True, "ok"
 
 
 def check_workflow_python_versions(new_text: str) -> str:
@@ -1627,6 +1697,11 @@ def validate_workflow_edit(original_text: str, new_text: str) -> tuple:
         segments = [s.strip("]") for s in re.split(r"[.\[]", path)]
         if any(seg in SENSITIVE_WORKFLOW_KEYS for seg in segments):
             return False, f"edit touches sensitive field '{path}'"
+        if "uses" in segments:
+            ok_uses, reason_uses = _verify_uses_change(old_v, new_v)
+            if not ok_uses:
+                return False, reason_uses
+            continue
         if isinstance(old_v, str) and isinstance(new_v, str):
             added = [l for l in new_v.splitlines() if l not in old_v.splitlines()]
             if scan_dangerous_commands("\n".join(added)):
