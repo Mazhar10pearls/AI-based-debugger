@@ -46,7 +46,6 @@ Optional env:
 
 import argparse
 import ast
-import difflib
 import json
 import os
 import re
@@ -159,7 +158,6 @@ DOCKERFILE_REF_PATTERNS = [
 ]
 DOCKERFILE_FROM_PYTHON = re.compile(r'^(\s*FROM\s+)python:([^\s]+)(.*)$', re.I | re.M)
 VALID_PYTHON_MINORS = set(range(8, 14))
-DEFAULT_PYTHON_VERSION = os.environ.get("DEFAULT_PYTHON_VERSION", "3.12")
 
 WORKFLOW_PYVERSION_LINE = re.compile(
     r'^(\s*python-version\s*:\s*)([\'"]?)(\d+)\.(\d+)([\'"]?)(.*)$', re.M)
@@ -635,71 +633,129 @@ def preflight_openai() -> bool:
 INVESTIGATE_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["analysis", "status", "requested_files", "root_cause",
-                 "solution", "confidence", "commit_message", "findings"],
+    "required": ["analysis", "hypotheses_considered", "hypotheses_rejected",
+                 "status", "requested_files", "root_cause", "solution",
+                 "why_fix_works", "confidence", "commit_message", "findings"],
     "properties": {
         "analysis":        {"type": "string"},
+        # Required fields the model cannot skip. Prose instructions to "consider
+        # alternatives" are ignorable; a required array is not.
+        "hypotheses_considered": {"type": "array", "items": {"type": "string"}},
+        "hypotheses_rejected": {"type": "array", "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["hypothesis", "disproved_by"],
+            "properties": {
+                "hypothesis":   {"type": "string"},
+                "disproved_by": {"type": "string"},
+            }}},
         "status":          {"type": "string",
                             "enum": ["need_more_info", "root_cause_confirmed"]},
         "requested_files": {"type": "array", "items": {"type": "string"}},
         "root_cause":      {"type": "string"},
         "solution":        {"type": "string"},
+        "why_fix_works":   {"type": "string"},
         "confidence":      {"type": "number"},
         "commit_message":  {"type": "string"},
         "findings": {"type": "array", "items": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["file", "issue", "root_cause", "solution"],
+            "required": ["file", "issue", "root_cause", "proof", "solution"],
             "properties": {
                 "file":       {"type": "string"},
                 "issue":      {"type": "string"},
                 "root_cause": {"type": "string"},
+                # Verbatim offending text. Forces the model to have actually
+                # read the file rather than pattern-matched the error string.
+                "proof":      {"type": "string"},
                 "solution":   {"type": "string"},
             }}},
     },
 }
 
 INVESTIGATE_SYSTEM = """\
-You are a DevOps investigation agent. Find the root cause of a CI failure using \
-only the evidence you are given, and request more files when you need them.
+You are the sole debugging engineer for this CI/CD failure. Nothing else has \
+diagnosed it and nothing else will. If you are wrong, the wrong patch ships.
 
-**RULES (follow strictly):**
+## WHAT THE HARNESS DID — AND WHAT IT CANNOT DO
 
-1. The "## ISSUE TO SOLVE" section tells you exactly what broke and where it
-   surfaced. Read it before anything else.
-2. If the error says "No such file or directory: 'X'", then X does not exist and
-   the bug is NOT inside X. The bug is in whichever file REFERENCES X — a
-   Dockerfile CMD/ENTRYPOINT/COPY, a workflow `run:` line, a shell script, a
-   Makefile target, an import. Do not assume which one. Check the evidence files
-   you were given, and request the referencing file if it is not there yet.
-3. For every file-path-like token in the evidence files, verify it exists in the
-   "## Repository tree". A referenced path that is absent — especially when a
-   similarly spelled file DOES exist — is a typo, and that is your root cause.
-4. Never request the missing file X itself. Request the file that references it.
-5. Confirm with status "root_cause_confirmed" as soon as you can point to the
-   exact wrong text inside a file you have actually read. Each finding's "file"
-   MUST name the file that CONTAINS the bad reference, never the missing file.
-6. Set "confidence" to 0.9 or higher only when you can see the offending text
-   verbatim in the evidence. If you are inferring, say so and score lower.
-7. When status is "need_more_info", put the paths you want in "requested_files"
-   and leave root_cause/solution/findings empty. When status is
-   "root_cause_confirmed", leave requested_files empty.
+A Python harness surrounds you. It is an I/O layer with no understanding of the
+failure. It dumped the raw CI logs, listed the repository tree, read some files,
+and it will later apply your patch and run validators against it. It did not
+diagnose anything and holds no theory of the bug.
+
+Two of its outputs LOOK authoritative and are not. Treat both as unverified:
+
+  * "Primary error" in ISSUE TO SOLVE is simply the first log line that matched
+    an ordered list of regexes. It is a guess at which line is salient, nothing
+    more. The true cause is often a line much earlier in the log, or a condition
+    that never appears in the log at all. The highlighted error is frequently a
+    downstream symptom.
+
+  * The files under "Evidence gathered so far" on your first turn were selected
+    by keyword heuristics — the error mentioned a container, so Dockerfiles were
+    included; it is a CI failure, so workflow YAML was included. Their presence
+    is NOT evidence that any of them contains the bug, and their absence is NOT
+    evidence that a file is irrelevant. The bug may well be in a file you have
+    not seen yet. Ask for it.
+
+The harness cannot run commands for you. You cannot execute a build, run a test,
+grep, or list a directory. Your only instrument is requesting files by path.
+Reason accordingly: choose the file whose CONTENTS would settle the question.
+
+## METHOD
+
+1. Form at least TWO competing hypotheses before you look for support for any of
+   them. If only one comes to mind, you have not understood the failure yet —
+   write out the mechanism until a second candidate appears.
+2. For each hypothesis, state what evidence would DISPROVE it, then go get that
+   evidence. Requesting files in order to falsify your own favourite theory is
+   the entire purpose of this loop.
+3. A hypothesis is confirmed only when you can quote the exact offending text
+   from a file you have actually read in this conversation. If you cannot quote
+   it, you are guessing — say so in your confidence score.
+4. Eliminate rivals explicitly, with evidence. "The workflow YAML is not the
+   cause: every path in its run: lines exists in the repository tree" is
+   elimination. "The Dockerfile seems more likely" is not.
+5. Reason about the MECHANISM, never the wording. "No such file or directory:
+   'X'" means the process did not find X at the path it looked in. That has many
+   possible causes: a misspelled reference, a file never copied into the image,
+   a wrong WORKDIR, a multi-stage build that dropped it, a path resolved
+   relative to the wrong directory, a .dockerignore exclusion, a file that is
+   generated at build time and was not. Do not collapse to "typo" until you have
+   ruled the others out.
+6. The file named in an error is where the failure SURFACED. The bug lives in
+   whatever referenced or produced it. Never patch a file that does not exist.
+
+## REQUESTING EVIDENCE
+
+Use status "need_more_info" and list paths in "requested_files". Ask for files
+that could KILL a hypothesis, not files that would flatter it. If a path you
+request does not exist, you will be told so and nothing will be substituted for
+it — that absence is itself evidence, so reason about why something referenced a
+path that isn't there.
+
+## CONFIRMING
+
+Use status "root_cause_confirmed" only when you can point at specific text in a
+file you have read. Then fill in:
+  - hypotheses_considered: every candidate you weighed, including dropped ones.
+  - hypotheses_rejected: each rival plus the specific evidence that killed it.
+  - findings[].file: the file CONTAINING the bad text — never the missing file.
+  - findings[].proof: that text, copied verbatim from the evidence above.
+  - why_fix_works: the causal chain from your change to the pipeline passing.
+
+## CONFIDENCE — CALIBRATION MATTERS MORE THAN OPTIMISM
+
+  0.9+     you quoted the offending text and eliminated every rival.
+  0.6-0.9  something is clearly wrong, but a rival survives or the fix is inferred.
+  below 0.6  you are guessing.
+
+Prefer requesting more evidence over guessing. But if you are told this is your
+FINAL TURN, no further evidence is coming: give your best hypothesis with an
+honest low score. A truthful 0.4 routes this to a human, which is a correct and
+useful outcome. An inflated 0.95 ships a wrong patch to production.
 """
-
-
-def _closest_allowed_file(requested: str, allowed_files: set) -> str:
-    req_base = Path(requested).name.lower()
-    by_base = {}
-    for f in allowed_files:
-        by_base.setdefault(Path(f).name.lower(), []).append(f)
-    close = difflib.get_close_matches(req_base, by_base.keys(), n=1, cutoff=0.6)
-    if not close:
-        return ""
-    candidates = by_base[close[0]]
-    if len(candidates) == 1:
-        return candidates[0]
-    best = difflib.get_close_matches(requested, candidates, n=1, cutoff=0.0)
-    return best[0] if best else candidates[0]
 
 
 def _finalize_investigation(data: dict, forced: bool) -> dict:
@@ -717,20 +773,38 @@ def _finalize_investigation(data: dict, forced: bool) -> dict:
                 "file":       (f.get("file") or "").strip(),
                 "issue":      (f.get("issue") or f.get("root_cause") or "").strip(),
                 "root_cause": (f.get("root_cause") or "").strip(),
+                "proof":      (f.get("proof") or "").strip(),
                 "solution":   (f.get("solution") or "").strip(),
             })
     if not findings:
-        findings = [{"file": "",
+        findings = [{"file": "", "proof": "",
                      "issue": data.get("root_cause") or "unknown",
                      "root_cause": data.get("root_cause") or "unknown",
                      "solution": data.get("solution") or ""}]
 
+    rejected = []
+    for h in (data.get("hypotheses_rejected") or []):
+        if isinstance(h, dict) and h.get("hypothesis"):
+            rejected.append({"hypothesis": h["hypothesis"].strip(),
+                             "disproved_by": (h.get("disproved_by") or "").strip()})
+
+    # A confirmation that eliminated nothing is a first guess wearing a
+    # confidence score. Cap it so the <0.5 gate routes it to a human.
+    considered = [c for c in (data.get("hypotheses_considered") or []) if c]
+    if not rejected and len(considered) < 2 and confidence >= 0.5:
+        print(f"[CALIBRATE] confirmed with {len(considered)} hypothesis and no "
+              f"rivals eliminated — capping confidence {confidence:.0%} → 45%")
+        confidence = 0.45
+
     return {
         "root_cause":     data.get("root_cause") or "unknown",
         "solution":       data.get("solution") or "",
+        "why_fix_works":  data.get("why_fix_works") or "",
         "confidence":     confidence,
         "commit_message": data.get("commit_message") or "fix: auto-fixer change",
         "findings":       findings,
+        "hypotheses_considered": considered,
+        "hypotheses_rejected":   rejected,
     }
 
 
@@ -808,17 +882,13 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
             if f in allowed_files:
                 to_read.append(f)
                 continue
-            match = _closest_allowed_file(f, allowed_files)
-            if match and match not in evidence:
-                print(f"[INVESTIGATE]   ~ '{f}' not in tree — reading '{match}'")
-                to_read.append(match)
-                notes.append(f"'{f}' does not exist; the closest real file "
-                             f"'{match}' is provided instead.")
-            else:
-                print(f"[INVESTIGATE]   ✗ '{f}' — denied")
-                dead_ends.add(f)
-                notes.append(f"'{f}' does not exist in the repository. Do NOT "
-                             f"request it again — find the file that REFERENCES it.")
+            # No substitution. Naming a "closest match" would hand the model the
+            # answer in exactly the typo-class bug this tool exists to find.
+            # Absence is reported as bare fact; the model reasons about it.
+            print(f"[INVESTIGATE]   ✗ '{f}' — does not exist")
+            dead_ends.add(f)
+            notes.append(f"'{f}' does not exist in the repository tree. "
+                         f"Nothing was substituted for it.")
 
         newly = {}
         for f in to_read:
@@ -859,9 +929,10 @@ def ai_investigate(signal, exit_code, repo_tree, git_diff, allowed_files: set,
         else:
             failure_mode = "no_model_response"
             root_cause = "model returned no usable response (API/network problem)"
-        result = {"root_cause": root_cause, "solution": "", "confidence": 0.0,
-                  "commit_message": "fix: auto-fixer change", "findings": [],
-                  "failure_mode": failure_mode}
+        result = {"root_cause": root_cause, "solution": "", "why_fix_works": "",
+                  "confidence": 0.0, "commit_message": "fix: auto-fixer change",
+                  "findings": [], "hypotheses_considered": [],
+                  "hypotheses_rejected": [], "failure_mode": failure_mode}
     else:
         result["failure_mode"] = None
     result["evidence"] = evidence
@@ -932,7 +1003,8 @@ def _normalize_issue_keys(issues):
 
 
 def ai_generate_patch(root_cause: str, solution: str, evidence: dict,
-                      retry_note: str = "", issue_block: str = "") -> list:
+                      retry_note: str = "", issue_block: str = "",
+                      why_fix_works: str = "") -> list:
     context = "\n\n".join(f"### {f}\n```\n{c}\n```" for f, c in evidence.items()) \
               or "(no evidence files were read)"
     user = (
@@ -941,6 +1013,8 @@ def ai_generate_patch(root_cause: str, solution: str, evidence: dict,
            if retry_note else "")
         + f"## Confirmed root cause\n{root_cause}\n\n"
         + f"## Solution direction\n{solution}\n\n"
+        + (f"## Why the investigator believes this fix works\n{why_fix_works}\n\n"
+           if why_fix_works else "")
         + f"## File contents — you may ONLY edit these\n{context}\n\n"
         + "Emit the issues JSON.")
     data = _call_openai([{"role": "system", "content": PATCH_SYSTEM},
@@ -1181,25 +1255,22 @@ MAX_WORKFLOW_VALUE_DIFFS = 3
 SENSITIVE_WORKFLOW_KEYS = {"permissions", "secrets", "env", "on", "runs-on", "uses", "if"}
 
 
-def normalize_workflow_python_versions(original_text: str, new_text: str) -> tuple:
-    old_matches = list(WORKFLOW_PYVERSION_LINE.finditer(original_text))
-    new_matches = list(WORKFLOW_PYVERSION_LINE.finditer(new_text))
-    if len(old_matches) != len(new_matches):
-        return new_text, False
-    changed = False
-    out = new_text
-    for om, nm in zip(reversed(old_matches), reversed(new_matches)):
-        o_major, o_minor = int(om.group(3)), int(om.group(4))
-        if o_major == 3 and o_minor in VALID_PYTHON_MINORS:
+def check_workflow_python_versions(new_text: str) -> str:
+    """Reject a patch that leaves an unreal python-version. Never rewrites it.
+
+    The previous implementation silently overwrote whatever version the model
+    chose with DEFAULT_PYTHON_VERSION — that was Python authoring the fix and
+    then crediting the AI for it in the PR body. Validation rejects; it does not
+    write. The rejection reason is fed back so the model patches it correctly on
+    the next repair round.
+    """
+    for m in WORKFLOW_PYVERSION_LINE.finditer(new_text):
+        major, minor = int(m.group(3)), int(m.group(4))
+        if major == 3 and minor in VALID_PYTHON_MINORS:
             continue
-        n_prefix, n_q1, _n_major, _n_minor, n_q2, n_rest = nm.groups()
-        quote = n_q1 or n_q2 or '"'
-        new_line = f"{n_prefix}{quote}{DEFAULT_PYTHON_VERSION}{quote}{n_rest}"
-        if new_line != nm.group(0):
-            changed = True
-            print(f"[NORMALIZE] python-version forced to {DEFAULT_PYTHON_VERSION}")
-        out = out[:nm.start()] + new_line + out[nm.end():]
-    return out, changed
+        return (f"patched workflow sets python-version {major}.{minor}, which is "
+                f"not a released CPython minor version")
+    return ""
 
 
 def validate_workflow_edit(original_text: str, new_text: str) -> tuple:
@@ -1272,12 +1343,9 @@ def validate_fix(fix: dict) -> tuple:
         except yaml.YAMLError as e:
             return False, f"YAML error: {e}"
         if WORKFLOW_PATTERN.search(file):
-            content, snapped = normalize_workflow_python_versions(original_text, content)
-            if snapped:
-                fix["fixed_content"] = content
-                fix["reason"] = (fix.get("reason", "") +
-                                 f"; python-version pinned to {DEFAULT_PYTHON_VERSION}"
-                                 ).lstrip("; ")[:300]
+            pyver_reason = check_workflow_python_versions(content)
+            if pyver_reason:
+                return False, pyver_reason
             ok, reason = validate_workflow_edit(original_text, content)
             if not ok:
                 return False, reason
@@ -1479,7 +1547,7 @@ def _gh(token):
 
 def open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
             investigation_log=None, evidence_files=None, solution="",
-            findings=None) -> str:
+            findings=None, rejected=None, why_fix_works="") -> str:
     details = "".join(f"\n**`{f.get('file','?')}`** — {f.get('reason','')}\n" for f in fixes)
     trace = ""
     if investigation_log:
@@ -1493,18 +1561,25 @@ def open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
             + (f" (`{f['file']}`)" if f.get('file') else "")
             + (f" — {f['root_cause']}"
                if f.get('root_cause') and f['root_cause'] != f['issue'] else "")
+            + (f"  \n   _Proof:_ `{f['proof']}`" if f.get('proof') else "")
             + (f"  \n   _Fix: {f['solution']}_" if f.get('solution') else "")
             for i, f in enumerate(findings))
         issues_section = f"### Issues identified & fixed ({len(findings)}){items}\n\n"
+    ruled_out = ""
+    if rejected:
+        rows = "".join(f"\n| {h['hypothesis']} | {h['disproved_by']} |" for h in rejected)
+        ruled_out = ("### Hypotheses ruled out\n\n"
+                     "| Considered | Disproved by |\n|---|---|" + rows + "\n\n")
     files_read = (f"**Files the agent read to diagnose this:** "
                   f"{', '.join(f'`{f}`' for f in evidence_files)}\n\n"
                   if evidence_files else "")
-    body = (f"## 🤖 AI Auto-Fix\n\n{trace}{issues_section}"
+    body = (f"## 🤖 AI Auto-Fix\n\n{trace}{issues_section}{ruled_out}"
             f"**Overall root cause:** {root_cause}\n\n"
             f"**Solution:** {solution or 'n/a'}\n\n"
-            f"{files_read}"
-            f"**Files changed:** {', '.join(f'`{f}`' for f in written)}\n\n"
-            f"## What changed{details}\n\n> Auto-generated — review before merge.")
+            + (f"**Why this fix works:** {why_fix_works}\n\n" if why_fix_works else "")
+            + f"{files_read}"
+            + f"**Files changed:** {', '.join(f'`{f}`' for f in written)}\n\n"
+            + f"## What changed{details}\n\n> Auto-generated — review before merge.")
     r = requests.post(f"https://api.github.com/repos/{repo}/pulls",
                       json={"title": f"🤖 {commit_msg}", "head": branch,
                             "base": GIT_TARGET_BRANCH, "body": body},
@@ -1635,6 +1710,9 @@ def main():
     confidence = investigation["confidence"]
     evidence   = investigation["evidence"]
     findings   = investigation.get("findings", [])
+    why_fix_works = investigation.get("why_fix_works", "")
+    considered = investigation.get("hypotheses_considered", [])
+    rejected   = investigation.get("hypotheses_rejected", [])
     investigation_log = investigation.get("investigation_log")
 
     print("\n  ── investigation result ──")
@@ -1646,8 +1724,16 @@ def main():
         print(f"    {i}. {fnd['issue']}" + (f"  [{fnd['file']}]" if fnd.get("file") else ""))
         if fnd.get("root_cause"):
             print(f"       cause: {fnd['root_cause']}")
+        if fnd.get("proof"):
+            print(f"       proof: {fnd['proof'][:160]}")
         if fnd.get("solution"):
             print(f"       fix:   {fnd['solution']}")
+    print(f"  hypotheses    : {len(considered)} considered, {len(rejected)} eliminated")
+    for h in rejected:
+        print(f"    - ruled out: {h['hypothesis'][:90]}")
+        print(f"      because:   {h['disproved_by'][:110]}")
+    if why_fix_works:
+        print(f"  why it works  : {why_fix_works[:200]}")
 
     failure_mode = investigation.get("failure_mode")
     if failure_mode in ("no_model_response", "not_converged") and not investigation_log:
@@ -1686,7 +1772,8 @@ def main():
     # ── PATCH GENERATION + VALIDATION LOOP ──
     findings_text = "\n".join(
         f"- [{f['file'] or 'file unknown'}] {f['issue']}: {f['root_cause']}"
-        + (f" — fix: {f['solution']}" if f.get('solution') else "")
+        + (f"\n    offending text (verbatim): {f['proof']}" if f.get('proof') else "")
+        + (f"\n    fix: {f['solution']}" if f.get('solution') else "")
         for f in findings)
     patch_root_cause = (f"{root_cause}\n\nIndividual issues to fix (address EVERY one):\n"
                         f"{findings_text}" if findings_text else root_cause)
@@ -1709,7 +1796,8 @@ def main():
         active_issue_block = retry_issue_block or issue_block
         try:
             issues = ai_generate_patch(patch_root_cause, solution, evidence,
-                                       retry_note, active_issue_block)
+                                       retry_note, active_issue_block,
+                                       why_fix_works)
         except Exception as exc:
             print(f"[ERROR] patch generation failed: {exc}", file=sys.stderr)
             if repair_round == MAX_REPAIR_ROUNDS:
@@ -1812,7 +1900,8 @@ def main():
         sys.exit(4)
     if token and repo:
         open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
-                investigation_log, list(evidence.keys()), solution, findings)
+                investigation_log, list(evidence.keys()), solution, findings,
+                rejected, why_fix_works)
     else:
         print(f"[PR] No token — merge {branch} manually.")
 
