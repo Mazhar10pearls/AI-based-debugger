@@ -43,7 +43,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.0"
+          python-version: "3.q"
 
       - name: Install dependencies
         run: |
