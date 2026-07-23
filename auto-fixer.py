@@ -46,6 +46,7 @@ Optional env:
 
 import argparse
 import ast
+import difflib
 import json
 import os
 import re
@@ -160,15 +161,32 @@ DOCKERFILE_REF_PATTERNS = [
     (re.compile(r'ENTRYPOINT\s*\[\s*"[^"]*"\s*,\s*"([^"]+)"', re.I), "ENTRYPOINT"),
 ]
 DOCKERFILE_FROM_PYTHON = re.compile(r'^(\s*FROM\s+)python:([^\s]+)(.*)$', re.I | re.M)
-VALID_PYTHON_MINORS = set(range(8, 14))
+# Deliberately NOT a list of released versions — that knowledge goes stale and
+# would reject a correct patch to a newer Python than this file knows about.
+# Only structurally impossible tags are caught; a plausible-but-wrong tag is
+# caught for real by `docker build` in try_docker_build().
+MIN_PYTHON_MINOR = int(os.environ.get("MIN_PYTHON_MINOR", "6"))
+
+
+def _is_plausible_python_tag(major: int, minor: int) -> bool:
+    return major == 3 and minor >= MIN_PYTHON_MINOR
 
 WORKFLOW_PYVERSION_LINE = re.compile(
     r'^(\s*python-version\s*:\s*)([\'"]?)(\d+)\.(\d+)([\'"]?)(.*)$', re.M)
 
 # ── Pattern for post-patch "missing reference" validation ────────────────────
+# Extensions the dangling-reference check can see. Not a claim about which
+# languages matter — extend via REPO_REF_EXTRA_EXTS (comma-separated) for stacks
+# not listed here.
+_REF_EXTS = ("py|txt|ya?ml|json|toml|cfg|ini|env|lock|js|jsx|ts|tsx|mjs|cjs|"
+             "go|java|kt|rb|rs|php|cs|c|cpp|h|sh|bash|ps1|sql|tf|tfvars|proto|"
+             "gradle|xml|properties|conf|md|csv|pem|crt|service|mk")
+_extra = [e.strip().lstrip(".") for e in
+          os.environ.get("REPO_REF_EXTRA_EXTS", "").split(",") if e.strip()]
+if _extra:
+    _REF_EXTS += "|" + "|".join(re.escape(e) for e in _extra)
 REPO_REF_EXT_PATTERN = re.compile(
-    r'(?<![\w./\-])((?:[\w.\-]+/)*[\w\-]+\.(?:py|txt|ya?ml|json|toml|cfg|ini|'
-    r'js|jsx|ts|tsx|go|java|rb|sh))(?![\w./\-])')
+    r'(?<![\w./\-])((?:[\w.\-]+/)*[\w\-]+\.(?:' + _REF_EXTS + r'))(?![\w./\-])')
 
 
 def scan_text_for_secrets(text: str) -> list:
@@ -243,6 +261,10 @@ TECH_STACK_SIGNALS = {
     "docker": ["dockerfile", "docker build", "docker push", "image", "container"],
     "java":   ["java", "maven", "gradle", "mvn", ".java", "pom.xml"],
     "go":     ["go build", "go test", "go mod", ".go", "go.mod"],
+    "rust":   ["cargo", "rustc", ".rs", "cargo.toml"],
+    "dotnet": ["dotnet", ".csproj", ".sln", "nuget"],
+    "ruby":   ["bundle", "rspec", "gemfile", ".rb"],
+    "php":    ["composer", "phpunit", ".php"],
 }
 
 GH_ERROR_ANNOTATION = re.compile(r'^##\[error\](.*)$', re.M)
@@ -897,18 +919,22 @@ defects at all — a file you suspected but which is correct, a theory the evide
 killed. The moment you can quote broken text from a real file, it is a finding,
 regardless of whether it explains today's error.
 
-Worked example of the mistake to avoid. A Dockerfile reads:
+Worked example of the mistake to avoid — note that the specific technology here
+is irrelevant; the reasoning error is what matters. A Node service's CI config
+reads:
 
-    FROM python:0.12
-    RUN pip install -r requirments.txt          # the real file is requirements.txt
+    - run: npm ci --registry https://registry.invalid.example
+    - run: node ./src/sever.js          # the real file is src/server.js
 
-The log says only that the base image could not be resolved, because the build
-never got as far as pip. Both lines are defects. The correct output is TWO
-findings — the image tag as current_failure, the misspelled requirements file as
-later_step. Writing "ruled out: the requirements typo, because the error is about
-the base image" is WRONG: that reasoning is sound as an explanation of the log and
-useless as engineering. The typo is real, you can quote it, and it will break the
-next build.
+The log shows only that the registry could not be reached, because the job never
+got as far as running node. Both lines are defects. The correct output is TWO
+findings — the unreachable registry as current_failure, the misspelled entry
+point as later_step. Writing "ruled out: the misspelled script, because the error
+is about the registry" is WRONG: that reasoning is sound as an explanation of the
+log and useless as engineering. The typo is real, you can quote it, and it will
+break the next run.
+
+Apply that shape to whatever stack you are actually looking at.
 
 ## SWEEP BEFORE YOU SUBMIT
 
@@ -993,9 +1019,12 @@ def _finalize_investigation(data: dict, forced: bool) -> dict:
     }
 
 
-EXECUTED_FILE_HINTS = (".sh", ".bash", ".yml", ".yaml", ".mk")
-EXECUTED_FILE_NAMES = ("dockerfile", "makefile", "docker-compose.yml",
-                       "docker-compose.yaml", "procfile")
+EXECUTED_FILE_HINTS = (".sh", ".bash", ".zsh", ".ps1", ".bat", ".cmd",
+                       ".yml", ".yaml", ".mk")
+EXECUTED_FILE_NAMES = ("dockerfile", "containerfile", "makefile", "justfile",
+                       "taskfile.yml", "taskfile.yaml", "jenkinsfile",
+                       "docker-compose.yml", "docker-compose.yaml",
+                       "compose.yml", "compose.yaml", "procfile")
 
 
 def _is_executed_file(rel: str) -> bool:
@@ -1025,6 +1054,12 @@ def _missing_reference_report(evidence: dict) -> list:
         for m in REPO_REF_EXT_PATTERN.finditer(content):
             token = m.group(1)
             if token in seen or "${{" in token or token.startswith("."):
+                continue
+            # `jr.json()` is a method call, not a file. Without this, the gate
+            # flags every .json()/.text()/.read() call in an embedded script and
+            # burns a pushback turn asking the agent about a non-existent file.
+            after = content[m.end():m.end() + 1]
+            if after == "(":
                 continue
             seen.add(token)
             candidates = {token, _relstrip(str(parent / token))}
@@ -1494,8 +1529,9 @@ def _dockerfile_still_broken(file: str, content: str) -> str:
         if not vm:
             continue
         major, minor = int(vm.group(1)), int(vm.group(2))
-        if not (major == 3 and minor in VALID_PYTHON_MINORS):
-            return f"base image still 'python:{version}' — not a real CPython release"
+        if not _is_plausible_python_tag(major, minor):
+            return (f"base image 'python:{version}' is not a plausible CPython tag "
+                    f"(expected 3.{MIN_PYTHON_MINOR}+)")
     return ""
 
 
@@ -1535,10 +1571,10 @@ def check_workflow_python_versions(new_text: str) -> str:
     """
     for m in WORKFLOW_PYVERSION_LINE.finditer(new_text):
         major, minor = int(m.group(3)), int(m.group(4))
-        if major == 3 and minor in VALID_PYTHON_MINORS:
+        if _is_plausible_python_tag(major, minor):
             continue
-        return (f"patched workflow sets python-version {major}.{minor}, which is "
-                f"not a released CPython minor version")
+        return (f"patched workflow sets python-version {major}.{minor}, which is not "
+                f"a plausible CPython version (expected 3.{MIN_PYTHON_MINOR}+)")
     return ""
 
 
@@ -1680,6 +1716,10 @@ def detect_test_commands(stacks: set) -> list:
             pass
     if "go" in stacks and Path("go.mod").exists():
         cmds.append(["go", "test", "./..."])
+    if "rust" in stacks and Path("Cargo.toml").exists():
+        cmds.append(["cargo", "test"])
+    if "ruby" in stacks and Path("Gemfile").exists():
+        cmds.append(["bundle", "exec", "rspec"])
     return cmds
 
 
@@ -1814,54 +1854,151 @@ def _gh(token):
             "X-GitHub-Api-Version": "2022-11-28"}
 
 
-def open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
-            investigation_log=None, evidence_files=None, solution="",
-            findings=None, rejected=None, why_fix_works="",
-            completeness="") -> str:
-    details = "".join(f"\n**`{f.get('file','?')}`** — {f.get('reason','')}\n" for f in fixes)
-    trace = ""
-    if investigation_log:
-        steps = "".join(f"\n{i+1}. `{s['status']}` — {s['analysis']}"
-                        for i, s in enumerate(investigation_log))
-        trace = f"### Investigation trace{steps}\n\n"
-    issues_section = ""
-    if findings:
-        items = "".join(
-            f"\n{i+1}. **{f['issue']}**"
-            + (f" (`{f['file']}`)" if f.get('file') else "")
-            + (" _(latent — would break a later step)_" if f.get("blocks") == "later_step" else "")
-            + (f" — {f['root_cause']}"
-               if f.get('root_cause') and f['root_cause'] != f['issue'] else "")
-            + (f"  \n   _Proof:_ `{f['proof']}`" if f.get('proof') else "")
-            + (f"  \n   _Fix: {f['solution']}_" if f.get('solution') else "")
-            for i, f in enumerate(findings))
-        issues_section = f"### Issues identified & fixed ({len(findings)}){items}\n\n"
-    ruled_out = ""
+MAX_DIFF_LINES_PER_FILE = int(os.environ.get("MAX_DIFF_LINES_PER_FILE", "30"))
+
+
+def _render_diff(original: str, new: str, path: str) -> str:
+    """Compact unified diff — the single most useful thing in a review."""
+    diff = list(difflib.unified_diff(
+        original.splitlines(), new.splitlines(),
+        fromfile=f"a/{path}", tofile=f"b/{path}", lineterm="", n=1))
+    if len(diff) > MAX_DIFF_LINES_PER_FILE:
+        diff = diff[:MAX_DIFF_LINES_PER_FILE] + ["... (diff truncated — see Files changed)"]
+    return "\n".join(diff)
+
+
+def _plural(n, word):
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def open_pr(token, repo, branch, ctx: dict) -> str:
+    """Open the fix PR.
+
+    The body answers three questions in order: what broke, what changed, is it
+    safe to merge. Everything else — the tool trace, the rejected hypotheses,
+    the list of files read — is audit material and lives inside a collapsed
+    <details> block, available when someone wants it and invisible when they don't.
+    """
+    written     = ctx.get("written", [])
+    originals   = ctx.get("originals", {})
+    fixes       = ctx.get("fixes", [])
+    findings    = ctx.get("findings") or []
+    confidence  = ctx.get("confidence", 0.0)
+    root_cause  = ctx.get("root_cause", "")
+    why_works   = ctx.get("why_fix_works", "")
+    completeness = ctx.get("completeness", "")
+    rejected    = ctx.get("rejected") or []
+    trace       = ctx.get("investigation_log") or []
+    files_read  = ctx.get("evidence_files") or []
+    run_url     = ctx.get("run_url", "")
+    tests_ran   = ctx.get("tests_ran", False)
+    docker_ran  = ctx.get("docker_ran", False)
+
+    changed_lines = sum(
+        len([l for l in _render_diff(originals.get(f, ""), Path(f).read_text(
+            encoding="utf-8", errors="replace"), f).splitlines()
+             if l.startswith(("+", "-")) and not l.startswith(("+++", "---"))])
+        for f in written if f in originals)
+
+    # ── Summary ────────────────────────────────────────────────────────────
+    head = [f"### What broke\n\n{root_cause}\n"]
+    if run_url:
+        head.append(f"Failing run: {run_url}\n")
+    latent = sum(1 for f in findings if f.get("blocks") == "later_step")
+    scope = (f"**Scope:** {_plural(len(findings), 'defect')} in "
+             f"{_plural(len(written), 'file')} · ~{changed_lines} lines changed")
+    if latent:
+        scope += (f"\n\n{_plural(latent, 'of these defects was' if latent == 1 else 'of these defects were')}"
+                  f" not the cause of this failure — {'it was' if latent == 1 else 'they were'} "
+                  f"found during the investigation and would have broken a later build step.")
+    head.append(scope + "\n")
+
+    # ── Changes, one section per file, with a real diff ────────────────────
+    changes = ["### Changes\n"]
+    for f in written:
+        try:
+            new_text = Path(f).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            new_text = ""
+        diff = _render_diff(originals.get(f, ""), new_text, f)
+        per_file = [x for x in findings if x.get("file") == f]
+        changes.append(f"**`{f}`**\n")
+        if diff:
+            changes.append(f"```diff\n{diff}\n```\n")
+        for x in per_file:
+            reason = x.get("root_cause") or x.get("issue") or ""
+            # A reviewer reads these differently: one explains the red build,
+            # the other is a defect we caught before it could cause its own.
+            marker = ("**Caused the failure** — " if x.get("blocks") == "current_failure"
+                      else "**Found while investigating** — ")
+            changes.append(f"- {marker}{x.get('issue','')}: {reason}\n")
+        if not per_file:
+            reason = next((fx.get("reason", "") for fx in fixes if fx.get("file") == f), "")
+            if reason:
+                changes.append(f"- {reason}\n")
+
+    # ── Why it is safe to merge ────────────────────────────────────────────
+    checks = ["### Verification\n",
+              "- Every file path referenced by the patched files exists in the repo\n",
+              "- Syntax parsed (Python / YAML / JSON as applicable)\n",
+              "- No secrets or dangerous shell patterns introduced\n"]
+    if tests_ran:
+        checks.append("- Test suite passed after the change\n")
+    if docker_ran:
+        checks.append("- `docker build` succeeded after the change\n")
+    checks.append(f"\n**Diagnostic confidence:** {confidence:.0%}"
+                  + ("  — below the auto-merge comfort threshold, review closely"
+                     if confidence < 0.75 else "") + "\n")
+    if why_works:
+        checks.append(f"\n{why_works}\n")
+
+    # ── Audit trail, collapsed ─────────────────────────────────────────────
+    audit = ["\n<details>\n<summary>Investigation detail</summary>\n\n"]
+    if completeness:
+        audit.append(f"**Checked for other instances:** {completeness}\n\n")
     if rejected:
-        rows = "".join(f"\n| {h['hypothesis']} | {h['disproved_by']} |" for h in rejected)
-        ruled_out = ("### Hypotheses ruled out\n\n"
-                     "| Considered | Disproved by |\n|---|---|" + rows + "\n\n")
-    files_read = (f"**Files the agent read to diagnose this:** "
-                  f"{', '.join(f'`{f}`' for f in evidence_files)}\n\n"
-                  if evidence_files else "")
-    body = (f"## 🤖 AI Auto-Fix\n\n{trace}{issues_section}{ruled_out}"
-            f"**Overall root cause:** {root_cause}\n\n"
-            f"**Solution:** {solution or 'n/a'}\n\n"
-            + (f"**Why this fix works:** {why_fix_works}\n\n" if why_fix_works else "")
-            + (f"**Completeness sweep:** {completeness}\n\n" if completeness else "")
-            + f"{files_read}"
-            + f"**Files changed:** {', '.join(f'`{f}`' for f in written)}\n\n"
-            + f"## What changed{details}\n\n> Auto-generated — review before merge.")
+        audit.append("**Alternative causes ruled out**\n\n"
+                     "| Considered | Ruled out because |\n|---|---|\n")
+        audit += [f"| {h['hypothesis']} | {h['disproved_by']} |\n" for h in rejected]
+        audit.append("\n")
+    if files_read:
+        audit.append(f"**Files examined:** {', '.join(f'`{x}`' for x in files_read)}\n\n")
+    if trace:
+        audit.append(f"**Steps:** {len(trace)}\n\n```\n")
+        audit += [f"{i+1}. {st.get('status','')} {st.get('analysis','')[:110]}\n"
+                  for i, st in enumerate(trace)]
+        audit.append("```\n")
+    audit.append("\n</details>\n")
+
+    body = ("".join(head) + "\n" + "".join(changes) + "\n" + "".join(checks)
+            + "".join(audit)
+            + "\n---\n*Opened automatically by the CI auto-fixer. "
+              "Human review required before merge.*")
+
     r = requests.post(f"https://api.github.com/repos/{repo}/pulls",
-                      json={"title": f"🤖 {commit_msg}", "head": branch,
-                            "base": GIT_TARGET_BRANCH, "body": body},
+                      json={"title": ctx.get("commit_message", "fix: automated CI fix"),
+                            "head": branch, "base": GIT_TARGET_BRANCH, "body": body},
                       headers=_gh(token), timeout=30)
     if r.status_code in (200, 201):
         url = r.json().get("html_url", "")
         print(f"[PR] {url}")
+        _label_pr(token, repo, r.json().get("number"), confidence)
         return url
     print(f"[PR] failed {r.status_code}: {r.text[:200]}", file=sys.stderr)
     return ""
+
+
+def _label_pr(token, repo, number, confidence):
+    """Labels do the at-a-glance signalling the old emoji title was doing."""
+    if not number:
+        return
+    labels = ["automated-fix"]
+    labels.append("high-confidence" if confidence >= 0.75 else "needs-close-review")
+    try:
+        requests.post(f"https://api.github.com/repos/{repo}/issues/{number}/labels",
+                      json={"labels": labels}, headers=_gh(token), timeout=15)
+    except Exception:
+        pass
 
 
 def pending_bot_pr(token, repo) -> str:
@@ -1870,8 +2007,8 @@ def pending_bot_pr(token, repo) -> str:
                          headers=_gh(token), timeout=15)
         if r.status_code == 200:
             for pr in r.json():
-                if (pr.get("head", {}).get("ref", "").startswith("fix/")
-                        and "🤖" in (pr.get("title") or "")):
+                # Branch prefix is the reliable marker; the title is free text.
+                if pr.get("head", {}).get("ref", "").startswith("fix/"):
                     return pr.get("html_url", "")
     except Exception:
         pass
@@ -2060,6 +2197,7 @@ def main():
                         f"{findings_text}" if findings_text else root_cause)
 
     written, originals, fixes = [], {}, []
+    tests_ran = docker_ran = False
     success = False
     retry_note = ""
     retry_issue_block = ""
@@ -2139,10 +2277,12 @@ def main():
         print("\n━━━ EXECUTE BUILD & TESTS ━━━")
         if not args.skip_tests:
             tests_ok, test_output = run_tests(stacks)
+            tests_ran = bool(detect_test_commands(stacks))
         else:
             print("[TEST] Skipped (--skip-tests)")
             tests_ok, test_output = True, ""
         docker_ok, docker_output = try_docker_build(written)
+        docker_ran = any("dockerfile" in Path(f).name.lower() for f in written)
 
         if tests_ok and docker_ok:
             success = True
@@ -2187,9 +2327,24 @@ def main():
     if not branch:
         sys.exit(4)
     if token and repo:
-        open_pr(token, repo, branch, commit_msg, root_cause, written, fixes,
-                investigation_log, list(evidence.keys()), solution, findings,
-                rejected, why_fix_works, completeness)
+        open_pr(token, repo, branch, {
+            "commit_message": commit_msg,
+            "root_cause": root_cause,
+            "solution": solution,
+            "why_fix_works": why_fix_works,
+            "completeness": completeness,
+            "confidence": confidence,
+            "findings": findings,
+            "rejected": rejected,
+            "written": written,
+            "originals": originals,
+            "fixes": fixes,
+            "investigation_log": investigation_log,
+            "evidence_files": list(evidence.keys()),
+            "run_url": run_url,
+            "tests_ran": tests_ran,
+            "docker_ran": docker_ran,
+        })
     else:
         print(f"[PR] No token — merge {branch} manually.")
 
