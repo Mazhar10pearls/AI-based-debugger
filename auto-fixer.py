@@ -799,7 +799,13 @@ DIAGNOSIS_PROPERTIES = {
                                           "what they returned. Say so plainly if you "
                                           "did not sweep."},
     "confidence": {"type": "number"},
-    "commit_message": {"type": "string"},
+    "commit_message": {"type": "string",
+                       "description": "A SINGLE LINE conventional-commit subject, "
+                                      "imperative mood, 72 characters maximum. "
+                                      "Example: 'fix: correct Python version in CI "
+                                      "workflow'. No body, no bullet list, no file "
+                                      "paths, no newlines. The detail belongs in the "
+                                      "findings, not here."},
     "findings": {"type": "array", "items": {
         "type": "object", "additionalProperties": False,
         "required": ["file", "issue", "root_cause", "proof", "blocks", "solution"],
@@ -965,6 +971,30 @@ outcome. An inflated 0.95 ships a wrong patch to production.
 """
 
 
+COMMIT_SUBJECT_MAX = int(os.environ.get("COMMIT_SUBJECT_MAX", "72"))
+
+
+def _clean_commit_message(raw: str) -> str:
+    """Reduce whatever the model wrote to one short subject line.
+
+    Formatting only — this does not change what the fix does. Long multi-line
+    commit bodies make `git log --oneline` unreadable and are the wrong place
+    for detail that already lives in the PR.
+    """
+    text = (raw or "").strip()
+    subject = next((l.strip() for l in text.splitlines() if l.strip()), "")
+    subject = re.sub(r"^[-*\u2022]\s*", "", subject).strip().rstrip(".")
+    subject = re.sub(r"\s+", " ", subject)
+    if not subject:
+        subject = "correct CI configuration"
+    if not re.match(r"^(fix|chore|ci|build|refactor)(\(.+?\))?:", subject, re.I):
+        subject = f"{BOT_PREFIX} {subject}"
+    if len(subject) > COMMIT_SUBJECT_MAX:
+        cut = subject[:COMMIT_SUBJECT_MAX].rsplit(" ", 1)[0]
+        subject = (cut or subject[:COMMIT_SUBJECT_MAX]).rstrip(",;:-") 
+    return subject
+
+
 def _finalize_investigation(data: dict, forced: bool) -> dict:
     try:
         confidence = float(data.get("confidence", 0.4))
@@ -1012,7 +1042,7 @@ def _finalize_investigation(data: dict, forced: bool) -> dict:
         "why_fix_works":  data.get("why_fix_works") or "",
         "completeness_check": data.get("completeness_check") or "",
         "confidence":     confidence,
-        "commit_message": data.get("commit_message") or "fix: auto-fixer change",
+        "commit_message": _clean_commit_message(data.get("commit_message")),
         "findings":       findings,
         "hypotheses_considered": considered,
         "hypotheses_rejected":   rejected,
@@ -1894,11 +1924,19 @@ def open_pr(token, repo, branch, ctx: dict) -> str:
     tests_ran   = ctx.get("tests_ran", False)
     docker_ran  = ctx.get("docker_ran", False)
 
+    def _patched(f: str) -> str:
+        for fx in fixes:
+            if fx.get("file") == f and isinstance(fx.get("fixed_content"), str):
+                return fx["fixed_content"]
+        try:                       # fallback only; the tree may be on the base branch
+            return Path(f).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return ""
+
     changed_lines = sum(
-        len([l for l in _render_diff(originals.get(f, ""), Path(f).read_text(
-            encoding="utf-8", errors="replace"), f).splitlines()
+        len([l for l in _render_diff(originals.get(f, ""), _patched(f), f).splitlines()
              if l.startswith(("+", "-")) and not l.startswith(("+++", "---"))])
-        for f in written if f in originals)
+        for f in written)
 
     # ── Summary ────────────────────────────────────────────────────────────
     head = [f"### What broke\n\n{root_cause}\n"]
@@ -1916,11 +1954,7 @@ def open_pr(token, repo, branch, ctx: dict) -> str:
     # ── Changes, one section per file, with a real diff ────────────────────
     changes = ["### Changes\n"]
     for f in written:
-        try:
-            new_text = Path(f).read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            new_text = ""
-        diff = _render_diff(originals.get(f, ""), new_text, f)
+        diff = _render_diff(originals.get(f, ""), _patched(f), f)
         per_file = [x for x in findings if x.get("file") == f]
         changes.append(f"**`{f}`**\n")
         if diff:
@@ -1931,7 +1965,10 @@ def open_pr(token, repo, branch, ctx: dict) -> str:
             # the other is a defect we caught before it could cause its own.
             marker = ("**Caused the failure** — " if x.get("blocks") == "current_failure"
                       else "**Found while investigating** — ")
-            changes.append(f"- {marker}{x.get('issue','')}: {reason}\n")
+            issue = (x.get("issue") or "").strip().rstrip(".:;")
+            reason = reason.strip()
+            changes.append(f"- {marker}{issue}"
+                           + (f". {reason}\n" if reason and reason != issue else "\n"))
         if not per_file:
             reason = next((fx.get("reason", "") for fx in fixes if fx.get("file") == f), "")
             if reason:
@@ -1947,10 +1984,39 @@ def open_pr(token, repo, branch, ctx: dict) -> str:
     if docker_ran:
         checks.append("- `docker build` succeeded after the change\n")
     checks.append(f"\n**Diagnostic confidence:** {confidence:.0%}"
-                  + ("  — below the auto-merge comfort threshold, review closely"
+                  + ("  — below the comfort threshold; review closely"
                      if confidence < 0.75 else "") + "\n")
     if why_works:
-        checks.append(f"\n{why_works}\n")
+        checks.append(f"\n**Rationale:** {why_works}\n")
+
+    # ── Risk: what a reviewer needs to weigh before approving ──────────────
+    sensitive = []
+    if any(WORKFLOW_PATTERN.search(f) for f in written):
+        sensitive.append("CI workflow configuration")
+    if any("dockerfile" in Path(f).name.lower() for f in written):
+        sensitive.append("container build definition")
+    risk = ["\n### Risk\n"]
+    risk.append(f"- Blast radius: {_plural(len(written), 'file')}, "
+                f"~{changed_lines} lines\n")
+    if sensitive:
+        risk.append(f"- Touches {' and '.join(sensitive)} — changes here affect "
+                    f"every subsequent build\n")
+    if not (tests_ran or docker_ran):
+        risk.append("- No test or build execution was possible in this environment; "
+                    "correctness rests on static validation alone\n")
+    risk.append("- Nothing has been merged. Close this PR to discard the change "
+                "entirely.\n")
+
+    # ── Checklist: give the reviewer something to actually do ──────────────
+    check_items = ["\n### Before approving\n",
+                   "- [ ] The diff matches the defects described above, and changes "
+                   "nothing else\n",
+                   "- [ ] The replacement values are right for this project "
+                   "(versions, filenames, paths)\n"]
+    if any(f.get("blocks") == "later_step" for f in findings):
+        check_items.append("- [ ] The defects marked *Found while investigating* are "
+                           "genuine, not deliberate\n")
+    check_items.append("- [ ] CI is green on this branch\n")
 
     # ── Audit trail, collapsed ─────────────────────────────────────────────
     audit = ["\n<details>\n<summary>Investigation detail</summary>\n\n"]
@@ -1964,14 +2030,16 @@ def open_pr(token, repo, branch, ctx: dict) -> str:
     if files_read:
         audit.append(f"**Files examined:** {', '.join(f'`{x}`' for x in files_read)}\n\n")
     if trace:
-        audit.append(f"**Steps:** {len(trace)}\n\n```\n")
-        audit += [f"{i+1}. {st.get('status','')} {st.get('analysis','')[:110]}\n"
-                  for i, st in enumerate(trace)]
+        audit.append(f"**Steps taken:** {len(trace)}\n\n```\n")
+        for i, st in enumerate(trace):
+            label = st.get("status", "")
+            arg = (st.get("analysis", "") or "").split("\u2192")[0].strip()
+            audit.append(f"{i+1:>2}. {label:<22} {arg[:70]}\n")
         audit.append("```\n")
     audit.append("\n</details>\n")
 
     body = ("".join(head) + "\n" + "".join(changes) + "\n" + "".join(checks)
-            + "".join(audit)
+            + "".join(risk) + "".join(check_items) + "".join(audit)
             + "\n---\n*Opened automatically by the CI auto-fixer. "
               "Human review required before merge.*")
 
